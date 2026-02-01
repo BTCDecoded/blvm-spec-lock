@@ -1,0 +1,53 @@
+[package]
+name = "blvm-spec-lock"
+version = "0.1.0"
+edition = "2021"
+authors = ["Bitcoin Commons Team"]
+description = "BLVM Spec Lock: Purpose-built formal verification tool for Bitcoin Commons"
+license = "MIT"
+repository = "https://github.com/BTCDecoded/blvm-consensus"
+homepage = "https://btcdecoded.org"
+rust-version = "1.83"
+
+[lib]
+proc-macro = true
+
+[[bin]]
+name = "cargo-spec-lock"
+path = "src/bin/cargo-spec-lock.rs"
+
+[dependencies]
+# Proc macro dependencies
+syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+
+# Markdown parsing
+pulldown-cmark = "0.9"
+
+# Utilities
+regex = "1.10"
+sha2 = "0.10"
+
+# Z3 SMT solver for verification (optional - requires libclang to build)
+z3 = { version = "0.12", optional = true }
+
+# CLI dependencies
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+
+# File system and path utilities
+walkdir = "2.4"
+
+[features]
+default = []
+# Enable Z3 verification (requires libclang to build)
+z3 = ["dep:z3"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn" }
+
+

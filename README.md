@@ -117,11 +117,3 @@ For other distributions, install:
 - LLVM and clang (matching versions)
 - libclang development headers
 
-## Status
-
-✅ Core implementation complete
-⏳ Testing and integration with blvm-consensus in progress
-
-## Documentation
-
-See `docs/BLVM_SPEC_LOCK_*.md` for complete design and implementation details.

@@ -18,6 +18,7 @@ pub use orange_paper::{
     SpecParser,
     Property,
     PropertyType,
+    ExtractedConstant,
 };
 
 // Re-export Rust contract parsing (for future use in verification)

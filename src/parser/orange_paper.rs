@@ -100,8 +100,27 @@ pub struct SpecSection {
     pub functions: Vec<FunctionSpec>,
     /// Theorems in this section
     pub theorems: Vec<Theorem>,
+    /// Constants in this section
+    pub constants: Vec<ExtractedConstant>,
     /// Raw content
     pub content: String,
+}
+
+/// Extracted constant from Orange Paper
+#[derive(Debug, Clone)]
+pub struct ExtractedConstant {
+    /// Constant name (e.g., "H", "C", "MAX_MONEY")
+    pub name: String,
+    /// Section ID (e.g., "4.1")
+    pub section: String,
+    /// Mathematical value (e.g., "210000", "10^8")
+    pub value: String,
+    /// Rust type (e.g., "u64", "i64")
+    pub rust_type: String,
+    /// Rust expression (e.g., "210_000", "100_000_000")
+    pub rust_expr: String,
+    /// Description from Orange Paper
+    pub description: String,
 }
 
 impl SpecParser {
@@ -148,6 +167,7 @@ impl SpecParser {
                     title,
                     functions: Vec::new(),
                     theorems: Vec::new(),
+                    constants: Vec::new(),
                     content: String::new(),
                 });
             } else if current_section.is_some() {
@@ -213,13 +233,173 @@ impl SpecParser {
             functions.push(func_spec);
         }
         
-        // Update section with parsed functions
+        // Extract constants for Section 4 (Consensus Constants)
+        let mut constants = Vec::new();
+        if section_id.starts_with("4.") {
+            constants = self.extract_constants_from_section(section_id, content)?;
+        }
+        
+        // Update section with parsed functions and constants
         if let Some(section) = self.sections.get_mut(section_id) {
             section.content = section_content;
             section.functions = functions;
+            section.constants = constants;
         }
         
         Ok(())
+    }
+    
+    /// Extract constants from Section 4 (Consensus Constants)
+    fn extract_constants_from_section(&self, section_id: &str, content: &str) -> Result<Vec<ExtractedConstant>, String> {
+        let mut constants = Vec::new();
+        
+        // Pattern: $CONSTANT_NAME = value$ (description)
+        // Examples:
+        // $C = 10^8$ (satoshis per BTC, ...)
+        // $H = 210,000$ (halving interval, ...)
+        // $M_{max} = 21 \times 10^6 \times C$ (maximum money supply, ...)
+        let constant_re = Regex::new(r"\$([A-Za-z_]+(?:\{[^}]+\})?)\s*=\s*([^$]+)\$\s*(?:\(([^)]+)\))?")
+            .map_err(|e| format!("Regex error: {}", e))?;
+        
+        // Also match lines that might have constants without parentheses
+        let constant_re_alt = Regex::new(r"\$([A-Za-z_]+(?:\{[^}]+\})?)\s*=\s*([^$]+)\$")
+            .map_err(|e| format!("Regex error: {}", e))?;
+        
+        for cap in constant_re.captures_iter(content) {
+            let name_raw = cap.get(1).unwrap().as_str();
+            let value_raw = cap.get(2).unwrap().as_str().trim();
+            // Extract description - handle cases where it might be cut off
+            let description = cap.get(3)
+                .map(|m| {
+                    let desc = m.as_str().to_string();
+                    // Fix common issues: add closing paren if missing, clean up
+                    if !desc.ends_with(')') && !desc.contains(')') {
+                        format!("{})", desc)
+                    } else {
+                        desc
+                    }
+                })
+                .unwrap_or_else(|| {
+                    // Try to find description in next line
+                    String::new()
+                });
+            
+            // Clean up constant name (remove LaTeX formatting)
+            // Handle subscripts like M_{max} -> M_MAX
+            let name = if name_raw.contains('{') {
+                // Extract base and subscript
+                let parts: Vec<&str> = name_raw.split('{').collect();
+                if parts.len() == 2 {
+                    let base = parts[0];
+                    let subscript = parts[1].trim_end_matches('}');
+                    format!("{}_{}", base.to_uppercase(), subscript.to_uppercase())
+                } else {
+                    name_raw.to_uppercase()
+                }
+            } else {
+                name_raw.to_uppercase()
+            };
+            
+            // Remove double underscores
+            let name = name.replace("__", "_");
+            
+            // Parse value and convert to Rust expression
+            let (rust_type, rust_expr) = self.parse_constant_value(value_raw)?;
+            
+            constants.push(ExtractedConstant {
+                name,
+                section: section_id.to_string(),
+                value: value_raw.to_string(),
+                rust_type,
+                rust_expr,
+                description,
+            });
+        }
+        
+        Ok(constants)
+    }
+    
+    /// Parse constant value from mathematical notation to Rust expression
+    fn parse_constant_value(&self, value: &str) -> Result<(String, String), String> {
+        let value = value.trim();
+        
+        // Handle different formats:
+        // - "10^8" -> 100_000_000 (u64)
+        // - "210,000" -> 210_000 (u64)
+        // - "21 \times 10^6 \times C" -> 21_000_000 * C (i64, needs C constant)
+        // - "4 \times 10^6" -> 4_000_000 (usize)
+        
+        // Remove LaTeX formatting and normalize (keep commas for now, remove later)
+        let cleaned = value
+            .replace("\\times", "*")
+            .replace("×", "*")
+            .replace(" ", "")
+            .trim()
+            .to_string();
+        
+        // IMPORTANT: Check most specific patterns FIRST (with anchors ^ and $)
+        // This prevents partial matches (e.g., "10^6" matching inside "21*10^6*C")
+        
+        // 1. Handle N * 10^M * C format (e.g., "21*10^6*C") - MOST SPECIFIC
+        let mult_exp_c_re = Regex::new(r"^(\d+)\*10\^(\d+)\*C$").map_err(|e| format!("Regex error: {}", e))?;
+        if let Some(captures) = mult_exp_c_re.captures(&cleaned) {
+            let base: u64 = captures.get(1).unwrap().as_str().parse()
+                .map_err(|_| format!("Invalid base: {}", value))?;
+            let exponent: u32 = captures.get(2).unwrap().as_str().parse()
+                .map_err(|_| format!("Invalid exponent: {}", value))?;
+            let multiplier = base * 10u64.pow(exponent);
+            let formatted = self.format_number_with_underscores(multiplier);
+            // C is u64, so we need to cast for i64 result
+            return Ok(("i64".to_string(), format!("({} * C) as i64", formatted)));
+        }
+        
+        // 2. Handle N * 10^M format (without C) - SECOND MOST SPECIFIC
+        let mult_exp_re = Regex::new(r"^(\d+)\*10\^(\d+)$").map_err(|e| format!("Regex error: {}", e))?;
+        if let Some(captures) = mult_exp_re.captures(&cleaned) {
+            let base: u64 = captures.get(1).unwrap().as_str().parse()
+                .map_err(|_| format!("Invalid base: {}", value))?;
+            let exponent: u32 = captures.get(2).unwrap().as_str().parse()
+                .map_err(|_| format!("Invalid exponent: {}", value))?;
+            let result = base * 10u64.pow(exponent);
+            let formatted = self.format_number_with_underscores(result);
+            return Ok(("u64".to_string(), formatted));
+        }
+        
+        // 3. Handle 10^N format - THIRD
+        let exp_re = Regex::new(r"^10\^(\d+)$").map_err(|e| format!("Regex error: {}", e))?;
+        if let Some(captures) = exp_re.captures(&cleaned) {
+            let exponent: u32 = captures.get(1).unwrap().as_str().parse()
+                .map_err(|_| format!("Invalid exponent: {}", value))?;
+            let result = 10u64.pow(exponent);
+            let formatted = self.format_number_with_underscores(result);
+            return Ok(("u64".to_string(), formatted));
+        }
+        
+        // 4. Try to parse as number (handle commas) - LEAST SPECIFIC
+        let num_str = cleaned.replace(",", "").replace("_", "");
+        if let Ok(num) = num_str.parse::<u64>() {
+            // Format with underscores for readability
+            let formatted = self.format_number_with_underscores(num);
+            return Ok(("u64".to_string(), formatted));
+        }
+        
+        Err(format!("Could not parse constant value: {}", value))
+    }
+    
+    /// Format number with underscores for readability (e.g., 210000 -> 210_000)
+    fn format_number_with_underscores(&self, num: u64) -> String {
+        let s = num.to_string();
+        let mut result = String::new();
+        let chars: Vec<char> = s.chars().rev().collect();
+        
+        for (i, ch) in chars.iter().enumerate() {
+            if i > 0 && i % 3 == 0 {
+                result.push('_');
+            }
+            result.push(*ch);
+        }
+        
+        result.chars().rev().collect()
     }
 
     /// Extract properties for a function
@@ -358,37 +538,77 @@ impl SpecParser {
         // Look for LaTeX formula: $$\text{FunctionName}(...) = ...$$
         // Use string search instead of regex to avoid escape issues
         let latex_func = format!(r"\text{{{}}}", func_name);
+        let latex_func_alt = format!(r"{}", func_name);  // Also match without \text{}
         
         // Find formula blocks (between $$)
         let mut in_formula = false;
-        let mut formula_start = 0;
         let mut formula_content = String::new();
+        let mut lines_in_formula = 0;
+        const MAX_FORMULA_LINES: usize = 10;  // Limit formula extraction to prevent grabbing too much
         
-        for (i, line) in content.lines().enumerate() {
+        for line in content.lines() {
             if line.contains("$$") {
                 if !in_formula {
                     // Start of formula
                     in_formula = true;
-                    formula_start = i;
                     formula_content = line.to_string();
+                    lines_in_formula = 1;
                 } else {
                     // End of formula
                     formula_content.push_str("\n");
                     formula_content.push_str(line);
-                    if formula_content.contains(&latex_func) {
-                        func.formula = Some(formula_content.clone());
+                    lines_in_formula += 1;
+                    
+                    // Check if this formula matches our function
+                    if formula_content.contains(&latex_func) || 
+                       formula_content.contains(&latex_func_alt) ||
+                       (formula_content.contains("GetBlockSubsidy") && func_name.contains("Subsidy")) ||
+                       (formula_content.contains("TotalSupply") && func_name.contains("Supply")) {
+                        // Clean up formula - remove extra content after closing $$
+                        let cleaned = self.clean_formula(&formula_content);
+                        func.formula = Some(cleaned);
                         break;
                     }
                     in_formula = false;
                     formula_content.clear();
+                    lines_in_formula = 0;
                 }
             } else if in_formula {
-                formula_content.push_str("\n");
-                formula_content.push_str(line);
+                if lines_in_formula < MAX_FORMULA_LINES {
+                    formula_content.push_str("\n");
+                    formula_content.push_str(line);
+                    lines_in_formula += 1;
+                } else {
+                    // Formula too long, stop extracting
+                    in_formula = false;
+                    formula_content.clear();
+                    lines_in_formula = 0;
+                }
             }
         }
         
         Ok(())
+    }
+    
+    /// Clean up extracted formula to remove extra content
+    fn clean_formula(&self, formula: &str) -> String {
+        // Extract just the formula between $$ markers
+        let parts: Vec<&str> = formula.split("$$").collect();
+        if parts.len() >= 2 {
+            // Take content between first and last $$
+            let mut cleaned = String::new();
+            for (i, part) in parts.iter().enumerate() {
+                if i % 2 == 1 {  // Odd indices are between $$ markers
+                    if !cleaned.is_empty() {
+                        cleaned.push('\n');
+                    }
+                    cleaned.push_str(part);
+                }
+            }
+            cleaned.trim().to_string()
+        } else {
+            formula.trim().to_string()
+        }
     }
 
     /// Generate contracts from properties
@@ -607,5 +827,53 @@ impl SpecParser {
         self.sections.get(section_id)
             .map(|s| s.theorems.iter().collect())
             .unwrap_or_default()
+    }
+    
+    /// Extract all constants from Section 4 (Consensus Constants)
+    pub fn extract_constants(&self) -> Vec<&ExtractedConstant> {
+        let mut constants = Vec::new();
+        
+        // Extract from Section 4.1, 4.2, 4.3
+        for section_id in &["4.1", "4.2", "4.3"] {
+            if let Some(section) = self.sections.get(*section_id) {
+                constants.extend(section.constants.iter());
+            }
+        }
+        
+        constants
+    }
+    
+    /// Get constants from a specific section
+    pub fn get_section_constants(&self, section_id: &str) -> Vec<&ExtractedConstant> {
+        self.sections.get(section_id)
+            .map(|s| s.constants.iter().collect())
+            .unwrap_or_default()
+    }
+    
+    /// Extract all functions with formulas from Orange Paper
+    pub fn extract_functions_with_formulas(&self) -> Vec<&FunctionSpec> {
+        let mut functions = Vec::new();
+        
+        for section in self.sections.values() {
+            for func in &section.functions {
+                if func.formula.is_some() {
+                    functions.push(func);
+                }
+            }
+        }
+        
+        functions
+    }
+    
+    /// Get function by name
+    pub fn get_function(&self, name: &str) -> Option<&FunctionSpec> {
+        for section in self.sections.values() {
+            for func in &section.functions {
+                if func.name == name {
+                    return Some(func);
+                }
+            }
+        }
+        None
     }
 }

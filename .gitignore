@@ -6,6 +6,8 @@
 
 # Cargo.lock for libraries (workspace or app controls lockfile)
 Cargo.lock
+# Standalone fuzz workspace needs a committed lockfile for --locked CI builds.
+!fuzz/Cargo.lock
 
 # Coverage reports and profiling
 /coverage/

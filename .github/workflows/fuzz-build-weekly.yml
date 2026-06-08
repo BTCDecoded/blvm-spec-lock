@@ -5,9 +5,10 @@ name: Fuzz harness (weekly build)
 
 on:
   workflow_dispatch:
-  schedule:
-    # Mondays 06:42 UTC (~low contention)
-    - cron: '42 6 * * 1'
+  # schedule disabled — use workflow_dispatch for ad-hoc fuzz compile checks.
+  # schedule:
+  #   # Mondays 06:42 UTC (~low contention)
+  #   - cron: '42 6 * * 1'
 
 permissions:
   contents: read

@@ -1689,7 +1689,7 @@ impl SpecParser {
 
 #[cfg(test)]
 mod formula_extraction_tests {
-    use super::{section_id_subsumes_formula_section, SpecParser};
+    use super::{SpecParser, section_id_subsumes_formula_section};
     use std::sync::Mutex;
 
     /// Serializes env + parser tests (**`SPEC_LOCK_FORMULAS`** affects process-global state).
@@ -1703,8 +1703,8 @@ mod formula_extraction_tests {
         fn set(value: Option<&str>) -> Self {
             let prev = std::env::var("SPEC_LOCK_FORMULAS").ok();
             match value {
-                Some(v) => std::env::set_var("SPEC_LOCK_FORMULAS", v),
-                None => std::env::remove_var("SPEC_LOCK_FORMULAS"),
+                Some(v) => unsafe { std::env::set_var("SPEC_LOCK_FORMULAS", v) },
+                None => unsafe { std::env::remove_var("SPEC_LOCK_FORMULAS") },
             }
             Self { prev }
         }
@@ -1713,8 +1713,8 @@ mod formula_extraction_tests {
     impl Drop for ScopedSpecLockFormulas {
         fn drop(&mut self) {
             match self.prev.take() {
-                Some(p) => std::env::set_var("SPEC_LOCK_FORMULAS", p),
-                None => std::env::remove_var("SPEC_LOCK_FORMULAS"),
+                Some(p) => unsafe { std::env::set_var("SPEC_LOCK_FORMULAS", p) },
+                None => unsafe { std::env::remove_var("SPEC_LOCK_FORMULAS") },
             }
         }
     }

@@ -3,7 +3,7 @@
 use super::verify::{Contract, ContractType, FunctionToVerify};
 use crate::parser::condition;
 use crate::parser::orange_paper::{
-    section_id_subsumes_formula_section, ContractType as SpecContractType, SpecParser,
+    ContractType as SpecContractType, SpecParser, section_id_subsumes_formula_section,
 };
 use std::path::PathBuf;
 
@@ -147,31 +147,30 @@ pub fn enrich_functions_with_spec(
                         // spec-world names (e.g. `BIP30Check(b, us, h, n) == valid`) produce
                         // vacuous Z3 uninterpreted-function contracts.  In that case we fall
                         // back to the manually-written #[ensures] which carry the real proof.
-                        let formula_ok = if let (Some(cond_str), Some(ref sig)) =
-                            (&parseable, &func.function_sig)
-                        {
-                            let param_names: std::collections::HashSet<String> = sig
-                                .sig
-                                .inputs
-                                .iter()
-                                .filter_map(|a| {
-                                    if let syn::FnArg::Typed(pt) = a {
-                                        if let syn::Pat::Ident(pi) = &*pt.pat {
-                                            return Some(pi.ident.to_string());
+                        let formula_ok =
+                            if let (Some(cond_str), Some(sig)) = (&parseable, &func.function_sig) {
+                                let param_names: std::collections::HashSet<String> = sig
+                                    .sig
+                                    .inputs
+                                    .iter()
+                                    .filter_map(|a| {
+                                        if let syn::FnArg::Typed(pt) = a {
+                                            if let syn::Pat::Ident(pi) = &*pt.pat {
+                                                return Some(pi.ident.to_string());
+                                            }
                                         }
-                                    }
-                                    None
-                                })
-                                .collect();
-                            expr.is_some()
-                                && (param_names.is_empty()
-                                    || !condition_references_only_unknown_vars(
-                                        cond_str,
-                                        &param_names,
-                                    ))
-                        } else {
-                            expr.is_some()
-                        };
+                                        None
+                                    })
+                                    .collect();
+                                expr.is_some()
+                                    && (param_names.is_empty()
+                                        || !condition_references_only_unknown_vars(
+                                            cond_str,
+                                            &param_names,
+                                        ))
+                            } else {
+                                expr.is_some()
+                            };
 
                         if formula_ok {
                             func.contracts.push(Contract {

@@ -537,7 +537,7 @@ impl Z3Translator {
                     _ => {
                         return Err(TranslationError::TypeError(
                             "Eq: operands must be Bool or Int (got mixed sorts)".to_string(),
-                        ))
+                        ));
                     }
                 };
                 Ok(eq.into())
@@ -566,7 +566,7 @@ impl Z3Translator {
                     _ => {
                         return Err(TranslationError::TypeError(
                             "Ne: operands must be Bool or Int (got mixed sorts)".to_string(),
-                        ))
+                        ));
                     }
                 };
                 Ok(eq.not().into())
@@ -2091,7 +2091,7 @@ impl Z3Translator {
                 _ => {
                     if let Ok(z3_expr) = self.translate_expr_with_vars(expr, vars) {
                         let result_var = result_slot.as_ref();
-                        let eq = result_var.and_then(|rv| {
+                        result_var.and_then(|rv| {
                             if let Some(int_val) = z3_expr.as_int() {
                                 rv.as_int().map(|r| r._eq(&int_val))
                             } else if let Some(bool_val) = z3_expr.as_bool() {
@@ -2099,8 +2099,7 @@ impl Z3Translator {
                             } else {
                                 None
                             }
-                        });
-                        eq
+                        })
                     } else {
                         None
                     }
@@ -2471,7 +2470,7 @@ impl Z3Translator {
             _ => {
                 return Err(TranslationError::UnsupportedExpression(
                     "If then branch: expected single expression".to_string(),
-                ))
+                ));
             }
         };
 
@@ -3062,7 +3061,7 @@ impl std::error::Error for TranslationError {}
 #[cfg(all(test, feature = "z3"))]
 mod tests {
     use super::*;
-    use z3::{ast::Ast, Config, Context, SatResult, Solver};
+    use z3::{SatResult, Solver};
 
     #[test]
     fn test_piecewise_body_vs_ensures_uses_same_result_var() {

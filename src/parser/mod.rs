@@ -13,8 +13,8 @@ pub mod orange_paper;
 // Re-export Orange Paper types (used by macro_impl; binary uses via submodules)
 #[allow(unused_imports)]
 pub use orange_paper::{
-    section_id_subsumes_formula_section, Contract, ContractType, FormulaSpec, FunctionSpec,
-    PropertyType, SpecParser, SpecSection,
+    Contract, ContractType, FormulaSpec, FunctionSpec, PropertyType, SpecParser, SpecSection,
+    section_id_subsumes_formula_section,
 };
 
 // Re-export Rust contract parsing (for future use in verification)

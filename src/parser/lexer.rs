@@ -354,8 +354,7 @@ mod tests {
         let tokens = lex.lex();
         assert!(
             tokens.contains(&Token::Op("*".into())),
-            "expected cdot/multiplication tokens, got {:?}",
-            tokens
+            "expected cdot/multiplication tokens, got {tokens:?}"
         );
         assert!(tokens.contains(&Token::Op("<=".into())));
         assert!(

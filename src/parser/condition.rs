@@ -812,8 +812,7 @@ mod tests {
         let s = result.unwrap();
         assert!(
             s.contains(">=") && s.contains("result") && s.contains("0"),
-            "extracted: {:?}",
-            s
+            "extracted: {s:?}"
         );
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Detects when Orange Paper and implementation diverge
 
-use super::verify::{discover_functions, FunctionToVerify};
+use super::verify::{FunctionToVerify, discover_functions};
 use std::path::{Path, PathBuf};
 // Note: SpecParser is not accessible from binary (proc-macro crate limitation)
 // Using simplified drift detection for now
@@ -350,54 +350,6 @@ fn spec_section_matches_lock(spec_section: &str, lock: &str) -> bool {
     spec_parts[..lock_parts.len()] == lock_parts[..]
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{formula_latex_parseable_for_verify, spec_section_matches_lock};
-
-    #[test]
-    fn formula_parse_gate_accepts_known_witness_style_body() {
-        assert!(formula_latex_parseable_for_verify("true"));
-        assert!(formula_latex_parseable_for_verify(r" x \leq y "));
-    }
-
-    #[test]
-    fn formula_parse_gate_accepts_cdot_times_unicode_comparison() {
-        assert!(formula_latex_parseable_for_verify(r"w \cdot h \leq z"));
-        assert!(formula_latex_parseable_for_verify(r"a × b ≤ c")); // × and ≤ Unicode
-        assert!(formula_latex_parseable_for_verify(r"\mathrm{X} >= 0"));
-    }
-
-    #[test]
-    fn formula_parse_gate_accepts_unicode_logic_ne_minus_implication() {
-        assert!(formula_latex_parseable_for_verify(r"p ≠ q")); // U+2260
-        assert!(formula_latex_parseable_for_verify(r"a − b ≤ c")); // U+2212 minus
-        assert!(formula_latex_parseable_for_verify(r"x ∧ y ≤ z")); // U+2227
-        assert!(formula_latex_parseable_for_verify(r"m ∨ n ≥ k")); // U+2228
-        assert!(formula_latex_parseable_for_verify(r"a ⇒ x ≤ y")); // Unicode ⇒ → conclusion `x <= y`
-    }
-
-    #[test]
-    fn formula_parse_gate_rejects_empty_or_pure_noise() {
-        assert!(!formula_latex_parseable_for_verify(""));
-        assert!(!formula_latex_parseable_for_verify("   "));
-        assert!(!formula_latex_parseable_for_verify(
-            "\\notProbablyValidRust blah"
-        ));
-    }
-
-    #[test]
-    fn section_prefix_does_not_match_sibling_minor() {
-        assert!(!spec_section_matches_lock("5.10", "5.1"));
-        assert!(!spec_section_matches_lock("5.1", "5.1.1"));
-    }
-
-    #[test]
-    fn section_prefix_matches_descendants() {
-        assert!(spec_section_matches_lock("5.1.1", "5.1"));
-        assert!(spec_section_matches_lock("5.1", "5.1"));
-    }
-}
-
 /// Convert Rust snake_case to PascalCase
 fn rust_to_pascal_case(rust_name: &str) -> String {
     rust_name
@@ -653,4 +605,52 @@ pub fn format_drift_json(result: &DriftResult) -> String {
         })).collect::<Vec<_>>(),
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{formula_latex_parseable_for_verify, spec_section_matches_lock};
+
+    #[test]
+    fn formula_parse_gate_accepts_known_witness_style_body() {
+        assert!(formula_latex_parseable_for_verify("true"));
+        assert!(formula_latex_parseable_for_verify(r" x \leq y "));
+    }
+
+    #[test]
+    fn formula_parse_gate_accepts_cdot_times_unicode_comparison() {
+        assert!(formula_latex_parseable_for_verify(r"w \cdot h \leq z"));
+        assert!(formula_latex_parseable_for_verify(r"a × b ≤ c")); // × and ≤ Unicode
+        assert!(formula_latex_parseable_for_verify(r"\mathrm{X} >= 0"));
+    }
+
+    #[test]
+    fn formula_parse_gate_accepts_unicode_logic_ne_minus_implication() {
+        assert!(formula_latex_parseable_for_verify(r"p ≠ q")); // U+2260
+        assert!(formula_latex_parseable_for_verify(r"a − b ≤ c")); // U+2212 minus
+        assert!(formula_latex_parseable_for_verify(r"x ∧ y ≤ z")); // U+2227
+        assert!(formula_latex_parseable_for_verify(r"m ∨ n ≥ k")); // U+2228
+        assert!(formula_latex_parseable_for_verify(r"a ⇒ x ≤ y")); // Unicode ⇒ → conclusion `x <= y`
+    }
+
+    #[test]
+    fn formula_parse_gate_rejects_empty_or_pure_noise() {
+        assert!(!formula_latex_parseable_for_verify(""));
+        assert!(!formula_latex_parseable_for_verify("   "));
+        assert!(!formula_latex_parseable_for_verify(
+            "\\notProbablyValidRust blah"
+        ));
+    }
+
+    #[test]
+    fn section_prefix_does_not_match_sibling_minor() {
+        assert!(!spec_section_matches_lock("5.10", "5.1"));
+        assert!(!spec_section_matches_lock("5.1", "5.1.1"));
+    }
+
+    #[test]
+    fn section_prefix_matches_descendants() {
+        assert!(spec_section_matches_lock("5.1.1", "5.1"));
+        assert!(spec_section_matches_lock("5.1", "5.1"));
+    }
 }

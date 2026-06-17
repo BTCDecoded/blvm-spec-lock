@@ -1493,7 +1493,7 @@ pub enum VerificationResult {
 #[cfg(test)]
 mod spec_locked_anchor_extract_tests {
     use super::{extract_constant_anchor, extract_formula_anchor, extract_section};
-    use syn::{parse_quote, ItemFn};
+    use syn::{ItemFn, parse_quote};
 
     #[test]
     fn dual_literal_extracts_formula_and_section() {
@@ -1565,8 +1565,8 @@ mod spec_locked_anchor_extract_tests {
 #[cfg(test)]
 mod failure_kind_tests {
     use super::{
-        demote_if_all_spec_derived, failed_verification, failure_kind, FailureKind, PartialReason,
-        VerificationResult,
+        FailureKind, PartialReason, VerificationResult, demote_if_all_spec_derived,
+        failed_verification, failure_kind,
     };
 
     #[test]
@@ -1657,7 +1657,7 @@ mod failure_kind_tests {
             VerificationResult::Partial { partial_reason, .. } => {
                 assert_eq!(partial_reason, Some(PartialReason::UnsupportedTranslation));
             }
-            _ => panic!("expected Partial, got {:?}", result),
+            _ => panic!("expected Partial, got {result:?}"),
         }
     }
 
@@ -1681,7 +1681,7 @@ mod failure_kind_tests {
             VerificationResult::Partial { partial_reason, .. } => {
                 assert_eq!(partial_reason, Some(PartialReason::UnsupportedTranslation));
             }
-            _ => panic!("expected Partial, got {:?}", result),
+            _ => panic!("expected Partial, got {result:?}"),
         }
     }
 
@@ -1700,7 +1700,7 @@ mod failure_kind_tests {
             VerificationResult::Partial { partial_reason, .. } => {
                 assert_eq!(partial_reason, Some(PartialReason::UnsupportedTranslation));
             }
-            _ => panic!("expected Partial, got {:?}", result),
+            _ => panic!("expected Partial, got {result:?}"),
         }
     }
 
@@ -1740,7 +1740,7 @@ mod failure_kind_tests {
             VerificationResult::Partial { partial_reason, .. } => {
                 assert_eq!(partial_reason, Some(PartialReason::UnsupportedTranslation));
             }
-            _ => panic!("expected Partial, got {:?}", result),
+            _ => panic!("expected Partial, got {result:?}"),
         }
     }
 }

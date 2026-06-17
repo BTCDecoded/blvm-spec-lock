@@ -387,7 +387,10 @@ pub fn format_formula_verify_human(
     let _ = writeln!(&mut s);
 
     if analysis.rows.is_empty() {
-        let _ = writeln!(&mut s, "  (no **`F_*`** formulas in merged spec — ingest enabled via **`SPEC_LOCK_FORMULAS`**)");
+        let _ = writeln!(
+            &mut s,
+            "  (no **`F_*`** formulas in merged spec — ingest enabled via **`SPEC_LOCK_FORMULAS`**)"
+        );
         let _ = writeln!(&mut s);
         let _ = writeln!(&mut s, "summary: 0 **`F_*`** rows");
         return s;
@@ -449,11 +452,264 @@ fn format_json(results: &[(FunctionToVerify, VerificationResult)]) -> String {
     format_verify_json_report(results, None)
 }
 
+/// Format as JUnit XML
+fn format_junit(results: &[(FunctionToVerify, VerificationResult)]) -> String {
+    use std::fmt::Write;
+
+    let _passed = results
+        .iter()
+        .filter(|(_, r)| matches!(r, VerificationResult::Passed { .. }))
+        .count();
+    let failed = results
+        .iter()
+        .filter(|(_, r)| {
+            matches!(
+                r,
+                VerificationResult::Failed { .. } | VerificationResult::NoContracts { .. }
+            )
+        })
+        .count();
+    let total = results.len();
+
+    let mut xml = String::new();
+    xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    writeln!(
+        &mut xml,
+        "<testsuites name=\"blvm-spec-lock\" tests=\"{total}\" failures=\"{failed}\" time=\"0.0\">"
+    )
+    .unwrap();
+    writeln!(
+        &mut xml,
+        "  <testsuite name=\"verification\" tests=\"{total}\" failures=\"{failed}\" time=\"0.0\">"
+    )
+    .unwrap();
+
+    for (func, result) in results {
+        let classname = func
+            .file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+
+        let status_attr = match result {
+            VerificationResult::Passed { .. } => "",
+            VerificationResult::Failed { .. } => " status=\"failed\"",
+            VerificationResult::Partial { .. } => " status=\"partial\"",
+            VerificationResult::NoContracts { .. } => " status=\"failed\"",
+            VerificationResult::NotImplemented => " status=\"not_implemented\"",
+        };
+
+        writeln!(
+            &mut xml,
+            "    <testcase name=\"{}\" classname=\"{}\"{}>",
+            func.function_name, classname, status_attr
+        )
+        .unwrap();
+
+        if let Some(ref section) = func.section {
+            write!(
+                &mut xml,
+                "      <properties>\n        <property name=\"section\" value=\"{section}\"/>\n      </properties>\n"
+            ).unwrap();
+        }
+
+        if let VerificationResult::Failed {
+            contract,
+            reason,
+            kind,
+            partial_reason,
+        } = result
+        {
+            let mut suffix = format!("contract: {}; kind: {}", contract, kind.as_str(),);
+            if let Some(pr) = partial_reason {
+                suffix.push_str(&format!("; partial_reason={}", pr.as_str()));
+            }
+            writeln!(
+                &mut xml,
+                "      <failure message=\"{}\">{}</failure>",
+                reason.replace('"', "&quot;"),
+                suffix.replace('"', "&quot;"),
+            )
+            .unwrap();
+        }
+
+        if let VerificationResult::Partial {
+            verified,
+            total,
+            reason,
+            partial_reason,
+        } = result
+        {
+            let mut body = format!("partial {verified}/{total}");
+            if let Some(pr) = partial_reason {
+                body.push_str(&format!("; partial_reason={}", pr.as_str()));
+            }
+            if let Some(r) = reason {
+                body.push_str(&format!("; {r}"));
+            }
+            writeln!(
+                &mut xml,
+                "      <system-out>{}</system-out>",
+                body.replace('"', "&quot;")
+            )
+            .unwrap();
+        }
+
+        xml.push_str("    </testcase>\n");
+    }
+
+    xml.push_str("  </testsuite>\n");
+    xml.push_str("</testsuites>\n");
+
+    xml
+}
+
+/// Format as Markdown
+fn format_markdown(results: &[(FunctionToVerify, VerificationResult)]) -> String {
+    let mut md = String::new();
+
+    md.push_str("# BLVM Spec Lock Verification Report\n\n");
+    // Simple timestamp (would use chrono if available)
+    md.push_str("**Generated:** Verification Report\n\n");
+
+    // Summary
+    let passed = results
+        .iter()
+        .filter(|(_, r)| matches!(r, VerificationResult::Passed { .. }))
+        .count();
+    let failed = results
+        .iter()
+        .filter(|(_, r)| matches!(r, VerificationResult::Failed { .. }))
+        .count();
+    let partial = results
+        .iter()
+        .filter(|(_, r)| matches!(r, VerificationResult::Partial { .. }))
+        .count();
+    let no_contracts = results
+        .iter()
+        .filter(|(_, r)| matches!(r, VerificationResult::NoContracts { .. }))
+        .count();
+
+    md.push_str("## Summary\n\n");
+    md.push_str(&format!("- **Total Functions:** {}\n", results.len()));
+    md.push_str(&format!("- **Passed:** {passed} ✅\n"));
+    md.push_str(&format!("- **Failed:** {} ❌\n", failed + no_contracts));
+    md.push_str(&format!("- **Partial:** {partial} ⚠️\n\n"));
+
+    // Results table
+    md.push_str("## Results\n\n");
+    md.push_str("| File | Function | Section | Status |\n");
+    md.push_str("|------|----------|---------|--------|\n");
+
+    for (func, result) in results {
+        let file_name = func
+            .file_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+
+        let section = func.section.as_deref().unwrap_or("-");
+
+        let status = match result {
+            VerificationResult::Passed { body_translated } => {
+                if *body_translated {
+                    "✅ Passed (semantic)".to_string()
+                } else {
+                    "✅ Passed (type-level)".to_string()
+                }
+            }
+            VerificationResult::Failed {
+                kind,
+                partial_reason,
+                ..
+            } => {
+                let mut s = format!("❌ Failed [{}]", kind.as_str());
+                if *kind == FailureKind::SolverUnknown {
+                    if let Some(pr) = partial_reason {
+                        s.push_str(&format!(" ({})", pr.as_str()));
+                    }
+                }
+                s
+            }
+            VerificationResult::Partial {
+                verified,
+                total,
+                reason,
+                partial_reason,
+            } => {
+                let mut s = format!("⚠️ Partial ({verified}/{total})");
+                if let Some(pr) = partial_reason {
+                    s.push_str(&format!(" [{}]", pr.as_str()));
+                }
+                if let Some(r) = reason {
+                    s.push_str(&format!(": {r}"));
+                }
+                s
+            }
+            VerificationResult::NoContracts { section } => {
+                format!("❌ Failed (no contracts §{section})")
+            }
+            VerificationResult::NotImplemented => "⏳ Not Implemented".to_string(),
+        };
+
+        md.push_str(&format!(
+            "| `{}` | `{}` | {} | {} |\n",
+            file_name, func.function_name, section, status
+        ));
+    }
+
+    // Failed details
+    let failed_results: Vec<_> = results
+        .iter()
+        .filter(|(_, r)| {
+            matches!(
+                r,
+                VerificationResult::Failed { .. } | VerificationResult::NoContracts { .. }
+            )
+        })
+        .collect();
+
+    if !failed_results.is_empty() {
+        md.push_str("\n## Failed Verifications\n\n");
+        for (func, result) in failed_results {
+            md.push_str(&format!(
+                "### `{}::{}`\n\n",
+                func.file_path.display(),
+                func.function_name
+            ));
+            match result {
+                VerificationResult::Failed {
+                    contract,
+                    reason,
+                    kind,
+                    partial_reason,
+                } => {
+                    md.push_str(&format!("- **Contract:** {contract}\n"));
+                    md.push_str(&format!("- **Reason:** {reason}\n"));
+                    md.push_str(&format!("- **Failure kind:** {}\n", kind.as_str()));
+                    if let Some(pr) = partial_reason {
+                        md.push_str(&format!("- **Solver note:** {}\n", pr.as_str()));
+                    }
+                    md.push('\n');
+                }
+                VerificationResult::NoContracts { section } => {
+                    md.push_str(&format!(
+                        "- **Reason:** no contracts (section {section})\n\n"
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    md
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::verify::{
-        failed_verification, FailureKind, FunctionToVerify, PartialReason, VerificationResult,
+        FailureKind, FunctionToVerify, PartialReason, VerificationResult, failed_verification,
     };
     use std::path::PathBuf;
 
@@ -733,257 +989,4 @@ mod tests {
         assert!(s2.contains("\"failure_kind\": \"solver_unknown\""), "{s2}");
         assert!(s2.contains("\"partial_reason\": \"z3_unknown\""), "{s2}");
     }
-}
-
-/// Format as JUnit XML
-fn format_junit(results: &[(FunctionToVerify, VerificationResult)]) -> String {
-    use std::fmt::Write;
-
-    let _passed = results
-        .iter()
-        .filter(|(_, r)| matches!(r, VerificationResult::Passed { .. }))
-        .count();
-    let failed = results
-        .iter()
-        .filter(|(_, r)| {
-            matches!(
-                r,
-                VerificationResult::Failed { .. } | VerificationResult::NoContracts { .. }
-            )
-        })
-        .count();
-    let total = results.len();
-
-    let mut xml = String::new();
-    xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    writeln!(
-        &mut xml,
-        "<testsuites name=\"blvm-spec-lock\" tests=\"{total}\" failures=\"{failed}\" time=\"0.0\">"
-    )
-    .unwrap();
-    writeln!(
-        &mut xml,
-        "  <testsuite name=\"verification\" tests=\"{total}\" failures=\"{failed}\" time=\"0.0\">"
-    )
-    .unwrap();
-
-    for (func, result) in results {
-        let classname = func
-            .file_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
-
-        let status_attr = match result {
-            VerificationResult::Passed { .. } => "",
-            VerificationResult::Failed { .. } => " status=\"failed\"",
-            VerificationResult::Partial { .. } => " status=\"partial\"",
-            VerificationResult::NoContracts { .. } => " status=\"failed\"",
-            VerificationResult::NotImplemented => " status=\"not_implemented\"",
-        };
-
-        writeln!(
-            &mut xml,
-            "    <testcase name=\"{}\" classname=\"{}\"{}>",
-            func.function_name, classname, status_attr
-        )
-        .unwrap();
-
-        if let Some(ref section) = func.section {
-            write!(
-                &mut xml,
-                "      <properties>\n        <property name=\"section\" value=\"{section}\"/>\n      </properties>\n"
-            ).unwrap();
-        }
-
-        if let VerificationResult::Failed {
-            contract,
-            reason,
-            kind,
-            partial_reason,
-        } = result
-        {
-            let mut suffix = format!("contract: {}; kind: {}", contract, kind.as_str(),);
-            if let Some(pr) = partial_reason {
-                suffix.push_str(&format!("; partial_reason={}", pr.as_str()));
-            }
-            writeln!(
-                &mut xml,
-                "      <failure message=\"{}\">{}</failure>",
-                reason.replace('"', "&quot;"),
-                suffix.replace('"', "&quot;"),
-            )
-            .unwrap();
-        }
-
-        if let VerificationResult::Partial {
-            verified,
-            total,
-            reason,
-            partial_reason,
-        } = result
-        {
-            let mut body = format!("partial {verified}/{total}");
-            if let Some(pr) = partial_reason {
-                body.push_str(&format!("; partial_reason={}", pr.as_str()));
-            }
-            if let Some(r) = reason {
-                body.push_str(&format!("; {r}"));
-            }
-            writeln!(
-                &mut xml,
-                "      <system-out>{}</system-out>",
-                body.replace('"', "&quot;")
-            )
-            .unwrap();
-        }
-
-        xml.push_str("    </testcase>\n");
-    }
-
-    xml.push_str("  </testsuite>\n");
-    xml.push_str("</testsuites>\n");
-
-    xml
-}
-
-/// Format as Markdown
-fn format_markdown(results: &[(FunctionToVerify, VerificationResult)]) -> String {
-    let mut md = String::new();
-
-    md.push_str("# BLVM Spec Lock Verification Report\n\n");
-    // Simple timestamp (would use chrono if available)
-    md.push_str("**Generated:** Verification Report\n\n");
-
-    // Summary
-    let passed = results
-        .iter()
-        .filter(|(_, r)| matches!(r, VerificationResult::Passed { .. }))
-        .count();
-    let failed = results
-        .iter()
-        .filter(|(_, r)| matches!(r, VerificationResult::Failed { .. }))
-        .count();
-    let partial = results
-        .iter()
-        .filter(|(_, r)| matches!(r, VerificationResult::Partial { .. }))
-        .count();
-    let no_contracts = results
-        .iter()
-        .filter(|(_, r)| matches!(r, VerificationResult::NoContracts { .. }))
-        .count();
-
-    md.push_str("## Summary\n\n");
-    md.push_str(&format!("- **Total Functions:** {}\n", results.len()));
-    md.push_str(&format!("- **Passed:** {passed} ✅\n"));
-    md.push_str(&format!("- **Failed:** {} ❌\n", failed + no_contracts));
-    md.push_str(&format!("- **Partial:** {partial} ⚠️\n\n"));
-
-    // Results table
-    md.push_str("## Results\n\n");
-    md.push_str("| File | Function | Section | Status |\n");
-    md.push_str("|------|----------|---------|--------|\n");
-
-    for (func, result) in results {
-        let file_name = func
-            .file_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
-
-        let section = func.section.as_deref().unwrap_or("-");
-
-        let status = match result {
-            VerificationResult::Passed { body_translated } => {
-                if *body_translated {
-                    "✅ Passed (semantic)".to_string()
-                } else {
-                    "✅ Passed (type-level)".to_string()
-                }
-            }
-            VerificationResult::Failed {
-                kind,
-                partial_reason,
-                ..
-            } => {
-                let mut s = format!("❌ Failed [{}]", kind.as_str());
-                if *kind == FailureKind::SolverUnknown {
-                    if let Some(pr) = partial_reason {
-                        s.push_str(&format!(" ({})", pr.as_str()));
-                    }
-                }
-                s
-            }
-            VerificationResult::Partial {
-                verified,
-                total,
-                reason,
-                partial_reason,
-            } => {
-                let mut s = format!("⚠️ Partial ({verified}/{total})");
-                if let Some(pr) = partial_reason {
-                    s.push_str(&format!(" [{}]", pr.as_str()));
-                }
-                if let Some(r) = reason {
-                    s.push_str(&format!(": {r}"));
-                }
-                s
-            }
-            VerificationResult::NoContracts { section } => {
-                format!("❌ Failed (no contracts §{section})")
-            }
-            VerificationResult::NotImplemented => "⏳ Not Implemented".to_string(),
-        };
-
-        md.push_str(&format!(
-            "| `{}` | `{}` | {} | {} |\n",
-            file_name, func.function_name, section, status
-        ));
-    }
-
-    // Failed details
-    let failed_results: Vec<_> = results
-        .iter()
-        .filter(|(_, r)| {
-            matches!(
-                r,
-                VerificationResult::Failed { .. } | VerificationResult::NoContracts { .. }
-            )
-        })
-        .collect();
-
-    if !failed_results.is_empty() {
-        md.push_str("\n## Failed Verifications\n\n");
-        for (func, result) in failed_results {
-            md.push_str(&format!(
-                "### `{}::{}`\n\n",
-                func.file_path.display(),
-                func.function_name
-            ));
-            match result {
-                VerificationResult::Failed {
-                    contract,
-                    reason,
-                    kind,
-                    partial_reason,
-                } => {
-                    md.push_str(&format!("- **Contract:** {contract}\n"));
-                    md.push_str(&format!("- **Reason:** {reason}\n"));
-                    md.push_str(&format!("- **Failure kind:** {}\n", kind.as_str()));
-                    if let Some(pr) = partial_reason {
-                        md.push_str(&format!("- **Solver note:** {}\n", pr.as_str()));
-                    }
-                    md.push('\n');
-                }
-                VerificationResult::NoContracts { section } => {
-                    md.push_str(&format!(
-                        "- **Reason:** no contracts (section {section})\n\n"
-                    ));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    md
 }

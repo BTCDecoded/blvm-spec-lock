@@ -17,10 +17,10 @@
 use crate::parser::contracts::{Contract, ContractType};
 #[cfg(feature = "z3")]
 use crate::translator::z3_translator::{
-    returns_bool_like, returns_result_or_option_result, Z3Translator, Z3VarMap,
+    Z3Translator, Z3VarMap, returns_bool_like, returns_result_or_option_result,
 };
 #[cfg(feature = "z3")]
-use z3::ast::{forall_const, Ast, Bool, Int};
+use z3::ast::{Ast, Bool, Int, forall_const};
 #[cfg(feature = "z3")]
 use z3::{Context, SatResult, Solver, Sort};
 
@@ -635,12 +635,12 @@ impl Z3Verifier {
             Ok(None) => {
                 return VerificationResult::Error {
                     error: "Could not translate body for run 1 (no formula)".to_string(),
-                }
+                };
             }
             Err(e) => {
                 return VerificationResult::Error {
                     error: format!("Could not translate body for run 1: {e}"),
-                }
+                };
             }
         };
         let formula2 = match self.translator.translate_function_body(func, &mut vars2) {
@@ -648,12 +648,12 @@ impl Z3Verifier {
             Ok(None) => {
                 return VerificationResult::Error {
                     error: "Could not translate body for run 2 (no formula)".to_string(),
-                }
+                };
             }
             Err(e) => {
                 return VerificationResult::Error {
                     error: format!("Could not translate body for run 2: {e}"),
-                }
+                };
             }
         };
 

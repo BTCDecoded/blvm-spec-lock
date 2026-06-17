@@ -3,7 +3,7 @@
 //! Reports which functions are spec-locked, coverage by section, missing functions, etc.
 //! With --spec-path: theorems/properties → contracts → parseable vs unparseable.
 
-use crate::cli::verify::{discover_functions, FunctionToVerify};
+use crate::cli::verify::{FunctionToVerify, discover_functions};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};

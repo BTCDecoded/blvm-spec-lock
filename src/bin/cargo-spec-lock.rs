@@ -836,7 +836,9 @@ fn handle_verify(args: VerifyArgs) -> i32 {
             }
         }
     } else {
-        eprintln!("Note: --spec-path not set. Use --spec-path <ORANGE_PAPER.md> for spec-derived contracts.");
+        eprintln!(
+            "Note: --spec-path not set. Use --spec-path <ORANGE_PAPER.md> for spec-derived contracts."
+        );
         eprintln!("  Without it, only manual #[requires]/#[ensures] are used.");
     }
 
@@ -864,11 +866,11 @@ fn handle_verify(args: VerifyArgs) -> i32 {
     // Merged **`F_*`** registry gate (same as **`check-formulas`** + **`verify-formulas`** SAT smoke): runs
     // before Rust function verification and fails fast on blocking static/Z3 outcomes.
     use crate::cli::formula_checks::{
-        analyze_formula_registry, registry_has_blocking_static_failure,
-        registry_has_blocking_z3_outcome, FormulaAnalyzeConfig, FormulaRegistryAnalysis,
+        FormulaAnalyzeConfig, FormulaRegistryAnalysis, analyze_formula_registry,
+        registry_has_blocking_static_failure, registry_has_blocking_z3_outcome,
     };
     use crate::cli::output::{
-        format_formula_verify_human, format_verify_json_report, FormulaVerifyJsonFlags,
+        FormulaVerifyJsonFlags, format_formula_verify_human, format_verify_json_report,
     };
 
     let mut formula_registry_for_json: Option<(FormulaRegistryAnalysis, FormulaVerifyJsonFlags)> =
@@ -1026,11 +1028,11 @@ fn handle_verify_formulas(
     json_out: Option<PathBuf>,
 ) -> i32 {
     use crate::cli::formula_checks::{
-        analyze_formula_registry, registry_has_blocking_static_failure,
-        registry_has_blocking_z3_outcome, FormulaAnalyzeConfig,
+        FormulaAnalyzeConfig, analyze_formula_registry, registry_has_blocking_static_failure,
+        registry_has_blocking_z3_outcome,
     };
     use crate::cli::output::{
-        format_formula_verify_human, format_formula_verify_json_report, FormulaVerifyJsonFlags,
+        FormulaVerifyJsonFlags, format_formula_verify_human, format_formula_verify_json_report,
     };
     use crate::parser::orange_paper::SpecParser;
 
@@ -1128,9 +1130,8 @@ fn handle_verify_formulas(
 
 fn handle_check_formulas(spec_paths: Vec<PathBuf>, z3_sat: bool, timeout_secs: u64) -> i32 {
     use crate::cli::formula_checks::{
-        analyze_formula_registry, registry_has_blocking_static_failure,
-        registry_has_blocking_z3_outcome, FormulaAnalyzeConfig, FormulaStaticOutcome,
-        Z3FormulaPhase,
+        FormulaAnalyzeConfig, FormulaStaticOutcome, Z3FormulaPhase, analyze_formula_registry,
+        registry_has_blocking_static_failure, registry_has_blocking_z3_outcome,
     };
     use crate::parser::orange_paper::SpecParser;
 
@@ -1539,7 +1540,9 @@ fn translate_formula_to_rust(formula: &str, func_name: &str) -> String {
             .chars()
             .take(80)
             .collect::<String>();
-        format!("    // TODO: Implement formula translation for {func_name}\n    // Formula: {formula_clean}...\n    // This formula requires manual implementation\n    unimplemented!(\"Formula translation not yet implemented for {func_name}\")")
+        format!(
+            "    // TODO: Implement formula translation for {func_name}\n    // Formula: {formula_clean}...\n    // This formula requires manual implementation\n    unimplemented!(\"Formula translation not yet implemented for {func_name}\")"
+        )
     }
 }
 

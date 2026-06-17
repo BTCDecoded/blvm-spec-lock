@@ -5,14 +5,14 @@
 //! which will be verified by the BLVM Spec Lock verification tool.
 
 use crate::parser::{
-    section_id_subsumes_formula_section, Contract, ContractType, FunctionSpec, SpecParser,
-    SpecSection,
+    Contract, ContractType, FunctionSpec, SpecParser, SpecSection,
+    section_id_subsumes_formula_section,
 };
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use regex::Regex;
 use std::path::PathBuf;
-use syn::{parse::Parse, Ident, LitStr, Token};
+use syn::{Ident, LitStr, Token, parse::Parse};
 
 /// Resolve Orange Paper markdown paths for `#[spec_locked]`.
 ///
@@ -449,7 +449,7 @@ pub fn process_spec_locked(
     args: proc_macro::TokenStream,
     input: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    use syn::{parse_macro_input, ItemFn};
+    use syn::{ItemFn, parse_macro_input};
 
     // Parse the function
     let func = parse_macro_input!(input as ItemFn);
@@ -773,18 +773,22 @@ pub fn process_spec_locked(
                         } else {
                             // Still not found - create minimal spec (migration mode)
                             // This allows functions to compile even if not yet in Orange Paper
-                            let minimal_spec_static: &'static FunctionSpec = Box::leak(Box::new(FunctionSpec {
-                                        name: func_name.clone(),
-                                        section: "auto-inferred".to_string(),
-                                        signature: None,
-                                        formula: None,
-                                        description: Some(format!("Function '{func_name}' auto-inferred (not yet in Orange Paper - migration mode)")),
-                                        conditions: vec![],
-                                        theorems: vec![],
-                                        contracts: vec![],
-                                        properties: vec![],
-                                        content: String::new(),
-                                    }));
+                            let minimal_spec_static: &'static FunctionSpec = Box::leak(Box::new(
+                                FunctionSpec {
+                                    name: func_name.clone(),
+                                    section: "auto-inferred".to_string(),
+                                    signature: None,
+                                    formula: None,
+                                    description: Some(format!(
+                                        "Function '{func_name}' auto-inferred (not yet in Orange Paper - migration mode)"
+                                    )),
+                                    conditions: vec![],
+                                    theorems: vec![],
+                                    contracts: vec![],
+                                    properties: vec![],
+                                    content: String::new(),
+                                },
+                            ));
 
                             // Use first available section as fallback (try common sections)
                             let default_section = parser
@@ -885,7 +889,7 @@ pub fn process_spec_locked(
                 // Actually, the simplest is to create a static-like minimal spec inline
                 // But we can't do that easily. Let's just allow it and let generate_ensures handle it
                 // We'll create a boxed minimal spec and leak it (not ideal but works for proc macro)
-                let minimal_spec = Box::leak(Box::new(FunctionSpec {
+                Box::leak(Box::new(FunctionSpec {
                     name: func_name.clone(),
                     section: section_str.to_string(),
                     signature: None,
@@ -898,8 +902,7 @@ pub fn process_spec_locked(
                     contracts: vec![],
                     properties: vec![],
                     content: section.content.clone(),
-                }));
-                minimal_spec
+                }))
             } else {
                 // Function not found in section - create minimal spec
                 let available: Vec<String> =
@@ -912,8 +915,7 @@ pub fn process_spec_locked(
                 } else {
                     available.join(", ")
                 };
-                // Create a minimal FunctionSpec for functions not yet in spec
-                let minimal_spec = Box::leak(Box::new(FunctionSpec {
+                Box::leak(Box::new(FunctionSpec {
                     name: func_name.clone(),
                     section: section_str.to_string(),
                     signature: None,
@@ -926,8 +928,7 @@ pub fn process_spec_locked(
                     conditions: vec![],
                     theorems: vec![],
                     contracts: vec![],
-                }));
-                minimal_spec
+                }))
             }
         }
     };

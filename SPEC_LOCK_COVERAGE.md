@@ -2,7 +2,7 @@
 
 This document describes blvm-spec-lock verification status across blvm-consensus and blvm-node.
 
-**Scope**: The Orange Paper focuses on **consensus only**. RPC, rate limiters, and node-internal design (beyond wire format) are out of scope. See [CONSENSUS_SPEC_FOCUS_PLAN.md](../docs/CONSENSUS_SPEC_FOCUS_PLAN.md).
+**Scope**: The Orange Paper focuses on **consensus only**. RPC, rate limiters, and node-internal design (beyond wire format) are out of scope.
 
 ## Actual `#[spec_locked]` count (inventory)
 

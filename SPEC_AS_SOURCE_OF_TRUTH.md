@@ -53,7 +53,7 @@ Hash primitives (SHA256, Hash256) are implied by the spec's use in formulas (e.g
 
 - **blvm-consensus**: 162 passed, 0 failed, 0 partial (all functions fully verified)
 - **blvm-node**: 8 passed (Dandelion 10.6, protocol 10.1.1, handshake 10.2.1)
-- **Spec scope**: Consensus only. RPC, rate limiters out of scope. See [CONSENSUS_SPEC_FOCUS_PLAN.md](../docs/CONSENSUS_SPEC_FOCUS_PLAN.md).
+- **Spec scope**: Consensus only. RPC, rate limiters out of scope.
 
 ## Contract Matching (Elegant Fallbacks)
 

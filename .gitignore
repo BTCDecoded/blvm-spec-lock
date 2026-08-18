@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target/
+# Nested fuzz workspace (see fuzz/Cargo.toml); /target/ above does not match this path.
+fuzz/target/
 **/*.rs.bk
 *.pdb
 **/*.rmeta

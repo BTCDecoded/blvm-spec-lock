@@ -197,7 +197,22 @@ impl Z3Verifier {
                     // A body is concrete only when it contains arithmetic beyond uninterpreted
                     // wrappers: actual bit-operations (bvshr/shl), integer division, modulo, or
                     // explicit numerical comparisons (indicated by numeric literals in the formula).
-                    let formula_str = impl_formula.to_string();
+                    // Nested `ite` DAGs (64-epoch `total_supply` unroll) must not be
+                    // fully pretty-printed: Z3 `to_string` expands sharing and hangs.
+                    // Only stringify wrapper/placeholder bodies (`call_*`, `for_loop_*`).
+                    let looks_wrapper_or_placeholder = shared_vars.keys().any(|k| {
+                        let k = k.as_str();
+                        (k.starts_with("call_") && k.ends_with("_result"))
+                            || k.starts_with("for_loop_")
+                    });
+                    let formula_str;
+                    let body_formula_vacuous = if looks_wrapper_or_placeholder {
+                        formula_str = impl_formula.to_string();
+                        is_formula_body_vacuous(&formula_str)
+                    } else {
+                        formula_str = String::new();
+                        false
+                    };
                     // Detect vacuous body formulas that add no useful constraints:
                     //
                     // 1. Tautology: "(= result result)" — translator fell back to a no-op.
@@ -224,13 +239,16 @@ impl Z3Verifier {
                     // Concrete formulas use built-in operators: arithmetic (+,-,*,/,div,mod,
                     // bvshr/shl), comparisons (>=,<=,>,<), Boolean (and,or,not), conditionals
                     // (ite), or literals (true,false,integers).
-                    let body_formula_vacuous = is_formula_body_vacuous(&formula_str);
                     if std::env::var("SPEC_LOCK_DEBUG_BODY").is_ok() {
                         eprintln!("BODY_DEBUG: formula_vacuous={body_formula_vacuous}");
-                        eprintln!(
-                            "BODY_DEBUG formula: {}",
-                            &formula_str[..formula_str.len().min(300)]
-                        );
+                        if formula_str.is_empty() {
+                            eprintln!("BODY_DEBUG formula: <unrolled/concrete; skipped stringify>");
+                        } else {
+                            eprintln!(
+                                "BODY_DEBUG formula: {}",
+                                &formula_str[..formula_str.len().min(300)]
+                            );
+                        }
                     }
                     solver.assert(&impl_formula);
 
@@ -828,6 +846,8 @@ fn is_formula_body_vacuous(formula_str: &str) -> bool {
     const Z3_BUILTIN_PREFIX: &[&str] = &[
         "+", "-", "*", "/", "div", "mod", "rem", ">=", "<=", ">", "<", "=", "not", "and", "or",
         "ite", "=>", "bvshr", "bvshl", "bvand", "bvor", "bvnot", "let", "forall", "exists",
+        // Axiomatized in add_shift_axioms: shr(a,k)=a/2^k for k<64, 0 for k>=64.
+        "shr", "shl",
     ];
     if s.starts_with("(= ") && s.ends_with(')') {
         let inner = &s[3..s.len() - 1]; // strip "(= " and ")"
@@ -851,8 +871,8 @@ fn is_formula_body_vacuous(formula_str: &str) -> bool {
     const CONCRETE_MARKERS: &[&str] = &[
         // Arithmetic
         "(+ ", "(- ", "(* ", "(/ ", " div ", " mod ", "(div ", "(rem ",
-        // Bit-vector shifts
-        "bvshr", "bvshl", // Comparison (prefix application style)
+        // Bit-vector shifts and axiomatized integer shifts (add_shift_axioms)
+        "bvshr", "bvshl", "(shr ", "(shl ", // Comparison (prefix application style)
         "(>= ", "(<= ", "(> ", "(< ", // Boolean
         "(and ", "(or ", "(not ",
         "(ite ",
@@ -908,6 +928,26 @@ fn is_formula_body_vacuous(formula_str: &str) -> bool {
 
     // Everything else without concrete markers is an uninterpreted-function application.
     true
+}
+
+#[cfg(all(test, feature = "z3"))]
+mod vacuity_tests {
+    use super::is_formula_body_vacuous;
+
+    #[test]
+    fn production_subsidy_shr_is_concrete() {
+        assert!(
+            !is_formula_body_vacuous("(= result (shr 5000000000 (div height 210000)))"),
+            "shr is axiomatized; this is get_block_subsidy"
+        );
+    }
+
+    #[test]
+    fn wrapper_uf_call_is_vacuous() {
+        assert!(is_formula_body_vacuous(
+            "(= result call_get_block_subsidy_result)"
+        ));
+    }
 }
 
 #[cfg(all(test, feature = "z3"))]

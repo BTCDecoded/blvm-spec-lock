@@ -262,8 +262,10 @@ impl Z3Translator {
             }
             Expr::Match(match_expr) => self.translate_match(match_expr, vars),
             Expr::ForLoop(fl) => {
-                let _ = self.translate_expr_with_vars(&fl.expr, vars);
-                let _ = self.translate_block_to_result_formula(&fl.body, vars);
+                if !self.try_unroll_constant_for(fl, vars)? {
+                    let _ = self.translate_expr_with_vars(&fl.expr, vars);
+                    let _ = self.translate_block_to_result_formula(&fl.body, vars);
+                }
                 let name = format!("for_loop_{}", vars.len());
                 let var = vars.entry(name.clone()).or_insert_with(|| {
                     let symbol = z3::Symbol::String(name);
@@ -788,15 +790,25 @@ impl Z3Translator {
                 self.translate_expr_with_vars(&method.receiver, vars)
             }
             "map" => {
-                // option.map(|x| f(x)) - use closure body or pass through
+                // option.map(|x| f(x)) — bind x to the receiver when Option is modeled as Int
+                // (checked_sub/add/mul). A fresh `map_x` makes `x.map(|d| d + 1)` vacuous.
                 if let Some(Expr::Closure(closure)) = method.args.first() {
                     if closure.inputs.len() == 1 {
                         if let syn::Pat::Ident(ident) = &closure.inputs[0] {
                             let param = ident.ident.to_string();
-                            let _recv = self.translate_expr_with_vars(&method.receiver, vars)?;
-                            let fresh = format!("map_{param}");
-                            let new_var = Int::new_const(&self.ctx, z3::Symbol::String(fresh));
-                            let old = vars.insert(param.clone(), new_var.into());
+                            let recv = self.translate_expr_with_vars(&method.receiver, vars)?;
+                            let bound = if recv.as_int().is_some() || recv.as_bool().is_some() {
+                                recv
+                            } else {
+                                let fresh = format!("map_{param}");
+                                vars.entry(fresh.clone())
+                                    .or_insert_with(|| {
+                                        let symbol = z3::Symbol::String(fresh);
+                                        Int::new_const(&self.ctx, symbol).into()
+                                    })
+                                    .clone()
+                            };
+                            let old = vars.insert(param.clone(), bound);
                             let result = self.translate_expr_with_vars(&closure.body, vars);
                             if let Some(prev) = old {
                                 vars.insert(param, prev);
@@ -976,12 +988,11 @@ impl Z3Translator {
                     bool_val.clone().into()
                 })
             }
-            "unwrap" => {
-                // opt.unwrap() or res.unwrap(): return inner value when Some/Ok.
-                // If receiver is Some(expr) or Ok(expr), use that; else fresh Int.
+            "unwrap" | "expect" => {
+                // opt.unwrap()/expect: return inner value when Some/Ok.
+                // checked_* already model Option as the Int; pass that through.
                 let receiver = &method.receiver;
-                if method.args.is_empty() {
-                    // Try to unwrap from call: Some(x) or Ok(x)
+                if method.args.is_empty() || method_name == "expect" {
                     if let Expr::Call(call) = &**receiver {
                         if let Ok(name) = call_expr_to_name(&call.func) {
                             let base = name.split("::").last().unwrap_or(&name);
@@ -990,7 +1001,11 @@ impl Z3Translator {
                             }
                         }
                     }
-                    // Fallback: fresh Int for unknown Option/Result value
+                    if let Ok(recv) = self.translate_expr_with_vars(receiver, vars) {
+                        if recv.as_int().is_some() || recv.as_bool().is_some() {
+                            return Ok(recv);
+                        }
+                    }
                     let _ = self.translate_expr_with_vars(receiver, vars);
                     let base = expr_to_var_hint(receiver);
                     let name = format!("{base}_unwrap");
@@ -1279,6 +1294,21 @@ impl Z3Translator {
             });
             return Ok(var.clone());
         }
+        // Production locktime::locktime_types_match: (a < T) == (b < T).
+        // Interpret it; a fresh UF makes check_bip65 type-level-only.
+        if base == "locktime_types_match" && call.args.len() == 2 {
+            let a = self.translate_expr_with_vars(&call.args[0], vars)?;
+            let b = self.translate_expr_with_vars(&call.args[1], vars)?;
+            if let (Some(ai), Some(bi)) = (a.as_int(), b.as_int()) {
+                let threshold = Int::from_i64(&self.ctx, 500_000_000);
+                let a_h = ai.lt(&threshold);
+                let b_h = bi.lt(&threshold);
+                return Ok(a_h._eq(&b_h).into());
+            }
+            return Err(TranslationError::TypeError(
+                "locktime_types_match requires integer arguments".into(),
+            ));
+        }
         if let Some(fresh_name) = known_bool_returning_function(&name) {
             for arg in &call.args {
                 let _ = self.translate_expr_with_vars(arg, vars);
@@ -1360,6 +1390,22 @@ impl Z3Translator {
             let some_arm = parse_some_ok_arm(arm1).or_else(|| parse_some_ok_arm(arm2));
             let none_arm = parse_none_err_arm(arm1).or_else(|| parse_none_err_arm(arm2));
             if let (Some((inner_var, body)), Some(default_body)) = (some_arm, none_arm) {
+                // checked_* returns Int (overflow ignored). Take the Some arm only so
+                // `match x.checked_mul(y) { Some(c) => c, None => { return CAP; } }`
+                // is the product, not a fresh `is_some` UF.
+                if let Some(si) = scrutinee.as_int() {
+                    let old = vars.insert(inner_var.clone(), si.clone().into());
+                    let body_z3 = self.translate_expr_with_vars(body, vars);
+                    match old {
+                        Some(prev) => {
+                            vars.insert(inner_var, prev);
+                        }
+                        None => {
+                            vars.remove(&inner_var);
+                        }
+                    }
+                    return body_z3;
+                }
                 let inner_val = vars
                     .entry(inner_var.clone())
                     .or_insert_with(|| {
@@ -1789,6 +1835,177 @@ impl Z3Translator {
         (vars, type_constraints)
     }
 
+    /// Bind `name = expr` when the RHS translates to Int/Bool.
+    fn bind_int_or_bool<'a>(
+        &'a self,
+        name: String,
+        expr: &Expr,
+        vars: &mut Z3VarMap<'a>,
+    ) {
+        if let Ok(z3_expr) = self.translate_expr_with_vars(expr, vars) {
+            if z3_expr.as_int().is_some() || z3_expr.as_bool().is_some() {
+                vars.insert(name, z3_expr);
+            }
+        }
+    }
+
+    /// Expand `for ident in LO..HI` when both bounds are integer literals and
+    /// `HI - LO` is in `1..=MAX_FOR_UNROLL`. `if cond { break }` skips this and
+    /// later iterations via `ite`.
+    fn try_unroll_constant_for<'a>(
+        &'a self,
+        fl: &syn::ExprForLoop,
+        vars: &mut Z3VarMap<'a>,
+    ) -> Result<bool, TranslationError> {
+        let Some((lo, hi)) = constant_half_open_range(&fl.expr) else {
+            return Ok(false);
+        };
+        let span = hi.saturating_sub(lo);
+        if span <= 0 || span > MAX_FOR_UNROLL {
+            return Ok(false);
+        }
+        let Some(k_name) = loop_ident(&fl.pat) else {
+            return Ok(false);
+        };
+
+        // Only `ite`-merge locals that existed before the loop (accumulators).
+        // Merging per-iteration bindings (`period_start`, `count`, …) nests their
+        // ASTs and blows up `total_supply`'s 64-epoch unroll.
+        let accumulators: Vec<String> = vars
+            .keys()
+            .filter(|n| *n != &k_name && *n != "result")
+            .cloned()
+            .collect();
+
+        let mut broken: Option<z3::ast::Bool<'a>> = None;
+        for k in lo..hi {
+            let k_int = Int::from_i64(&self.ctx, k);
+            let old_k = vars.insert(k_name.clone(), k_int.into());
+            let before = vars.clone();
+            let mut this_break: Option<z3::ast::Bool<'a>> = None;
+            let mut assigned: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
+            for stmt in &fl.body.stmts {
+                match stmt {
+                    Stmt::Local(local) => {
+                        if let Some(init) = &local.init {
+                            if let syn::Pat::Ident(ident) = &local.pat {
+                                self.bind_int_or_bool(
+                                    ident.ident.to_string(),
+                                    &init.expr,
+                                    vars,
+                                );
+                            }
+                        }
+                    }
+                    Stmt::Expr(expr, _) => {
+                        if let Expr::If(if_expr) = expr {
+                            if is_break_only_then(if_expr) {
+                                if let Ok(c) = self.translate_expr_with_vars(&if_expr.cond, vars)
+                                {
+                                    if let Some(b) = c.as_bool() {
+                                        this_break = Some(b);
+                                    }
+                                }
+                                continue;
+                            }
+                            // Overflow `if total >= CAP { return CAP }` — dead on the
+                            // integer subsidy schedule; skip so the sum stays the body.
+                            if self.translate_if_with_early_return(if_expr, vars)?.is_some() {
+                                continue;
+                            }
+                        } else if let Expr::Assign(assign) = expr {
+                            if let Expr::Path(path) = &*assign.left {
+                                let var_name = path_to_string(&path.path);
+                                self.bind_int_or_bool(var_name.clone(), &assign.right, vars);
+                                assigned.insert(var_name);
+                            }
+                        } else if let Expr::Binary(bin) = expr {
+                            if matches!(
+                                bin.op,
+                                syn::BinOp::AddAssign(_) | syn::BinOp::SubAssign(_)
+                            ) {
+                                if let Expr::Path(path) = &*bin.left {
+                                    let var_name = path_to_string(&path.path);
+                                    let left = vars.get(&var_name).cloned().unwrap_or_else(|| {
+                                        Int::new_const(
+                                            &self.ctx,
+                                            z3::Symbol::String(var_name.clone()),
+                                        )
+                                        .into()
+                                    });
+                                    if let Ok(right) =
+                                        self.translate_expr_with_vars(&bin.right, vars)
+                                    {
+                                        if let (Some(left_int), Some(right_int)) =
+                                            (left.as_int(), right.as_int())
+                                        {
+                                            let result = match bin.op {
+                                                syn::BinOp::AddAssign(_) => {
+                                                    (left_int + right_int).into()
+                                                }
+                                                syn::BinOp::SubAssign(_) => {
+                                                    (left_int - right_int).into()
+                                                }
+                                                _ => continue,
+                                            };
+                                            vars.insert(var_name.clone(), result);
+                                            assigned.insert(var_name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Stmt::Macro(_) => {}
+                    _ => {}
+                }
+            }
+
+            let skip = match (&broken, &this_break) {
+                (Some(b), Some(c)) => Some(Bool::or(&self.ctx, &[b, c])),
+                (Some(b), None) => Some(b.clone()),
+                (None, Some(c)) => Some(c.clone()),
+                (None, None) => None,
+            };
+            if let Some(ref skip) = skip {
+                for name in &accumulators {
+                    if !assigned.contains(name) {
+                        continue;
+                    }
+                    let Some(after_v) = vars.get(name).cloned() else {
+                        continue;
+                    };
+                    let Some(before_v) = before.get(name) else {
+                        continue;
+                    };
+                    if let (Some(ai), Some(bi)) = (after_v.as_int(), before_v.as_int()) {
+                        vars.insert(name.clone(), skip.not().ite(&ai, &bi).into());
+                    } else if let (Some(ab), Some(bb)) = (after_v.as_bool(), before_v.as_bool())
+                    {
+                        vars.insert(name.clone(), skip.not().ite(&ab, &bb).into());
+                    }
+                }
+            }
+            if let Some(c) = this_break {
+                broken = Some(match broken {
+                    Some(b) => Bool::or(&self.ctx, &[&b, &c]),
+                    None => c,
+                });
+            }
+            match old_k {
+                Some(prev) => {
+                    vars.insert(k_name.clone(), prev);
+                }
+                None => {
+                    vars.remove(&k_name);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Translate a function body to a Z3 formula that relates inputs to result
     ///
     /// This is the KEY for verifying ensures: we translate the implementation
@@ -1900,8 +2117,10 @@ impl Z3Translator {
                             }
                         }
                     } else if let Expr::ForLoop(fl) = expr {
-                        let _ = self.translate_expr_with_vars(&fl.expr, vars);
-                        let _ = self.translate_block_to_result_formula(&fl.body, vars);
+                        if !self.try_unroll_constant_for(fl, vars)? {
+                            let _ = self.translate_expr_with_vars(&fl.expr, vars);
+                            let _ = self.translate_block_to_result_formula(&fl.body, vars);
+                        }
                     } else if let Expr::While(while_expr) = expr {
                         let _ = self.translate_expr_with_vars(&while_expr.cond, vars);
                         let _ = self.translate_block_to_result_formula(&while_expr.body, vars);
@@ -1948,6 +2167,13 @@ impl Z3Translator {
                     // below by `block.stmts.last()`.
                     let is_last = block.stmts.last() == Some(stmt);
                     if !is_last {
+                        if let Expr::ForLoop(fl) = expr {
+                            if !self.try_unroll_constant_for(fl, vars)? {
+                                let _ = self.translate_expr_with_vars(&fl.expr, vars);
+                                let _ = self.translate_block_to_result_formula(&fl.body, vars);
+                            }
+                            continue;
+                        }
                         if let Expr::If(if_expr) = expr {
                             if let Some((cond, result_formula)) =
                                 self.translate_if_with_early_return(if_expr, vars)?
@@ -2514,6 +2740,7 @@ fn resolve_constant(name: &str) -> Option<i64> {
         "INITIAL_SUBSIDY" => Some(50_0000_0000), // 50 BTC in satoshis
         "MAX_MONEY" => Some(2_100_000_000_000_000), // 21M BTC in satoshis
         "HALVING_INTERVAL" => Some(210_000),
+        "LOCKTIME_THRESHOLD" => Some(500_000_000),
         "SATOSHIS_PER_BTC" => Some(100_000_000),
 
         // Transaction constants
@@ -2892,6 +3119,49 @@ fn parse_lit_int(int_lit: &syn::LitInt) -> Option<i64> {
 
 /// Extract integer literal from expression if it's a literal.
 /// Handles decimal, hex (0x), octal (0o), and binary (0b) with underscore separators.
+/// Max trip count for bounded `for` unroll (`total_supply` is `0..64`).
+const MAX_FOR_UNROLL: i64 = 64;
+
+fn constant_half_open_range(expr: &syn::Expr) -> Option<(i64, i64)> {
+    let range = match expr {
+        syn::Expr::Range(r) => r,
+        syn::Expr::Paren(p) => {
+            if let syn::Expr::Range(r) = &*p.expr {
+                r
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    if !matches!(range.limits, syn::RangeLimits::HalfOpen(_)) {
+        return None;
+    }
+    let lo = extract_int_literal(range.start.as_ref()?)?;
+    let hi = extract_int_literal(range.end.as_ref()?)?;
+    Some((lo, hi))
+}
+
+fn loop_ident(pat: &syn::Pat) -> Option<String> {
+    match pat {
+        syn::Pat::Ident(i) => Some(i.ident.to_string()),
+        _ => None,
+    }
+}
+
+fn is_break_only_then(if_expr: &syn::ExprIf) -> bool {
+    if if_expr.else_branch.is_some() {
+        return false;
+    }
+    let meaningful: Vec<&syn::Stmt> = if_expr
+        .then_branch
+        .stmts
+        .iter()
+        .filter(|s| !matches!(s, syn::Stmt::Macro(_)))
+        .collect();
+    matches!(meaningful.as_slice(), [syn::Stmt::Expr(syn::Expr::Break(_), _)])
+}
+
 fn extract_int_literal(expr: &syn::Expr) -> Option<i64> {
     if let syn::Expr::Lit(syn::ExprLit {
         lit: syn::Lit::Int(int_lit),
@@ -3008,7 +3278,6 @@ fn known_bool_returning_function(name: &str) -> Option<String> {
     let base = name.split("::").last().unwrap_or(name);
     match base {
         "is_zero_hash" => Some("call_is_zero_hash_result".to_string()),
-        "locktime_types_match" => Some("call_locktime_types_match_result".to_string()),
         "is_standard_script" => Some("call_is_standard_script_result".to_string()),
         // validate_taproot_script returns Result<bool>; model as named Bool variable so
         // callers (is_taproot_output) can reason about it via the callee-ensures axiom.
@@ -3122,6 +3391,155 @@ mod tests {
             }
         }
         assert_eq!(result, SatResult::Unsat, "Body should prove ensures");
+    }
+
+    fn prove_ensures(code: &str, params: &[(&str, &str)], ret: &str, ensures: &str) {
+        let tr = Z3Translator::new(10000);
+        let func: syn::ItemFn = syn::parse_str(code).expect("parse fn");
+        let mut param_types = std::collections::HashMap::new();
+        for (name, ty) in params {
+            param_types.insert((*name).to_string(), syn::parse_str::<syn::Type>(ty).unwrap());
+        }
+        let return_type: syn::Type = syn::parse_str(ret).unwrap();
+        let (mut shared_vars, type_constraints) =
+            tr.build_shared_vars(&param_types, Some(&return_type));
+        let ensures_expr: syn::Expr = syn::parse_str(ensures).unwrap();
+        let contract = Contract {
+            contract_type: crate::parser::contracts::ContractType::Ensures,
+            condition: ensures_expr,
+            comment: None,
+        };
+        let ensures_z3 = tr
+            .translate_contract_with_shared_vars(&contract, &mut shared_vars)
+            .expect("ensures translation");
+        let body_formula = tr
+            .translate_function_body(&func, &mut shared_vars)
+            .expect("body translation")
+            .expect("body formula not None");
+        let solver = Solver::new(tr.context());
+        for c in &type_constraints {
+            solver.assert(c);
+        }
+        solver.assert(&body_formula);
+        solver.assert(&ensures_z3.as_bool().unwrap().not());
+        assert_eq!(
+            solver.check(),
+            SatResult::Unsat,
+            "body should prove {ensures}"
+        );
+    }
+
+    #[test]
+    fn checked_map_expect_is_receiver_plus_one() {
+        prove_ensures(
+            r#"
+            fn add_one(x: i64) -> i64 {
+                x.checked_sub(0).map(|d| d + 1).expect("ok")
+            }
+            "#,
+            &[("x", "i64")],
+            "i64",
+            "result == x + 1",
+        );
+    }
+
+    #[test]
+    fn constant_for_unroll_sum() {
+        prove_ensures(
+            r#"
+            fn sum_small() -> i64 {
+                let mut total = 0i64;
+                for k in 0..4 {
+                    total = total + k;
+                }
+                total
+            }
+            "#,
+            &[],
+            "i64",
+            "result == 6",
+        );
+    }
+
+    #[test]
+    fn production_total_supply_body_translates() {
+        let tr = Z3Translator::new(10000);
+        let code = r#"
+            fn total_supply(height: u64) -> i64 {
+                let end = height;
+                let h = HALVING_INTERVAL;
+                let mut total = 0i64;
+                for k in 0u64..64 {
+                    let period_start = k.saturating_mul(h);
+                    if period_start > end {
+                        break;
+                    }
+                    let subsidy = INITIAL_SUBSIDY >> k;
+                    let period_end = (k + 1).saturating_mul(h).saturating_sub(1);
+                    let overlap_hi = end.min(period_end);
+                    let count = overlap_hi
+                        .checked_sub(period_start)
+                        .map(|d| d + 1)
+                        .expect("ok");
+                    let contrib = match (count as i64).checked_mul(subsidy) {
+                        Some(c) => c,
+                        None => {
+                            return MAX_MONEY;
+                        }
+                    };
+                    total = match total.checked_add(contrib) {
+                        Some(t) => t,
+                        None => {
+                            return MAX_MONEY;
+                        }
+                    };
+                    if total >= MAX_MONEY {
+                        return MAX_MONEY;
+                    }
+                }
+                total
+            }
+        "#;
+        let func: syn::ItemFn = syn::parse_str(code).expect("parse fn");
+        let mut param_types = std::collections::HashMap::new();
+        param_types.insert(
+            "height".to_string(),
+            syn::parse_str::<syn::Type>("u64").unwrap(),
+        );
+        let return_type: syn::Type = syn::parse_str("i64").unwrap();
+        let (mut shared_vars, _) = tr.build_shared_vars(&param_types, Some(&return_type));
+        let body = tr.translate_function_body(&func, &mut shared_vars);
+        assert!(
+            matches!(body, Ok(Some(_))),
+            "expected Some formula, got {body:?}"
+        );
+        prove_ensures(
+            code,
+            &[("height", "u64")],
+            "i64",
+            "result >= 0 && result <= 2100000000000000",
+        );
+    }
+
+    #[test]
+    fn constant_for_unroll_break() {
+        prove_ensures(
+            r#"
+            fn sum_until_break() -> i64 {
+                let mut total = 0i64;
+                for k in 0..4 {
+                    if k > 1 {
+                        break;
+                    }
+                    total = total + 1;
+                }
+                total
+            }
+            "#,
+            &[],
+            "i64",
+            "result == 2",
+        );
     }
 }
 

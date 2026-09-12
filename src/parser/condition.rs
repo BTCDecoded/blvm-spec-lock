@@ -36,6 +36,69 @@ fn classify_noise(cond: &str) -> Option<&'static str> {
     None
 }
 
+fn paren_balance(s: &str) -> i32 {
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+fn ends_with_incomplete_operator(s: &str) -> bool {
+    let t = s.trim_end();
+    t.ends_with("==")
+        || t.ends_with("!=")
+        || t.ends_with(">=")
+        || t.ends_with("<=")
+        || t.ends_with("&&")
+        || t.ends_with("||")
+        || t.ends_with("=>")
+        || matches!(t.chars().last(), Some('>' | '<' | '=' | '&' | '|' | '!'))
+}
+
+/// First conjunct only when the left side is a complete expression.
+/// Keeps `result == (A && B)` intact; still drops English tails after `and` / `&&`.
+fn first_complete_conjunct(s: &str) -> &str {
+    let and_left = s.split(" and ").next().unwrap_or(s).trim();
+    let amp_left = s.split(" && ").next().unwrap_or(s).trim();
+    let candidate = if and_left.len() <= amp_left.len() {
+        and_left
+    } else {
+        amp_left
+    };
+    if candidate.len() < s.len()
+        && paren_balance(candidate) == 0
+        && !ends_with_incomplete_operator(candidate)
+    {
+        candidate
+    } else {
+        s
+    }
+}
+
+/// Strip `result >= 0 (flags are a 32-bit…)` prose. Do not treat `result == (expr)` as a comment.
+fn strip_trailing_paren_prose(s: &str) -> &str {
+    if let Some((expr, rest)) = s.split_once(" (") {
+        let looks_prose = rest
+            .trim_start()
+            .starts_with(|c: char| c.is_alphabetic())
+            && rest.contains(' ')
+            && !rest.contains('<')
+            && !rest.contains('>')
+            && !rest.contains("==")
+            && paren_balance(expr) == 0
+            && !ends_with_incomplete_operator(expr);
+        if looks_prose {
+            return expr.trim();
+        }
+    }
+    s
+}
+
 /// Parse "result(args1) == result(args2)" for determinism. Returns true if pattern matches.
 pub fn is_result_equality(cond: &str) -> bool {
     let re = Regex::new(r"result\s*\([^)]*\)\s*(?:==|\\iff)\s*result\s*\([^)]*\)").ok();
@@ -393,15 +456,9 @@ pub fn extract_parseable_condition(condition: &str) -> Option<String> {
         .next()?
         .split(" for all ")
         .next()?
-        .split(" and ")
-        .next()?
-        .split(" && ")
-        .next()?
         .trim();
-    let core = core
-        .split_once(" (")
-        .map(|(expr, _)| expr.trim())
-        .unwrap_or(core);
+    let core = first_complete_conjunct(core);
+    let core = strip_trailing_paren_prose(core);
     let core = if core.contains("∀") && core.contains(':') {
         if let Some(colon) = core.find(':') {
             core[colon + 1..].trim()
@@ -803,6 +860,31 @@ mod tests {
             Some("(result == true || result == false)".to_string()),
             "bare-brace form \\in {{...}} must parse"
         );
+    }
+
+    #[test]
+    fn bip65_two_arg_result_parses() {
+        let s = "result == ((tx_locktime < 500000000) == (stack_locktime < 500000000) && tx_locktime >= stack_locktime)";
+        let got = extract_parseable_condition(s).expect("parseable");
+        assert!(
+            syn::parse_str::<syn::Expr>(&got).is_ok(),
+            "syn failed on {got}"
+        );
+        assert!(
+            got.contains("tx_locktime") && got.contains("&&") && got.contains("stack_locktime"),
+            "must keep both conjuncts, got {got}"
+        );
+    }
+
+    #[test]
+    fn prose_paren_still_strips() {
+        let got = extract_parseable_condition("result >= 0 (flags are a 32-bit unsigned mask)")
+            .expect("parseable");
+        assert!(
+            syn::parse_str::<syn::Expr>(&got).is_ok(),
+            "syn failed on {got}"
+        );
+        assert!(!got.contains("flags"), "prose must drop, got {got}");
     }
 
     #[test]

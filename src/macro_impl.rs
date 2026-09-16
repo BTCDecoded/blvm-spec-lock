@@ -4,11 +4,8 @@
 //! Contracts are provided via manual #[requires] and #[ensures] attributes,
 //! which will be verified by the BLVM Spec Lock verification tool.
 
-use crate::parser::{
-    Contract, ContractType, FunctionSpec, SpecParser, SpecSection,
-    section_id_subsumes_formula_section,
-};
-use proc_macro2::{Span, TokenStream};
+use crate::parser::{FunctionSpec, SpecParser};
+use proc_macro2::TokenStream;
 use quote::quote;
 use regex::Regex;
 use std::path::PathBuf;

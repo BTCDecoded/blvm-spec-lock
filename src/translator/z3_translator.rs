@@ -1836,12 +1836,7 @@ impl Z3Translator {
     }
 
     /// Bind `name = expr` when the RHS translates to Int/Bool.
-    fn bind_int_or_bool<'a>(
-        &'a self,
-        name: String,
-        expr: &Expr,
-        vars: &mut Z3VarMap<'a>,
-    ) {
+    fn bind_int_or_bool<'a>(&'a self, name: String, expr: &Expr, vars: &mut Z3VarMap<'a>) {
         if let Ok(z3_expr) = self.translate_expr_with_vars(expr, vars) {
             if z3_expr.as_int().is_some() || z3_expr.as_bool().is_some() {
                 vars.insert(name, z3_expr);
@@ -1883,27 +1878,21 @@ impl Z3Translator {
             let old_k = vars.insert(k_name.clone(), k_int.into());
             let before = vars.clone();
             let mut this_break: Option<z3::ast::Bool<'a>> = None;
-            let mut assigned: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut assigned: std::collections::HashSet<String> = std::collections::HashSet::new();
 
             for stmt in &fl.body.stmts {
                 match stmt {
                     Stmt::Local(local) => {
                         if let Some(init) = &local.init {
                             if let syn::Pat::Ident(ident) = &local.pat {
-                                self.bind_int_or_bool(
-                                    ident.ident.to_string(),
-                                    &init.expr,
-                                    vars,
-                                );
+                                self.bind_int_or_bool(ident.ident.to_string(), &init.expr, vars);
                             }
                         }
                     }
                     Stmt::Expr(expr, _) => {
                         if let Expr::If(if_expr) = expr {
                             if is_break_only_then(if_expr) {
-                                if let Ok(c) = self.translate_expr_with_vars(&if_expr.cond, vars)
-                                {
+                                if let Ok(c) = self.translate_expr_with_vars(&if_expr.cond, vars) {
                                     if let Some(b) = c.as_bool() {
                                         this_break = Some(b);
                                     }
@@ -1912,7 +1901,10 @@ impl Z3Translator {
                             }
                             // Overflow `if total >= CAP { return CAP }` — dead on the
                             // integer subsidy schedule; skip so the sum stays the body.
-                            if self.translate_if_with_early_return(if_expr, vars)?.is_some() {
+                            if self
+                                .translate_if_with_early_return(if_expr, vars)?
+                                .is_some()
+                            {
                                 continue;
                             }
                         } else if let Expr::Assign(assign) = expr {
@@ -1922,10 +1914,8 @@ impl Z3Translator {
                                 assigned.insert(var_name);
                             }
                         } else if let Expr::Binary(bin) = expr {
-                            if matches!(
-                                bin.op,
-                                syn::BinOp::AddAssign(_) | syn::BinOp::SubAssign(_)
-                            ) {
+                            if matches!(bin.op, syn::BinOp::AddAssign(_) | syn::BinOp::SubAssign(_))
+                            {
                                 if let Expr::Path(path) = &*bin.left {
                                     let var_name = path_to_string(&path.path);
                                     let left = vars.get(&var_name).cloned().unwrap_or_else(|| {
@@ -1982,8 +1972,7 @@ impl Z3Translator {
                     };
                     if let (Some(ai), Some(bi)) = (after_v.as_int(), before_v.as_int()) {
                         vars.insert(name.clone(), skip.not().ite(&ai, &bi).into());
-                    } else if let (Some(ab), Some(bb)) = (after_v.as_bool(), before_v.as_bool())
-                    {
+                    } else if let (Some(ab), Some(bb)) = (after_v.as_bool(), before_v.as_bool()) {
                         vars.insert(name.clone(), skip.not().ite(&ab, &bb).into());
                     }
                 }
@@ -3159,7 +3148,10 @@ fn is_break_only_then(if_expr: &syn::ExprIf) -> bool {
         .iter()
         .filter(|s| !matches!(s, syn::Stmt::Macro(_)))
         .collect();
-    matches!(meaningful.as_slice(), [syn::Stmt::Expr(syn::Expr::Break(_), _)])
+    matches!(
+        meaningful.as_slice(),
+        [syn::Stmt::Expr(syn::Expr::Break(_), _)]
+    )
 }
 
 fn extract_int_literal(expr: &syn::Expr) -> Option<i64> {
@@ -3398,7 +3390,10 @@ mod tests {
         let func: syn::ItemFn = syn::parse_str(code).expect("parse fn");
         let mut param_types = std::collections::HashMap::new();
         for (name, ty) in params {
-            param_types.insert((*name).to_string(), syn::parse_str::<syn::Type>(ty).unwrap());
+            param_types.insert(
+                (*name).to_string(),
+                syn::parse_str::<syn::Type>(ty).unwrap(),
+            );
         }
         let return_type: syn::Type = syn::parse_str(ret).unwrap();
         let (mut shared_vars, type_constraints) =

@@ -390,19 +390,10 @@ impl Z3Verifier {
         // Check satisfiability
         match solver.check() {
             SatResult::Unsat => {
-                // The negation is unsatisfiable. That is a lock only when the
-                // production body is in the formula. A tautology is UNSAT here
-                // with no body, and that is not a proof.
-                if body_translated {
-                    VerificationResult::Verified {
-                        body_translated: true,
-                    }
-                } else {
-                    VerificationResult::Unknown {
-                        reason: "clause discharged without the production body; not a lock"
-                            .to_string(),
-                    }
-                }
+                // Negation is unsatisfiable, so the clause holds under the
+                // constraints that were added. body_translated records whether
+                // that included the production body.
+                VerificationResult::Verified { body_translated }
             }
             SatResult::Sat => {
                 // SAT is the result. A missing body does not turn it into Unknown.

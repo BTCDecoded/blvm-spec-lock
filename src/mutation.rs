@@ -16,12 +16,13 @@
 //! The control mutant is an obligation of `false`. Z3 reports UNSAT. That is
 //! the proof the harness can fail a mutant.
 
-use z3::ast::Bool;
+use crate::translator::z3_translator::Z3Translator;
+use z3::ast::{Bool, BV};
 use z3::{Config, Context, SatResult, Solver};
 
 /// Bump only after the previous phase's failing-mutant test is green.
 /// 1 = current CI obligations. 2 = i64 bitvector overflow. 3 = functional formulas.
-const OBLIGATION_PHASE: u8 = 1;
+const OBLIGATION_PHASE: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verdict {
@@ -102,13 +103,17 @@ impl Mutant {
     fn obligation(self) -> &'static str {
         match self {
             Mutant::Control => "false",
-            Mutant::M1 | Mutant::M2 | Mutant::M3 | Mutant::M4 | Mutant::M5 => {
+            Mutant::M3 if OBLIGATION_PHASE >= 2 => {
+                "i64 checked_add: Err iff bvadd overflows (width 64)"
+            }
+            Mutant::M1 | Mutant::M2 | Mutant::M4 | Mutant::M5 => {
                 "F_CheckTransactionTotality: result == true || result == false"
             }
             Mutant::M6 | Mutant::M7 | Mutant::M8 | Mutant::M9 => {
                 "F_BIP66PreActivationPass: bip66_active == 0 => result == 1"
             }
             Mutant::M10 | Mutant::M11 => "F_MerkleRootDeterminism: result(H1) == result(H2)",
+            Mutant::M3 => "F_CheckTransactionTotality: result == true || result == false",
         }
     }
 
@@ -179,8 +184,17 @@ fn judge(mutant: Mutant) -> Verdict {
                 let result_ok = Bool::from_bool(ctx, false);
                 solver.assert(&Bool::or(ctx, &[&result_ok, &result_ok.not()]));
             }
+            Mutant::M3 if OBLIGATION_PHASE >= 2 => {
+                // 2^62 + 2^62 overflows signed 64-bit. The mutant uses wrapping_add
+                // and returns Ok. The obligation is Err exactly when bvadd overflows.
+                let half = BV::from_i64(ctx, 1_i64 << 62, 64);
+                let (_sum, overflow_ok) =
+                    Z3Translator::i64_checked_binop(ctx, "checked_add", &half, &half);
+                let returned_err = Bool::from_bool(ctx, false);
+                solver.assert(&returned_err.not());
+                solver.assert(&returned_err.iff(&overflow_ok.not()));
+            }
             Mutant::M3 => {
-                // Sum overflows i64. Mutant wraps and returns Ok. Totality accepts Ok.
                 let overflow = Bool::from_bool(ctx, true);
                 let returned_err = Bool::from_bool(ctx, false);
                 solver.assert(&overflow);
@@ -244,9 +258,10 @@ fn render_table() -> String {
     let mut out = String::new();
     out.push_str("# Spec-lock mutation coverage\n\n");
     out.push_str(
-        "Phase 1. Obligations are the ones CI proves today. UNSAT means the mutant \
-         contradicts the obligation (caught). SAT means the obligation still holds \
-         of the mutant (not caught).\n\n",
+        "Phase 2. `checked_add` is signed 64-bit `bvadd` plus an overflow predicate. \
+         M3 (wrapping_add) must be UNSAT. The other mutants are still scored against \
+         the tautologies CI proves today. UNSAT means the mutant contradicts the \
+         obligation (caught).\n\n",
     );
     out.push_str("| mutant | function | change | obligation | Z3 | verdict |\n");
     out.push_str("|---|---|---|---|---|---|\n");
@@ -304,13 +319,26 @@ mod tests {
     }
 
     #[test]
-    fn phase1_consensus_mutants_survive_current_obligations() {
-        assert_eq!(OBLIGATION_PHASE, 1);
+    fn m3_wrapping_add_is_unsat() {
+        assert!(OBLIGATION_PHASE >= 2);
+        assert_eq!(
+            judge(Mutant::M3),
+            Verdict::Caught,
+            "wrapping_add must contradict the i64 overflow obligation"
+        );
+    }
+
+    #[test]
+    fn phase2_other_mutants_still_survive_tautologies() {
+        assert_eq!(OBLIGATION_PHASE, 2);
         for mutant in Mutant::CONSENSUS {
+            if mutant == Mutant::M3 {
+                continue;
+            }
             assert_eq!(
                 judge(mutant),
                 Verdict::NotCaught,
-                "{} must survive the current tautology; got a catch before the formula exists",
+                "{} is not covered by the bitvector sum obligation yet",
                 mutant.id()
             );
         }

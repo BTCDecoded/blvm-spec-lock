@@ -20,7 +20,7 @@
 
 use crate::parser::contracts::Contract;
 use syn::{Block, Expr, ItemFn, Stmt};
-use z3::ast::{Ast, Bool, Int};
+use z3::ast::{Ast, Bool, BV, Int};
 #[cfg(feature = "z3")]
 use z3::{Config, Context, Sort};
 
@@ -634,6 +634,56 @@ impl Z3Translator {
         }
     }
 
+    /// Signed i64 `checked_add` / `checked_sub` / `checked_mul`.
+    ///
+    /// The bitvector result is the wrap of the operation. `overflow_ok` is true
+    /// exactly when that wrap equals the mathematical result in range of i64.
+    /// Width is 64. This is not unbounded `Int` addition.
+    pub(crate) fn i64_checked_binop<'a>(
+        ctx: &'a Context,
+        op: &str,
+        left: &BV<'a>,
+        right: &BV<'a>,
+    ) -> (BV<'a>, Bool<'a>) {
+        let (result, overflow_ok) = match op {
+            "checked_add" => {
+                let sum = left.bvadd(right);
+                let ok = Bool::and(
+                    ctx,
+                    &[
+                        &left.bvadd_no_overflow(right, true),
+                        &left.bvadd_no_underflow(right),
+                    ],
+                );
+                (sum, ok)
+            }
+            "checked_sub" => {
+                let diff = left.bvsub(right);
+                let ok = Bool::and(
+                    ctx,
+                    &[
+                        &left.bvsub_no_underflow(right, true),
+                        &left.bvsub_no_overflow(right),
+                    ],
+                );
+                (diff, ok)
+            }
+            "checked_mul" => {
+                let prod = left.bvmul(right);
+                let ok = Bool::and(
+                    ctx,
+                    &[
+                        &left.bvmul_no_overflow(right, true),
+                        &left.bvmul_no_underflow(right),
+                    ],
+                );
+                (prod, ok)
+            }
+            _ => unreachable!("i64_checked_binop: {op}"),
+        };
+        (result, overflow_ok)
+    }
+
     /// Exact `2^k` as Z3 `Int` for `k < 64` (avoids host `1i64 << 63` overflow).
     pub(crate) fn pow2_int(ctx: &Context, k: u32) -> Int<'_> {
         debug_assert!(k < 64);
@@ -655,25 +705,22 @@ impl Z3Translator {
 
         match method_name.as_str() {
             "checked_add" | "checked_sub" | "checked_mul" => {
-                // a.checked_add(b) returns Option; model as a+b (overflow ignored for verification)
+                // Fixed-width signed 64-bit. The returned term is the bitvector
+                // sum/difference/product. `overflow_ok` is true iff the operation
+                // does not overflow i64. Callers that model `checked_*` → Err must
+                // use that predicate. It is not assumed true.
                 let left = self.translate_expr_with_vars(&method.receiver, vars)?;
                 let arg = method.args.first().ok_or_else(|| {
                     TranslationError::UnsupportedExpression("checked_add needs 1 arg".to_string())
                 })?;
                 let right = self.translate_expr_with_vars(arg, vars)?;
-                let left_int = left.as_int().ok_or_else(|| {
-                    TranslationError::TypeError("checked_add: expected Int".to_string())
-                })?;
-                let right_int = right.as_int().ok_or_else(|| {
-                    TranslationError::TypeError("checked_add: expected Int".to_string())
-                })?;
-                let result = match method_name.as_str() {
-                    "checked_add" => left_int + right_int,
-                    "checked_sub" => left_int - right_int,
-                    "checked_mul" => left_int * right_int,
-                    _ => unreachable!(),
-                };
-                Ok(result.into())
+                let left_bv = dynamic_as_i64_bv(&self.ctx, &left)?;
+                let right_bv = dynamic_as_i64_bv(&self.ctx, &right)?;
+                let (sum, overflow_ok) =
+                    Self::i64_checked_binop(&self.ctx, method_name.as_str(), &left_bv, &right_bv);
+                let n = vars.len();
+                vars.insert(format!("i64_overflow_ok_{n}"), overflow_ok.into());
+                Ok(sum.into())
             }
             "unwrap_or" | "unwrap_or_else" => {
                 // x.unwrap_or(default) or x.unwrap_or_else(|| default) - use receiver (the Option)
@@ -3327,6 +3374,26 @@ impl std::fmt::Display for TranslationError {
 
 impl std::error::Error for TranslationError {}
 
+fn dynamic_as_i64_bv<'a>(
+    ctx: &'a Context,
+    value: &z3::ast::Dynamic<'a>,
+) -> Result<BV<'a>, TranslationError> {
+    let _ = ctx;
+    if let Some(bv) = value.as_bv() {
+        if bv.get_size() == 64 {
+            return Ok(bv);
+        }
+        return Err(TranslationError::TypeError(format!(
+            "checked arithmetic width is i64 (64), got {}",
+            bv.get_size()
+        )));
+    }
+    let int = value.as_int().ok_or_else(|| {
+        TranslationError::TypeError("checked arithmetic: expected i64 Int or bitvector".to_string())
+    })?;
+    Ok(BV::from_int(&int, 64))
+}
+
 #[cfg(all(test, feature = "z3"))]
 mod tests {
     use super::*;
@@ -3422,24 +3489,50 @@ mod tests {
         }
         solver.assert(&body_formula);
         solver.assert(&ensures_z3.as_bool().unwrap().not());
-        assert_eq!(
-            solver.check(),
-            SatResult::Unsat,
-            "body should prove {ensures}"
-        );
+        let result = solver.check();
+        assert_eq!(result, SatResult::Unsat, "body should prove {ensures}");
     }
 
     #[test]
-    fn checked_map_expect_is_receiver_plus_one() {
-        prove_ensures(
-            r#"
+    fn checked_map_expect_i64_equality_is_not_proved() {
+        // Obligation stays `result == x + 1`. It is not weakened.
+        // checked_sub is now signed 64-bit. x is still an unbounded Int in the
+        // ensures, so Z3 finds a counterexample (SAT of the negation). That is
+        // a finding: this proof does not carry the i64 width.
+        let tr = Z3Translator::new(10000);
+        let code = r#"
             fn add_one(x: i64) -> i64 {
                 x.checked_sub(0).map(|d| d + 1).expect("ok")
             }
-            "#,
-            &[("x", "i64")],
-            "i64",
-            "result == x + 1",
+        "#;
+        let func: syn::ItemFn = syn::parse_str(code).unwrap();
+        let mut param_types = std::collections::HashMap::new();
+        param_types.insert("x".to_string(), syn::parse_str::<syn::Type>("i64").unwrap());
+        let return_type: syn::Type = syn::parse_str("i64").unwrap();
+        let (mut shared_vars, type_constraints) =
+            tr.build_shared_vars(&param_types, Some(&return_type));
+        let contract = Contract {
+            contract_type: crate::parser::contracts::ContractType::Ensures,
+            condition: syn::parse_str("result == x + 1").unwrap(),
+            comment: None,
+        };
+        let ensures_z3 = tr
+            .translate_contract_with_shared_vars(&contract, &mut shared_vars)
+            .unwrap();
+        let body_formula = tr
+            .translate_function_body(&func, &mut shared_vars)
+            .unwrap()
+            .unwrap();
+        let solver = Solver::new(tr.context());
+        for c in &type_constraints {
+            solver.assert(c);
+        }
+        solver.assert(&body_formula);
+        solver.assert(&ensures_z3.as_bool().unwrap().not());
+        assert_eq!(
+            solver.check(),
+            SatResult::Sat,
+            "result == x + 1 is unproved once checked_sub is i64 bitvector arithmetic"
         );
     }
 

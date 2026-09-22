@@ -111,7 +111,9 @@ pub fn detect_drift(
     // Enrich functions with spec-derived contracts before drift check.
     // Without this, #[spec_locked] functions have empty contracts (macro output not in parsed source).
     if spec_paths.iter().all(|p| p.exists()) && !spec_paths.is_empty() {
-        let _ = super::spec_enrich::enrich_functions_with_spec(&mut functions, &spec_paths);
+        // A missing formula id used to be discarded here. Enrichment then stopped,
+        // and every later function was reported as missing from the paper.
+        super::spec_enrich::enrich_functions_with_spec(&mut functions, &spec_paths)?;
     }
 
     let mut mismatched_contracts = Vec::new();

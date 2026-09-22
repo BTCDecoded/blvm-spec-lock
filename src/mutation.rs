@@ -6,23 +6,17 @@
 //! - **UNSAT** — the mutant contradicts the obligation. The proof fails. Caught.
 //! - **SAT** — a model satisfies both. The obligation does not rule the mutant out.
 //!
-//! Step 1 scores mutants against the obligations CI uses today
-//! (`F_CheckTransactionTotality` is the auto type-contract
-//! `result == true || result == false`, `F_BIP66PreActivationPass` is
-//! `result == 1` when the fork flag is 0, `F_MerkleRootDeterminism` is
-//! `result(H1) == result(H2)`). Those formulas do not mention the checks
-//! the mutants delete, so the mutants stay SAT.
-//!
-//! The control mutant is an obligation of `false`. Z3 reports UNSAT. That is
-//! the proof the harness can fail a mutant.
+//! Phase 3 scores the eleven mutants against functional obligations.
+//! UNSAT means the mutant contradicts the obligation (caught). The control
+//! obligation is `false`.
 
 use crate::translator::z3_translator::Z3Translator;
-use z3::ast::{Bool, BV};
+use z3::ast::{Ast, BV, Bool};
 use z3::{Config, Context, SatResult, Solver};
 
 /// Bump only after the previous phase's failing-mutant test is green.
 /// 1 = current CI obligations. 2 = i64 bitvector overflow. 3 = functional formulas.
-const OBLIGATION_PHASE: u8 = 2;
+const OBLIGATION_PHASE: u8 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verdict {
@@ -103,17 +97,19 @@ impl Mutant {
     fn obligation(self) -> &'static str {
         match self {
             Mutant::Control => "false",
-            Mutant::M3 if OBLIGATION_PHASE >= 2 => {
-                "i64 checked_add: Err iff bvadd overflows (width 64)"
+            Mutant::M1 | Mutant::M2 => {
+                "F_NoDuplicateInputs: equal prevout (txid and vout) iff duplicate reject"
             }
-            Mutant::M1 | Mutant::M2 | Mutant::M4 | Mutant::M5 => {
-                "F_CheckTransactionTotality: result == true || result == false"
+            Mutant::M3 => "F_OutputSumBounded: Err iff i64 bvadd overflows (width 64)",
+            Mutant::M4 => "F_OutputSumBounded: value == MAX_MONEY is in range, so Ok",
+            Mutant::M5 => "F_OutputSumBounded: Ok implies every output is non-negative",
+            Mutant::M6 => "F_StrictDERSoundness: length in 9..=73",
+            Mutant::M7 => "F_StrictDERSoundness: no unnecessary leading zero",
+            Mutant::M8 => "F_StrictDERSoundness: no high bit on R",
+            Mutant::M9 => "F_StrictDERSoundness: tag byte is 0x30",
+            Mutant::M10 | Mutant::M11 => {
+                "F_MerkleMutationRejected: unpadded equal pair iff mutation; pad is not one"
             }
-            Mutant::M6 | Mutant::M7 | Mutant::M8 | Mutant::M9 => {
-                "F_BIP66PreActivationPass: bip66_active == 0 => result == 1"
-            }
-            Mutant::M10 | Mutant::M11 => "F_MerkleRootDeterminism: result(H1) == result(H2)",
-            Mutant::M3 => "F_CheckTransactionTotality: result == true || result == false",
         }
     }
 
@@ -165,24 +161,26 @@ fn judge(mutant: Mutant) -> Verdict {
         // The behavior is satisfiable together with the tautology, so Z3 returns SAT.
         match mutant {
             Mutant::M1 => {
-                // Same prevout, HashSet check deleted, result stays Valid.
-                let dup = Bool::from_bool(ctx, true);
+                // Same txid and vout. Mutant deleted the check, so it does not reject.
+                let txid_eq = Bool::from_bool(ctx, true);
+                let vout_eq = Bool::from_bool(ctx, true);
                 let rejected = Bool::from_bool(ctx, false);
-                solver.assert(&dup);
+                let prevout_eq = Bool::and(ctx, &[&txid_eq, &vout_eq]);
+                solver.assert(&prevout_eq);
                 solver.assert(&rejected.not());
-                let result_ok = Bool::from_bool(ctx, true);
-                solver.assert(&Bool::or(ctx, &[&result_ok, &result_ok.not()]));
+                // Reject exactly when the full prevout matches.
+                solver.assert(&rejected.iff(&prevout_eq));
             }
             Mutant::M2 => {
-                // Same txid, different vout. Mutant rejects; totality does not care.
+                // Same txid, different vout. Mutant rejects. Full prevout does not match.
                 let txid_eq = Bool::from_bool(ctx, true);
                 let vout_eq = Bool::from_bool(ctx, false);
                 let rejected = Bool::from_bool(ctx, true);
+                let prevout_eq = Bool::and(ctx, &[&txid_eq, &vout_eq]);
                 solver.assert(&txid_eq);
                 solver.assert(&vout_eq.not());
                 solver.assert(&rejected);
-                let result_ok = Bool::from_bool(ctx, false);
-                solver.assert(&Bool::or(ctx, &[&result_ok, &result_ok.not()]));
+                solver.assert(&rejected.iff(&prevout_eq));
             }
             Mutant::M3 if OBLIGATION_PHASE >= 2 => {
                 // 2^62 + 2^62 overflows signed 64-bit. The mutant uses wrapping_add
@@ -203,50 +201,77 @@ fn judge(mutant: Mutant) -> Verdict {
                 solver.assert(&Bool::or(ctx, &[&result_ok, &result_ok.not()]));
             }
             Mutant::M4 => {
-                // Value == MAX_MONEY. Mutant uses >= and rejects. Totality accepts either result.
-                let equal_max = Bool::from_bool(ctx, true);
-                let rejected = Bool::from_bool(ctx, true);
-                solver.assert(&equal_max);
-                solver.assert(&rejected);
+                // Single output equal to MAX_MONEY, no overflow. Mutant rejects via >=.
+                let value = BV::from_i64(ctx, 2_100_000_000_000_000, 64);
+                let max_money = BV::from_i64(ctx, 2_100_000_000_000_000, 64);
+                let zero = BV::from_i64(ctx, 0, 64);
+                let in_range = value.bvsge(&zero) & value.bvsle(&max_money);
                 let result_ok = Bool::from_bool(ctx, false);
-                solver.assert(&Bool::or(ctx, &[&result_ok, &result_ok.not()]));
+                solver.assert(&in_range);
+                solver.assert(&result_ok.not());
+                solver.assert(&result_ok.iff(&in_range));
             }
             Mutant::M5 => {
-                // One negative output. Mutant accepts it.
-                let negative = Bool::from_bool(ctx, true);
+                // Negative output. Mutant returns Ok.
+                let value = BV::from_i64(ctx, -1, 64);
+                let zero = BV::from_i64(ctx, 0, 64);
+                let non_negative = value.bvsge(&zero);
                 let result_ok = Bool::from_bool(ctx, true);
-                solver.assert(&negative);
                 solver.assert(&result_ok);
-                solver.assert(&Bool::or(ctx, &[&result_ok, &result_ok.not()]));
+                solver.assert(&result_ok.implies(&non_negative));
             }
-            Mutant::M6 | Mutant::M7 | Mutant::M8 | Mutant::M9 => {
-                // Byte mutant accepts a bad signature. The pre-activation formula
-                // only talks about the inactive fork, where the parser is not called.
-                let parser_accepts_bad = Bool::from_bool(ctx, true);
-                let active = Bool::from_bool(ctx, false);
-                let result_pass = Bool::from_bool(ctx, true);
-                solver.assert(&parser_accepts_bad);
-                solver.assert(&active.not().implies(&result_pass));
+            Mutant::M6 => {
+                // Length 74. Mutant accepts. Length clause is 9..=73, width u32.
+                let len = BV::from_i64(ctx, 74, 32);
+                let lo = BV::from_i64(ctx, 9, 32);
+                let hi = BV::from_i64(ctx, 73, 32);
+                let len_ok = len.bvuge(&lo) & len.bvule(&hi);
+                let accept = Bool::from_bool(ctx, true);
+                solver.assert(&accept);
+                solver.assert(&accept.implies(&len_ok));
+            }
+            Mutant::M7 => {
+                // Unnecessary leading zero on R. Mutant accepts.
+                let leading_zero = Bool::from_bool(ctx, true);
+                let accept = Bool::from_bool(ctx, true);
+                solver.assert(&accept);
+                solver.assert(&leading_zero);
+                solver.assert(&accept.implies(&leading_zero.not()));
+            }
+            Mutant::M8 => {
+                // High bit set on R. Mutant accepts.
+                let r0 = BV::from_i64(ctx, 0x81, 8);
+                let high = BV::from_i64(ctx, 0x80, 8);
+                let high_bit = r0.bvand(&high)._eq(&high);
+                let accept = Bool::from_bool(ctx, true);
+                solver.assert(&accept);
+                solver.assert(&high_bit);
+                solver.assert(&accept.implies(&high_bit.not()));
+            }
+            Mutant::M9 => {
+                // Tag 0x31. Mutant accepts.
+                let tag = BV::from_i64(ctx, 0x31, 8);
+                let compound = BV::from_i64(ctx, 0x30, 8);
+                let tag_ok = tag._eq(&compound);
+                let accept = Bool::from_bool(ctx, true);
+                solver.assert(&accept);
+                solver.assert(&accept.implies(&tag_ok));
             }
             Mutant::M10 => {
-                // Equal adjacent hashes, check removed, mutated flag stays false.
-                // Determinism (same inputs, same output) still holds.
-                let equal_adj = Bool::from_bool(ctx, true);
+                // Equal adjacent hashes on the unpadded level. Check removed.
+                let unpadded_equal = Bool::from_bool(ctx, true);
                 let mutated = Bool::from_bool(ctx, false);
-                solver.assert(&equal_adj);
+                solver.assert(&unpadded_equal);
                 solver.assert(&mutated.not());
-                let deterministic = Bool::from_bool(ctx, true);
-                solver.assert(&deterministic);
+                solver.assert(&mutated.iff(&unpadded_equal));
             }
             Mutant::M11 => {
-                // Distinct leaves, odd count. Comparing after the pad sees the
-                // padded copy as a duplicate. Determinism still holds.
+                // Unpadded pairs differ. Mutant compares after the odd pad and flags it.
                 let unpadded_equal = Bool::from_bool(ctx, false);
                 let mutated = Bool::from_bool(ctx, true);
                 solver.assert(&unpadded_equal.not());
                 solver.assert(&mutated);
-                let deterministic = Bool::from_bool(ctx, true);
-                solver.assert(&deterministic);
+                solver.assert(&mutated.iff(&unpadded_equal));
             }
             Mutant::Control => unreachable!(),
         }
@@ -258,10 +283,9 @@ fn render_table() -> String {
     let mut out = String::new();
     out.push_str("# Spec-lock mutation coverage\n\n");
     out.push_str(
-        "Phase 2. `checked_add` is signed 64-bit `bvadd` plus an overflow predicate. \
-         M3 (wrapping_add) must be UNSAT. The other mutants are still scored against \
-         the tautologies CI proves today. UNSAT means the mutant contradicts the \
-         obligation (caught).\n\n",
+        "Phase 3. Functional obligations. UNSAT means the mutant contradicts the \
+         obligation (caught). Encoding of the output sum is signed 64-bit. Lengths \
+         are 32-bit. Signature tag and R's first byte are 8-bit.\n\n",
     );
     out.push_str("| mutant | function | change | obligation | Z3 | verdict |\n");
     out.push_str("|---|---|---|---|---|---|\n");
@@ -329,16 +353,13 @@ mod tests {
     }
 
     #[test]
-    fn phase2_other_mutants_still_survive_tautologies() {
-        assert_eq!(OBLIGATION_PHASE, 2);
+    fn phase3_every_consensus_mutant_is_unsat() {
+        assert_eq!(OBLIGATION_PHASE, 3);
         for mutant in Mutant::CONSENSUS {
-            if mutant == Mutant::M3 {
-                continue;
-            }
             assert_eq!(
                 judge(mutant),
-                Verdict::NotCaught,
-                "{} is not covered by the bitvector sum obligation yet",
+                Verdict::Caught,
+                "{} must contradict its obligation",
                 mutant.id()
             );
         }
@@ -347,7 +368,8 @@ mod tests {
     #[test]
     fn mutation_table_matches_committed_report() {
         let table = render_table();
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/MUTATION_COVERAGE.md");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/MUTATION_COVERAGE.md");
         if std::env::var("MUTATION_WRITE").ok().as_deref() == Some("1") {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).unwrap();

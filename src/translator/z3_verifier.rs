@@ -396,9 +396,43 @@ impl Z3Verifier {
                 VerificationResult::Verified { body_translated }
             }
             SatResult::Sat => {
-                // SAT is the result. A missing body does not turn it into Unknown.
+                // A model is a counterexample only when the production body was
+                // translated and every assigned name is a parameter or `result`.
+                // `result_len`, `result_is_ok`, and other translator names mean
+                // the formula is incomplete. That SAT is not an implementation bug.
                 let counterexample = self.extract_counterexample(&solver);
-                let _ = param_types;
+                let is_vacuous = !body_translated
+                    || counterexample.as_ref().is_none_or(|ce| {
+                        if ce.assignments.is_empty() {
+                            return true;
+                        }
+                        let known_names: std::collections::HashSet<&str> = param_types
+                            .keys()
+                            .map(|s| s.as_str())
+                            .chain(std::iter::once("result"))
+                            .collect();
+                        ce.assignments.keys().any(|k| {
+                            let bare = k
+                                .strip_prefix("r1_")
+                                .or_else(|| k.strip_prefix("r2_"))
+                                .unwrap_or(k.as_str());
+                            !known_names.contains(bare)
+                        })
+                    });
+                if is_vacuous {
+                    return VerificationResult::Unknown {
+                        reason: if !body_translated {
+                            "Could not translate function body to Z3 constraints; \
+                             SAT result without body constraints is not meaningful"
+                                .to_string()
+                        } else {
+                            "Z3 found SAT but counterexample model has no named variable \
+                             assignments (incomplete translator); result is not a concrete \
+                             witness against the implementation"
+                                .to_string()
+                        },
+                    };
+                }
                 VerificationResult::Failed { counterexample }
             }
             SatResult::Unknown => VerificationResult::Unknown {

@@ -1306,16 +1306,15 @@ fn demote_if_all_spec_derived(
         return None;
     }
 
-    // A failure is a translator gap when Z3 cannot produce a concrete counterexample —
-    // meaning the result is never a genuine implementation violation.
-    //
-    // "no named variable assignments" is unconditionally a gap (spec-derived or manual):
-    // Z3 returned a model with no concrete values for function parameters, which only
-    // happens when the body was not meaningfully translated.
-    // Body-translation failure, empty counterexamples, and type errors are not
-    // proofs and are not demoted. A missing body used to become Partial and
-    // exit 0. Only an unparseable LaTeX contract is still a parser gap.
-    let is_translator_gap = |reason: &str| -> bool { reason.contains("could not be parsed") };
+    // A failure is a translator gap when Z3 cannot produce a concrete counterexample.
+    // An untranslated body, an empty assignment map, and a type error in the
+    // translator are that gap. A model whose names are all parameters is not.
+    let is_translator_gap = |reason: &str| -> bool {
+        reason.contains("could not be parsed")
+            || reason.contains("Could not translate function body")
+            || reason.contains("counterexample model has no named variable assignments")
+            || reason.contains("Translation error")
+    };
 
     let all_gaps = failed_contracts
         .iter()
@@ -1588,7 +1587,7 @@ mod failure_kind_tests {
     }
 
     #[test]
-    fn spec_derived_body_translation_failure_stays_failed() {
+    fn spec_derived_body_translation_failure_demotes_to_partial() {
         let failed = vec![(
             "Ensures".to_string(),
             "Z3: Z3 verification unknown: Could not translate function body to Z3 constraints; \
@@ -1596,14 +1595,18 @@ mod failure_kind_tests {
                 .to_string(),
             true,
         )];
-        assert!(
-            demote_if_all_spec_derived(&failed, 0, 1).is_none(),
-            "a missing body is not a proof and is not demoted"
-        );
+        let result = demote_if_all_spec_derived(&failed, 0, 1)
+            .expect("body-translation gap should demote to Partial");
+        match result {
+            VerificationResult::Partial { partial_reason, .. } => {
+                assert_eq!(partial_reason, Some(PartialReason::UnsupportedTranslation));
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
     }
 
     #[test]
-    fn spec_derived_empty_assignments_stay_failed() {
+    fn spec_derived_empty_assignments_demotes_to_partial() {
         let failed = vec![(
             "Ensures".to_string(),
             "Z3: Z3 verification unknown: Z3 found SAT but counterexample model has no named \
@@ -1612,23 +1615,31 @@ mod failure_kind_tests {
                 .to_string(),
             true,
         )];
-        assert!(
-            demote_if_all_spec_derived(&failed, 0, 1).is_none(),
-            "SAT is not demoted because the assignment map is empty"
-        );
+        let result = demote_if_all_spec_derived(&failed, 0, 1)
+            .expect("empty assignment map should demote to Partial");
+        match result {
+            VerificationResult::Partial { partial_reason, .. } => {
+                assert_eq!(partial_reason, Some(PartialReason::UnsupportedTranslation));
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
     }
 
     #[test]
-    fn spec_derived_translation_type_error_stays_failed() {
+    fn spec_derived_translation_type_error_demotes_to_partial() {
         let failed = vec![(
             "Ensures".to_string(),
             "Z3: Z3 verification error: Translation error: Type error: Expected Bool".to_string(),
             true,
         )];
-        assert!(
-            demote_if_all_spec_derived(&failed, 0, 1).is_none(),
-            "a translation type error is not a proof"
-        );
+        let result = demote_if_all_spec_derived(&failed, 0, 1)
+            .expect("translation type error should demote to Partial");
+        match result {
+            VerificationResult::Partial { partial_reason, .. } => {
+                assert_eq!(partial_reason, Some(PartialReason::UnsupportedTranslation));
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1648,7 +1659,7 @@ mod failure_kind_tests {
     }
 
     #[test]
-    fn manual_no_named_assignments_stay_failed() {
+    fn manual_no_named_assignments_demotes_to_partial() {
         let failed = vec![(
             "Ensures".to_string(),
             "Z3: Z3 verification unknown: Z3 found SAT but counterexample model has no named \
@@ -1657,9 +1668,13 @@ mod failure_kind_tests {
                 .to_string(),
             false,
         )];
-        assert!(
-            demote_if_all_spec_derived(&failed, 0, 1).is_none(),
-            "a manual contract with no named assignments is not demoted"
-        );
+        let result = demote_if_all_spec_derived(&failed, 0, 1)
+            .expect("an unnamed model is a translator gap for a manual contract too");
+        match result {
+            VerificationResult::Partial { partial_reason, .. } => {
+                assert_eq!(partial_reason, Some(PartialReason::UnsupportedTranslation));
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
     }
 }

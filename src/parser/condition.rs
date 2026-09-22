@@ -83,9 +83,7 @@ fn first_complete_conjunct(s: &str) -> &str {
 /// Strip `result >= 0 (flags are a 32-bit…)` prose. Do not treat `result == (expr)` as a comment.
 fn strip_trailing_paren_prose(s: &str) -> &str {
     if let Some((expr, rest)) = s.split_once(" (") {
-        let looks_prose = rest
-            .trim_start()
-            .starts_with(|c: char| c.is_alphabetic())
+        let looks_prose = rest.trim_start().starts_with(|c: char| c.is_alphabetic())
             && rest.contains(' ')
             && !rest.contains('<')
             && !rest.contains('>')

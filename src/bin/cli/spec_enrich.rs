@@ -249,20 +249,8 @@ pub fn enrich_functions_with_spec(
 
         if let Some(spec_func) = spec_func {
             if spec_func.contracts.is_empty() {
-                // Spec section exists but has no formal Properties — the function is
-                // documented but not formally constrained. Inject a trivially-true contract
-                // so that check-drift and verify don't flag it as "missing from spec".
-                // This eliminates the need for `Defined: $\text{true}$` boilerplate in the
-                // Orange Paper: the spec can document a function without formal properties
-                // and the tooling treats it as trivially passing.
-                let expr: syn::Expr = syn::parse_str("true").expect("'true' is valid Rust");
-                func.contracts.push(Contract {
-                    contract_type: ContractType::Ensures,
-                    condition: "true".to_string(),
-                    expr: Some(expr),
-                    is_spec_derived: true,
-                });
-                enriched_count += 1;
+                // No property in the section. Do not inject `true`. The function
+                // stays without a contract and is not a lock.
                 continue;
             }
 
@@ -408,32 +396,11 @@ pub fn enrich_functions_with_spec(
                         func.contracts.push(m);
                     }
                 }
-            } else if !added_any && manual_ensures.is_empty() {
-                // Spec section was found and has properties, but none were parseable
-                // (e.g., all are implications with input-variable antecedents that the
-                // translator correctly skips to avoid vacuous contracts). Inject a
-                // trivially-true contract so the function is not flagged as
-                // "missing from spec" by check-drift or NoContracts by verify.
-                // Z3 trivially proves `true` — result is PASSED, never PARTIAL.
-                let expr: syn::Expr = syn::parse_str("true").expect("'true' is valid Rust");
-                if !func.contracts.iter().any(|c| c.condition == "true") {
-                    func.contracts.push(Contract {
-                        contract_type: ContractType::Ensures,
-                        condition: "true".to_string(),
-                        expr: Some(expr),
-                        is_spec_derived: true,
-                    });
-                    enriched_count += 1;
-                }
             }
         }
 
-        // Do not add a placeholder when no parseable contracts exist and no manual
-        // ensures were present. In that case leave contracts empty so the verifier's
-        // auto_type_contracts path can fire (type-level PASSED). Adding a placeholder
-        // here would block auto_type_contracts and incorrectly produce PARTIAL for
-        // functions whose spec properties are legitimately complex but whose return
-        // type guarantees are still sound.
+        // No parseable contract and no manual ensures: leave the list empty.
+        // An empty list is not a lock. Do not synthesize a type tautology.
     }
 
     Ok(enriched_count)

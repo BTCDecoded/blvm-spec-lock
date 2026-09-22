@@ -1,34 +1,26 @@
-//! Mutation harness for spec-lock obligations.
+//! Mutation harness. Each mutant is a source patch of the production arm.
 //!
-//! For each mutant, Z3 is asked whether the mutant can still satisfy the
-//! obligation on a distinguishing input.
-//!
-//! - **UNSAT** — the mutant contradicts the obligation. The proof fails. Caught.
-//! - **SAT** — a model satisfies both. The obligation does not rule the mutant out.
-//!
-//! Phase 3 scores the eleven mutants against functional obligations.
-//! UNSAT means the mutant contradicts the obligation (caught). The control
-//! obligation is `false`.
+//! The query is `body ∧ ¬clause`, built by re-parsing that arm.
+//! Unpatched is UNSAT. A patch that breaks the clause is SAT.
 
-use crate::translator::z3_translator::Z3Translator;
-use z3::ast::{Ast, BV, Bool};
-use z3::{Config, Context, SatResult, Solver};
-
-/// Bump only after the previous phase's failing-mutant test is green.
-/// 1 = current CI obligations. 2 = i64 bitvector overflow. 3 = functional formulas.
-const OBLIGATION_PHASE: u8 = 3;
+use crate::translator::production_lock::{
+    ProductionFacts, der_high_bit_query, der_leading_zero_query, der_len_query, der_tag_query,
+    dup_query, facts_of, merkle_query, money_in_range_query, negative_rejected_query,
+    overflow_query,
+};
+use z3::SatResult;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Verdict {
-    Caught,
-    NotCaught,
+enum Shape {
+    Pointwise,
+    Inductive,
 }
 
-impl Verdict {
+impl Shape {
     fn as_str(self) -> &'static str {
         match self {
-            Verdict::Caught => "caught",
-            Verdict::NotCaught => "not caught",
+            Shape::Pointwise => "pointwise",
+            Shape::Inductive => "inductive step",
         }
     }
 }
@@ -46,11 +38,31 @@ enum Mutant {
     M9,
     M10,
     M11,
-    /// Obligation is `false`. Must be UNSAT in every phase.
-    Control,
+    M12,
+    M13,
+    M14,
+    M15,
 }
 
 impl Mutant {
+    const ALL: [Mutant; 15] = [
+        Mutant::M1,
+        Mutant::M2,
+        Mutant::M3,
+        Mutant::M4,
+        Mutant::M5,
+        Mutant::M6,
+        Mutant::M7,
+        Mutant::M8,
+        Mutant::M9,
+        Mutant::M10,
+        Mutant::M11,
+        Mutant::M12,
+        Mutant::M13,
+        Mutant::M14,
+        Mutant::M15,
+    ];
+
     fn id(self) -> &'static str {
         match self {
             Mutant::M1 => "M1",
@@ -64,302 +76,452 @@ impl Mutant {
             Mutant::M9 => "M9",
             Mutant::M10 => "M10",
             Mutant::M11 => "M11",
-            Mutant::Control => "control",
+            Mutant::M12 => "M12",
+            Mutant::M13 => "M13",
+            Mutant::M14 => "M14",
+            Mutant::M15 => "M15",
         }
     }
 
     fn function(self) -> &'static str {
         match self {
-            Mutant::M1 | Mutant::M2 | Mutant::M3 | Mutant::M4 | Mutant::M5 => "check_transaction",
-            Mutant::M6 | Mutant::M7 | Mutant::M8 | Mutant::M9 => "is_strict_der",
-            Mutant::M10 | Mutant::M11 => "merkle_tree_from_hashes",
-            Mutant::Control => "harness",
+            Mutant::M1
+            | Mutant::M2
+            | Mutant::M3
+            | Mutant::M4
+            | Mutant::M5
+            | Mutant::M12
+            | Mutant::M13 => "check_transaction",
+            Mutant::M6 | Mutant::M7 | Mutant::M8 | Mutant::M9 | Mutant::M14 => "is_strict_der",
+            Mutant::M10 | Mutant::M11 | Mutant::M15 => "merkle_tree_from_hashes",
         }
     }
 
     fn change(self) -> &'static str {
         match self {
             Mutant::M1 => "delete the duplicate-input HashSet check",
-            Mutant::M2 => "duplicate check compares txid only, ignores vout",
-            Mutant::M3 => "wrapping_add instead of checked_add on the output sum",
-            Mutant::M4 => "MAX_MONEY comparison changed from > to >=",
-            Mutant::M5 => "allow a single negative output value",
-            Mutant::M6 => "accept signature length 74",
-            Mutant::M7 => "drop the unnecessary-leading-zero check",
-            Mutant::M8 => "drop the high-bit check on R",
-            Mutant::M9 => "accept tag 0x31 as well as 0x30",
-            Mutant::M10 => "remove the equal-adjacent-hash check before odd-padding",
-            Mutant::M11 => "compare adjacent hashes after padding instead of before",
-            Mutant::Control => "obligation false (detector)",
+            Mutant::M2 | Mutant::M13 => "insert txid only",
+            Mutant::M3 => "wrapping_add on the production output sum",
+            Mutant::M4 => "every production MAX_MONEY compare is >=",
+            Mutant::M5 => "drop sign and u64-cast rejects so a negative i64 is Ok",
+            Mutant::M6 | Mutant::M14 => "DER length bound 74",
+            Mutant::M7 => "drop the leading-zero check on R",
+            Mutant::M8 => "drop the high bit check on R",
+            Mutant::M9 => "accept tag 0x31",
+            Mutant::M10 => "drop the unpadded equal-hash check",
+            Mutant::M11 | Mutant::M15 => "compare adjacent hashes after the odd pad",
+            Mutant::M12 => "later production value_u64 compare is >=; fast path stays >",
         }
     }
 
-    fn obligation(self) -> &'static str {
+    fn shape(self) -> Shape {
         match self {
-            Mutant::Control => "false",
-            Mutant::M1 | Mutant::M2 => {
-                "F_NoDuplicateInputs: equal prevout (txid and vout) iff duplicate reject"
-            }
-            Mutant::M3 => "F_OutputSumBounded: Err iff i64 bvadd overflows (width 64)",
-            Mutant::M4 => "F_OutputSumBounded: value == MAX_MONEY is in range, so Ok",
-            Mutant::M5 => "F_OutputSumBounded: Ok implies every output is non-negative",
-            Mutant::M6 => "F_StrictDERSoundness: length in 9..=73",
-            Mutant::M7 => "F_StrictDERSoundness: no unnecessary leading zero",
-            Mutant::M8 => "F_StrictDERSoundness: no high bit on R",
-            Mutant::M9 => "F_StrictDERSoundness: tag byte is 0x30",
-            Mutant::M10 | Mutant::M11 => {
-                "F_MerkleMutationRejected: unpadded equal pair iff mutation; pad is not one"
+            Mutant::M3 | Mutant::M10 | Mutant::M11 | Mutant::M15 => Shape::Inductive,
+            _ => Shape::Pointwise,
+        }
+    }
+}
+
+fn consensus_src(file: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../blvm-consensus/src")
+        .join(file);
+    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+}
+
+fn extract_fn(src: &str, name: &str) -> String {
+    let marker = format!("fn {name}(");
+    let start = src
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing {name}"));
+    let rest = &src[start..];
+    let mut depth = 0i32;
+    let mut started = false;
+    for (i, c) in rest.char_indices() {
+        if c == '{' {
+            depth += 1;
+            started = true;
+        } else if c == '}' {
+            depth -= 1;
+            if started && depth == 0 {
+                return rest[..=i].to_string();
             }
         }
     }
-
-    const CONSENSUS: [Mutant; 11] = [
-        Mutant::M1,
-        Mutant::M2,
-        Mutant::M3,
-        Mutant::M4,
-        Mutant::M5,
-        Mutant::M6,
-        Mutant::M7,
-        Mutant::M8,
-        Mutant::M9,
-        Mutant::M10,
-        Mutant::M11,
-    ];
+    panic!("unbalanced {name}");
 }
 
-/// SAT of (mutant behavior ∧ distinguishing input ∧ obligation).
-/// UNSAT means the mutant cannot meet the obligation: proof fails, mutant caught.
-fn check_sat(build: impl FnOnce(&Context, &Solver)) -> SatResult {
-    let mut cfg = Config::new();
-    cfg.set_model_generation(true);
-    cfg.set_timeout_msec(5_000);
-    let ctx = Context::new(&cfg);
-    let solver = Solver::new(&ctx);
-    build(&ctx, &solver);
-    solver.check()
+fn parse_fn(src: &str) -> syn::ItemFn {
+    syn::parse_str(src).unwrap_or_else(|err| panic!("parse failed: {err}\n{src}"))
 }
 
-fn verdict_of(result: SatResult) -> Verdict {
+fn merge_money(fast: ProductionFacts, main: ProductionFacts) -> ProductionFacts {
+    let mut facts = main;
+    let mut money = fast.money;
+    money.append(&mut facts.money);
+    facts.money = money;
+    facts
+}
+
+fn tx_facts(fast_src: &str, check_src: &str) -> ProductionFacts {
+    let fast = facts_of(&parse_fn(fast_src));
+    let main = facts_of(&parse_fn(check_src));
+    merge_money(fast, main)
+}
+
+const DUP_IF: &str = r#"        if !seen_prevouts.insert(&input.prevout) {
+            return Ok(ValidationResult::Invalid(format!(
+                "Duplicate input prevout at index {i}"
+            )));
+        }"#;
+
+const MERKLE_CMP: &str = r#"        for pos in (0..hashes.len().saturating_sub(1)).step_by(2) {
+            if hashes[pos] == hashes[pos + 1] {
+                mutated = true;
+            }
+        }"#;
+
+const MERKLE_PAD: &str = r#"        if hashes.len() & 1 != 0 {
+            hashes.push(hashes[hashes.len() - 1]);
+        }"#;
+
+const DER_LEADING: &str = r#"    if len_r > 1 && signature[4] == 0x00 && (signature[5] & 0x80) == 0 {
+        return Ok(false);
+    }"#;
+
+const DER_HIGH: &str = r#"    if (signature[4] & 0x80) != 0 {
+        return Ok(false);
+    }"#;
+
+fn patch(
+    mutant: Mutant,
+    fast: &str,
+    check: &str,
+    der: &str,
+    merkle: &str,
+) -> (String, String, String, String) {
+    let mut fast = fast.to_string();
+    let mut check = check.to_string();
+    let mut der = der.to_string();
+    let mut merkle = merkle.to_string();
+    match mutant {
+        Mutant::M1 => {
+            check = check.replace(DUP_IF, "");
+        }
+        Mutant::M2 | Mutant::M13 => {
+            check = check.replace(
+                "seen_prevouts.insert(&input.prevout)",
+                "seen_prevouts.insert(&input.prevout.txid)",
+            );
+        }
+        Mutant::M3 => {
+            check = check.replace(".checked_add(output.value)", ".wrapping_add(output.value)");
+        }
+        Mutant::M4 => {
+            fast = fast.replace("value_u64 > MAX_MONEY_U64", "value_u64 >= MAX_MONEY_U64");
+            check = check.replace("value_u64 > MAX_MONEY_U64", "value_u64 >= MAX_MONEY_U64");
+            check = check.replace("total_u64 > MAX_MONEY_U64", "total_u64 >= MAX_MONEY_U64");
+        }
+        Mutant::M5 => {
+            for src in [&mut fast, &mut check] {
+                *src = src.replace(
+                    "output.value < 0 || value_u64 > MAX_MONEY_U64",
+                    "output.value > MAX_MONEY",
+                );
+            }
+            check = check.replace(
+                "total_output_value < 0 || total_u64 > MAX_MONEY_U64",
+                "total_output_value > MAX_MONEY",
+            );
+        }
+        Mutant::M6 | Mutant::M14 => {
+            der = der.replace("signature.len() > 73", "signature.len() > 74");
+        }
+        Mutant::M7 => {
+            der = der.replace(DER_LEADING, "");
+        }
+        Mutant::M8 => {
+            der = der.replace(DER_HIGH, "");
+        }
+        Mutant::M9 => {
+            der = der.replace(
+                "signature[0] != 0x30",
+                "signature[0] != 0x30 && signature[0] != 0x31",
+            );
+        }
+        Mutant::M10 => {
+            merkle = merkle.replace(MERKLE_CMP, "");
+        }
+        Mutant::M11 | Mutant::M15 => {
+            merkle = merkle.replace(MERKLE_CMP, "");
+            merkle = merkle.replace(MERKLE_PAD, &format!("{MERKLE_PAD}\n{MERKLE_CMP}"));
+        }
+        Mutant::M12 => {
+            check = check.replacen("value_u64 > MAX_MONEY_U64", "value_u64 >= MAX_MONEY_U64", 1);
+        }
+    }
+    (fast, check, der, merkle)
+}
+
+fn sat_of(result: SatResult) -> &'static str {
     match result {
-        SatResult::Unsat => Verdict::Caught,
-        SatResult::Sat | SatResult::Unknown => Verdict::NotCaught,
+        SatResult::Unsat => "UNSAT",
+        SatResult::Sat => "SAT",
+        SatResult::Unknown => "UNKNOWN",
     }
 }
 
-fn judge(mutant: Mutant) -> Verdict {
-    if mutant == Mutant::Control {
-        let result = check_sat(|ctx, solver| {
-            let obligation = Bool::from_bool(ctx, false);
-            solver.assert(&obligation);
-        });
-        return verdict_of(result);
-    }
-    let _ = OBLIGATION_PHASE;
-    let result = check_sat(|ctx, solver| {
-        // Phase 1 obligation, conjoined with the mutant's behavior on one input.
-        // The behavior is satisfiable together with the tautology, so Z3 returns SAT.
-        match mutant {
-            Mutant::M1 => {
-                // Same txid and vout. Mutant deleted the check, so it does not reject.
-                let txid_eq = Bool::from_bool(ctx, true);
-                let vout_eq = Bool::from_bool(ctx, true);
-                let rejected = Bool::from_bool(ctx, false);
-                let prevout_eq = Bool::and(ctx, &[&txid_eq, &vout_eq]);
-                solver.assert(&prevout_eq);
-                solver.assert(&rejected.not());
-                // Reject exactly when the full prevout matches.
-                solver.assert(&rejected.iff(&prevout_eq));
+fn judge(mutant: Mutant) -> SatResult {
+    let tx = consensus_src("transaction.rs");
+    let der_file = consensus_src("bip_validation.rs");
+    let mining = consensus_src("mining.rs");
+    let fast0 = extract_fn(&tx, "check_transaction_fast_path");
+    let check0 = extract_fn(&tx, "check_transaction");
+    let der0 = extract_fn(&der_file, "is_strict_der");
+    let merkle0 = extract_fn(&mining, "merkle_tree_from_hashes");
+    let (fast, check, der, merkle) = patch(mutant, &fast0, &check0, &der0, &merkle0);
+    match mutant {
+        Mutant::M1
+        | Mutant::M2
+        | Mutant::M3
+        | Mutant::M4
+        | Mutant::M5
+        | Mutant::M12
+        | Mutant::M13 => {
+            let facts = tx_facts(&fast, &check);
+            match mutant {
+                Mutant::M1 | Mutant::M2 | Mutant::M13 => dup_query(&facts),
+                Mutant::M3 => overflow_query(&facts),
+                Mutant::M4 | Mutant::M12 => money_in_range_query(&facts),
+                Mutant::M5 => negative_rejected_query(&facts),
+                _ => unreachable!(),
             }
-            Mutant::M2 => {
-                // Same txid, different vout. Mutant rejects. Full prevout does not match.
-                let txid_eq = Bool::from_bool(ctx, true);
-                let vout_eq = Bool::from_bool(ctx, false);
-                let rejected = Bool::from_bool(ctx, true);
-                let prevout_eq = Bool::and(ctx, &[&txid_eq, &vout_eq]);
-                solver.assert(&txid_eq);
-                solver.assert(&vout_eq.not());
-                solver.assert(&rejected);
-                solver.assert(&rejected.iff(&prevout_eq));
-            }
-            Mutant::M3 if OBLIGATION_PHASE >= 2 => {
-                // 2^62 + 2^62 overflows signed 64-bit. The mutant uses wrapping_add
-                // and returns Ok. The obligation is Err exactly when bvadd overflows.
-                let half = BV::from_i64(ctx, 1_i64 << 62, 64);
-                let (_sum, overflow_ok) =
-                    Z3Translator::i64_checked_binop(ctx, "checked_add", &half, &half);
-                let returned_err = Bool::from_bool(ctx, false);
-                solver.assert(&returned_err.not());
-                solver.assert(&returned_err.iff(&overflow_ok.not()));
-            }
-            Mutant::M3 => {
-                let overflow = Bool::from_bool(ctx, true);
-                let returned_err = Bool::from_bool(ctx, false);
-                solver.assert(&overflow);
-                solver.assert(&returned_err.not());
-                let result_ok = Bool::from_bool(ctx, true);
-                solver.assert(&Bool::or(ctx, &[&result_ok, &result_ok.not()]));
-            }
-            Mutant::M4 => {
-                // Single output equal to MAX_MONEY, no overflow. Mutant rejects via >=.
-                let value = BV::from_i64(ctx, 2_100_000_000_000_000, 64);
-                let max_money = BV::from_i64(ctx, 2_100_000_000_000_000, 64);
-                let zero = BV::from_i64(ctx, 0, 64);
-                let in_range = value.bvsge(&zero) & value.bvsle(&max_money);
-                let result_ok = Bool::from_bool(ctx, false);
-                solver.assert(&in_range);
-                solver.assert(&result_ok.not());
-                solver.assert(&result_ok.iff(&in_range));
-            }
-            Mutant::M5 => {
-                // Negative output. Mutant returns Ok.
-                let value = BV::from_i64(ctx, -1, 64);
-                let zero = BV::from_i64(ctx, 0, 64);
-                let non_negative = value.bvsge(&zero);
-                let result_ok = Bool::from_bool(ctx, true);
-                solver.assert(&result_ok);
-                solver.assert(&result_ok.implies(&non_negative));
-            }
-            Mutant::M6 => {
-                // Length 74. Mutant accepts. Length clause is 9..=73, width u32.
-                let len = BV::from_i64(ctx, 74, 32);
-                let lo = BV::from_i64(ctx, 9, 32);
-                let hi = BV::from_i64(ctx, 73, 32);
-                let len_ok = len.bvuge(&lo) & len.bvule(&hi);
-                let accept = Bool::from_bool(ctx, true);
-                solver.assert(&accept);
-                solver.assert(&accept.implies(&len_ok));
-            }
-            Mutant::M7 => {
-                // Unnecessary leading zero on R. Mutant accepts.
-                let leading_zero = Bool::from_bool(ctx, true);
-                let accept = Bool::from_bool(ctx, true);
-                solver.assert(&accept);
-                solver.assert(&leading_zero);
-                solver.assert(&accept.implies(&leading_zero.not()));
-            }
-            Mutant::M8 => {
-                // High bit set on R. Mutant accepts.
-                let r0 = BV::from_i64(ctx, 0x81, 8);
-                let high = BV::from_i64(ctx, 0x80, 8);
-                let high_bit = r0.bvand(&high)._eq(&high);
-                let accept = Bool::from_bool(ctx, true);
-                solver.assert(&accept);
-                solver.assert(&high_bit);
-                solver.assert(&accept.implies(&high_bit.not()));
-            }
-            Mutant::M9 => {
-                // Tag 0x31. Mutant accepts.
-                let tag = BV::from_i64(ctx, 0x31, 8);
-                let compound = BV::from_i64(ctx, 0x30, 8);
-                let tag_ok = tag._eq(&compound);
-                let accept = Bool::from_bool(ctx, true);
-                solver.assert(&accept);
-                solver.assert(&accept.implies(&tag_ok));
-            }
-            Mutant::M10 => {
-                // Equal adjacent hashes on the unpadded level. Check removed.
-                let unpadded_equal = Bool::from_bool(ctx, true);
-                let mutated = Bool::from_bool(ctx, false);
-                solver.assert(&unpadded_equal);
-                solver.assert(&mutated.not());
-                solver.assert(&mutated.iff(&unpadded_equal));
-            }
-            Mutant::M11 => {
-                // Unpadded pairs differ. Mutant compares after the odd pad and flags it.
-                let unpadded_equal = Bool::from_bool(ctx, false);
-                let mutated = Bool::from_bool(ctx, true);
-                solver.assert(&unpadded_equal.not());
-                solver.assert(&mutated);
-                solver.assert(&mutated.iff(&unpadded_equal));
-            }
-            Mutant::Control => unreachable!(),
         }
-    });
-    verdict_of(result)
+        Mutant::M6 | Mutant::M7 | Mutant::M8 | Mutant::M9 | Mutant::M14 => {
+            let facts = facts_of(&parse_fn(&der));
+            match mutant {
+                Mutant::M6 | Mutant::M14 => der_len_query(&facts),
+                Mutant::M7 => der_leading_zero_query(&facts),
+                Mutant::M8 => der_high_bit_query(&facts),
+                Mutant::M9 => der_tag_query(&facts),
+                _ => unreachable!(),
+            }
+        }
+        Mutant::M10 | Mutant::M11 | Mutant::M15 => merkle_query(&facts_of(&parse_fn(&merkle))),
+    }
+}
+
+fn unpatched(which: &str) -> SatResult {
+    let tx = consensus_src("transaction.rs");
+    let facts = tx_facts(
+        &extract_fn(&tx, "check_transaction_fast_path"),
+        &extract_fn(&tx, "check_transaction"),
+    );
+    match which {
+        "money" => money_in_range_query(&facts),
+        "negative" => negative_rejected_query(&facts),
+        "dup" => dup_query(&facts),
+        "overflow" => overflow_query(&facts),
+        "der_len" => der_len_query(&facts_of(&parse_fn(&extract_fn(
+            &consensus_src("bip_validation.rs"),
+            "is_strict_der",
+        )))),
+        "der_high" => der_high_bit_query(&facts_of(&parse_fn(&extract_fn(
+            &consensus_src("bip_validation.rs"),
+            "is_strict_der",
+        )))),
+        "der_lead" => der_leading_zero_query(&facts_of(&parse_fn(&extract_fn(
+            &consensus_src("bip_validation.rs"),
+            "is_strict_der",
+        )))),
+        "der_tag" => der_tag_query(&facts_of(&parse_fn(&extract_fn(
+            &consensus_src("bip_validation.rs"),
+            "is_strict_der",
+        )))),
+        "merkle" => merkle_query(&facts_of(&parse_fn(&extract_fn(
+            &consensus_src("mining.rs"),
+            "merkle_tree_from_hashes",
+        )))),
+        _ => panic!("unknown unpatched query {which}"),
+    }
 }
 
 fn render_table() -> String {
     let mut out = String::new();
     out.push_str("# Spec-lock mutation coverage\n\n");
     out.push_str(
-        "Phase 3. Functional obligations. UNSAT means the mutant contradicts the \
-         obligation (caught). Encoding of the output sum is signed 64-bit. Lengths \
-         are 32-bit. Signature tag and R's first byte are 8-bit.\n\n",
+        "Query is `body ∧ ¬clause` on the production arm after a source patch and a re-parse. \
+         Unpatched UNSAT means the body meets the clause. Patched SAT means the patch breaks it. \
+         A patched query that stays UNSAT is not a lock.\n\n",
     );
-    out.push_str("| mutant | function | change | obligation | Z3 | verdict |\n");
-    out.push_str("|---|---|---|---|---|---|\n");
-    let mut caught = 0usize;
-    for mutant in Mutant::CONSENSUS {
-        let verdict = judge(mutant);
-        if verdict == Verdict::Caught {
-            caught += 1;
-        }
-        let z3 = match verdict {
-            Verdict::Caught => "UNSAT",
-            Verdict::NotCaught => "SAT",
-        };
+    out.push_str("| mutant | function | change | shape | patched |\n");
+    out.push_str("|---|---|---|---|---|\n");
+    for mutant in Mutant::ALL {
+        let result = judge(mutant);
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} |\n",
             mutant.id(),
             mutant.function(),
             mutant.change(),
-            mutant.obligation(),
-            z3,
-            verdict.as_str()
+            mutant.shape().as_str(),
+            sat_of(result)
         ));
     }
-    let control = judge(Mutant::Control);
-    out.push_str(&format!(
-        "\nControl (`false`): Z3 {} — {}.\n\n",
-        match control {
-            Verdict::Caught => "UNSAT",
-            Verdict::NotCaught => "SAT",
-        },
-        control.as_str()
-    ));
-    out.push_str(&format!(
-        "Consensus mutants caught: {caught} / {}.\n\n",
-        Mutant::CONSENSUS.len()
-    ));
-    out.push_str(
-        "This count replaces a coverage percentage. A function whose only obligation \
-         is a tautology is not formally verified.\n",
-    );
+    out.push_str("\nUnpatched production arms:\n\n");
+    for (name, which) in [
+        ("output at MAX_MONEY", "money"),
+        ("negative output", "negative"),
+        ("duplicate prevout", "dup"),
+        ("output-sum step", "overflow"),
+        ("DER length 74", "der_len"),
+        ("DER high bit", "der_high"),
+        ("DER leading zero", "der_lead"),
+        ("DER tag 0x31", "der_tag"),
+        ("merkle mutation", "merkle"),
+    ] {
+        out.push_str(&format!("- {name}: {}\n", sat_of(unpatched(which))));
+    }
+    out.push_str(&crate::translator::consensus_set::coverage_markdown());
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::translator::production_lock::mir_matches;
 
     #[test]
-    fn failing_mutant_control_is_unsat() {
-        assert_eq!(
-            judge(Mutant::Control),
-            Verdict::Caught,
-            "Z3 must report UNSAT on an obligation of false"
-        );
+    fn unpatched_production_is_unsat() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        for which in [
+            "money", "negative", "dup", "overflow", "der_len", "der_high", "der_lead", "der_tag",
+            "merkle",
+        ] {
+            assert_eq!(
+                unpatched(which),
+                SatResult::Unsat,
+                "unpatched {which} must be UNSAT"
+            );
+        }
     }
 
     #[test]
-    fn m3_wrapping_add_is_unsat() {
-        assert!(OBLIGATION_PHASE >= 2);
-        assert_eq!(
-            judge(Mutant::M3),
-            Verdict::Caught,
-            "wrapping_add must contradict the i64 overflow obligation"
-        );
-    }
-
-    #[test]
-    fn phase3_every_consensus_mutant_is_unsat() {
-        assert_eq!(OBLIGATION_PHASE, 3);
-        for mutant in Mutant::CONSENSUS {
+    fn every_mutant_is_sat() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        for mutant in Mutant::ALL {
             assert_eq!(
                 judge(mutant),
-                Verdict::Caught,
-                "{} must contradict its obligation",
+                SatResult::Sat,
+                "{} stayed UNSAT; the patch did not touch what Z3 sees",
+                mutant.id()
+            );
+        }
+    }
+
+    fn mir_text() -> String {
+        let deps = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../blvm-consensus/target/debug/deps");
+        let mut mirs: Vec<_> = std::fs::read_dir(&deps)
+            .unwrap_or_else(|err| panic!("MIR dir {}: {err}", deps.display()))
+            .filter_map(|ent| ent.ok())
+            .map(|ent| ent.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("mir"))
+            .collect();
+        mirs.sort();
+        let path = mirs
+            .pop()
+            .unwrap_or_else(|| panic!("no production MIR under {}", deps.display()));
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    fn mir_fn(mir: &str, name: &str) -> String {
+        let marker = format!("{name}(");
+        let mut out = String::new();
+        let mut on = false;
+        for line in mir.lines() {
+            if line.starts_with("fn ") && line.contains(&marker) && !line.contains("fast_path") {
+                on = true;
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            if on
+                && (line.starts_with("fn ")
+                    || line.starts_with("const ")
+                    || line.starts_with("static "))
+            {
+                break;
+            }
+            if on {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        assert!(!out.is_empty(), "MIR has no {name}");
+        out
+    }
+
+    #[test]
+    fn mir_correspondence_fails_closed_when_the_compare_changes() {
+        let deps = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../blvm-consensus/target/debug/deps");
+        if !deps.is_dir() || !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let mir = mir_text();
+        let tx = consensus_src("transaction.rs");
+        let tx_mir = mir_fn(&mir, "check_transaction");
+        let unpatched_tx = tx_facts(
+            &extract_fn(&tx, "check_transaction_fast_path"),
+            &extract_fn(&tx, "check_transaction"),
+        );
+        assert!(
+            mir_matches(&unpatched_tx, &tx_mir),
+            "unpatched money compare and prevout insert must match the MIR"
+        );
+        let der = mir_fn(&mir, "is_strict_der");
+        let der_facts = facts_of(&parse_fn(&extract_fn(
+            &consensus_src("bip_validation.rs"),
+            "is_strict_der",
+        )));
+        assert!(mir_matches(&der_facts, &der));
+        let merkle_mir = mir_fn(&mir, "merkle_tree_from_hashes");
+        let merkle_facts = facts_of(&parse_fn(&extract_fn(
+            &consensus_src("mining.rs"),
+            "merkle_tree_from_hashes",
+        )));
+        assert!(mir_matches(&merkle_facts, &merkle_mir));
+        for mutant in [
+            Mutant::M1,
+            Mutant::M4,
+            Mutant::M12,
+            Mutant::M6,
+            Mutant::M10,
+            Mutant::M11,
+        ] {
+            let tx_src = consensus_src("transaction.rs");
+            let (fast, check, der_src, merkle_src) = patch(
+                mutant,
+                &extract_fn(&tx_src, "check_transaction_fast_path"),
+                &extract_fn(&tx_src, "check_transaction"),
+                &extract_fn(&consensus_src("bip_validation.rs"), "is_strict_der"),
+                &extract_fn(&consensus_src("mining.rs"), "merkle_tree_from_hashes"),
+            );
+            let (facts, slice) = match mutant {
+                Mutant::M1 | Mutant::M4 | Mutant::M12 => (tx_facts(&fast, &check), tx_mir.as_str()),
+                Mutant::M6 => (facts_of(&parse_fn(&der_src)), der.as_str()),
+                Mutant::M10 | Mutant::M11 => {
+                    (facts_of(&parse_fn(&merkle_src)), merkle_mir.as_str())
+                }
+                _ => unreachable!(),
+            };
+            assert!(
+                !mir_matches(&facts, slice),
+                "{} still matches the unpatched MIR",
                 mutant.id()
             );
         }
@@ -440,6 +602,9 @@ mod tests {
 
     #[test]
     fn mutation_table_matches_committed_report() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let table = render_table();
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/MUTATION_COVERAGE.md");

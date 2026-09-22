@@ -627,42 +627,8 @@ pub fn verify_function(
         }
     }
     if function.contracts.is_empty() {
-        // Attempt to auto-derive type-level contracts from the return type before
-        // giving up with NoContracts.  Functions returning unsigned / opaque types
-        // (Hash, Block, u64, …) get `result >= 0` for free; functions returning
-        // bool-like types get `result == true || result == false`.  These contracts
-        // are trivially true by the type system and need no Z3 body translation.
-        //
-        // Only functions returning signed primitives (Integer / i64, etc.) or types
-        // with no useful type-level contract fall through to NoContracts.
-        if let Some(ref sig) = function.function_sig {
-            use crate::translator::z3_translator::auto_type_contracts;
-            let return_ty = extract_return_type_from_sig(sig);
-            if let Some(ret) = return_ty {
-                let type_contracts = auto_type_contracts(&ret);
-                if !type_contracts.is_empty() {
-                    // Auto-derived type contracts are "spec derived" so they show
-                    // distinctly in reports and don't inflate the semantic spec count.
-                    let synthetic: Vec<Contract> = type_contracts
-                        .iter()
-                        .filter_map(|s| {
-                            let expr: syn::Expr = syn::parse_str(s).ok()?;
-                            Some(Contract {
-                                contract_type: ContractType::Ensures,
-                                condition: s.clone(),
-                                expr: Some(expr),
-                                is_spec_derived: true,
-                            })
-                        })
-                        .collect();
-                    if !synthetic.is_empty() {
-                        let mut synthetic_fn = function.clone();
-                        synthetic_fn.contracts = synthetic;
-                        return verify_function(&synthetic_fn, timeout_secs, callee_postconds);
-                    }
-                }
-            }
-        }
+        // A missing clause is not a lock. Do not synthesize
+        // `result == true || result == false` or `result >= 0` from the type.
         return VerificationResult::NoContracts {
             section: function.section.clone().unwrap_or_else(|| "?".to_string()),
         };
@@ -773,30 +739,16 @@ pub fn verify_function(
                 if let Some(ref func) = function.function_sig {
                     requires_z3_count += 1;
                     match verify_determinism(func, &requires_contracts, timeout_secs) {
-                        Ok(()) => verified_count += 1,
+                        Ok(()) => {
+                            verified_count += 1;
+                            any_body_translated = true;
+                        }
                         Err(e) => {
-                            if e.contains("Could not translate body") {
-                                // Body untranslatable for determinism check.
-                                // Spec-derived determinism contracts that reduce to "true" via
-                                // extract_parseable_condition (e.g. "may differ" annotations) are
-                                // acceptable as type-level assertions — count them as verified
-                                // rather than recording an unsupported-translation gap.
-                                if contract.is_spec_derived {
-                                    verified_count += 1;
-                                } else {
-                                    requires_z3_count += 1;
-                                    let mut slot = translation_error.borrow_mut();
-                                    if slot.is_none() {
-                                        *slot = Some(e);
-                                    }
-                                }
-                            } else {
-                                failed_contracts.push((
-                                    format!("{:?}", contract.contract_type),
-                                    format!("Determinism: {e}"),
-                                    contract.is_spec_derived,
-                                ));
-                            }
+                            failed_contracts.push((
+                                format!("{:?}", contract.contract_type),
+                                format!("Determinism: {e}"),
+                                contract.is_spec_derived,
+                            ));
                         }
                     }
                 } else {
@@ -828,6 +780,13 @@ pub fn verify_function(
                 StaticCheck::Passed => {
                     verified_count += 1;
                 }
+                StaticCheck::NotAProof(reason) => {
+                    failed_contracts.push((
+                        format!("{:?}", contract.contract_type),
+                        reason,
+                        contract.is_spec_derived,
+                    ));
+                }
                 StaticCheck::Failed(reason) => {
                     failed_contracts.push((
                         format!("{:?}", contract.contract_type),
@@ -855,9 +814,16 @@ pub fn verify_function(
                                 ));
                             }
                             Ok(body_translated) => {
-                                verified_count += 1;
                                 if body_translated {
+                                    verified_count += 1;
                                     any_body_translated = true;
+                                } else {
+                                    failed_contracts.push((
+                                        format!("{:?}", contract.contract_type),
+                                        "clause discharged without the production body; not a lock"
+                                            .to_string(),
+                                        contract.is_spec_derived,
+                                    ));
                                 }
                             }
                         }
@@ -894,10 +860,16 @@ pub fn verify_function(
         return failed_verification(contract_type, reason, failed_contracts.len());
     }
 
-    if verified_count == function.contracts.len() {
+    if verified_count == function.contracts.len() && any_body_translated {
         VerificationResult::Passed {
-            body_translated: any_body_translated,
+            body_translated: true,
         }
+    } else if verified_count == function.contracts.len() {
+        failed_verification(
+            "Ensures",
+            "contracts held without the production body; not a lock",
+            1,
+        )
     } else if requires_z3_count > 0 {
         let trans_err = translation_error.into_inner();
         let reason_msg = format!(
@@ -932,6 +904,8 @@ pub fn verify_function(
 /// Result of static checking
 enum StaticCheck {
     Passed,
+    /// True for the type, or the literal `true`. Not a proof of the body.
+    NotAProof(String),
     Failed(String),
     RequiresZ3,
 }
@@ -950,7 +924,9 @@ fn check_contract_statically(
     if let syn::Expr::Lit(lit) = expr {
         if let syn::Lit::Bool(b) = &lit.lit {
             if b.value {
-                return StaticCheck::Passed;
+                return StaticCheck::NotAProof(
+                    "literal true is not a lock of the function body".to_string(),
+                );
             }
         }
     }
@@ -963,7 +939,10 @@ fn check_contract_statically(
     //    (e.g. complex struct returns), so it trivially finds SAT for the negation
     //    (`result == 2`) and emits PARTIAL.  We bypass Z3 entirely.
     if is_bool_exhaustion_tautology(expr) {
-        return StaticCheck::Passed;
+        return StaticCheck::NotAProof(
+            "result == true || result == false is true for the type, not a lock of the body"
+                .to_string(),
+        );
     }
 
     // 2. Non-negative for unsigned return types: `result >= 0` / `result_N >= 0`.
@@ -973,7 +952,9 @@ fn check_contract_statically(
     //    Z3 translator.
     if let Some(func) = func_sig {
         if is_nonneg_tautology_for_return_type(expr, func) {
-            return StaticCheck::Passed;
+            return StaticCheck::NotAProof(
+                "result >= 0 follows from the return type, not from the body".to_string(),
+            );
         }
     }
 
@@ -1360,12 +1341,10 @@ fn demote_if_all_spec_derived(
     // "no named variable assignments" is unconditionally a gap (spec-derived or manual):
     // Z3 returned a model with no concrete values for function parameters, which only
     // happens when the body was not meaningfully translated.
-    let is_translator_gap = |reason: &str| -> bool {
-        reason.contains("could not be parsed")
-            || reason.contains("Could not translate function body")
-            || reason.contains("counterexample model has no named variable assignments")
-            || reason.contains("Translation error")
-    };
+    // Body-translation failure, empty counterexamples, and type errors are not
+    // proofs and are not demoted. A missing body used to become Partial and
+    // exit 0. Only an unparseable LaTeX contract is still a parser gap.
+    let is_translator_gap = |reason: &str| -> bool { reason.contains("could not be parsed") };
 
     let all_gaps = failed_contracts
         .iter()
@@ -1638,12 +1617,7 @@ mod failure_kind_tests {
     }
 
     #[test]
-    fn spec_derived_body_translation_failure_demotes_to_partial() {
-        // When the function body cannot be translated to Z3 constraints, the SAT result
-        // is vacuous (no body = no real counterexample).  The z3_verifier returns Unknown
-        // with "Could not translate function body", which verify_with_z3 propagates as
-        // "Z3: Z3 verification unknown: Could not translate function body ...".
-        // demote_if_all_spec_derived should treat this as a translation gap → Partial.
+    fn spec_derived_body_translation_failure_stays_failed() {
         let failed = vec![(
             "Ensures".to_string(),
             "Z3: Z3 verification unknown: Could not translate function body to Z3 constraints; \
@@ -1651,22 +1625,14 @@ mod failure_kind_tests {
                 .to_string(),
             true,
         )];
-        let result = demote_if_all_spec_derived(&failed, 0, 1)
-            .expect("body-translation gap should demote to Partial");
-        match result {
-            VerificationResult::Partial { partial_reason, .. } => {
-                assert_eq!(partial_reason, Some(PartialReason::UnsupportedTranslation));
-            }
-            _ => panic!("expected Partial, got {result:?}"),
-        }
+        assert!(
+            demote_if_all_spec_derived(&failed, 0, 1).is_none(),
+            "a missing body is not a proof and is not demoted"
+        );
     }
 
     #[test]
-    fn spec_derived_empty_assignments_demotes_to_partial() {
-        // When the Z3 translator produces SAT but cannot extract named variable assignments
-        // (stub extract_counterexample), the verifier returns Unknown with
-        // "counterexample model has no named variable assignments".
-        // demote_if_all_spec_derived should treat this as a translation gap → Partial.
+    fn spec_derived_empty_assignments_stay_failed() {
         let failed = vec![(
             "Ensures".to_string(),
             "Z3: Z3 verification unknown: Z3 found SAT but counterexample model has no named \
@@ -1675,33 +1641,23 @@ mod failure_kind_tests {
                 .to_string(),
             true,
         )];
-        let result = demote_if_all_spec_derived(&failed, 0, 1)
-            .expect("empty-assignments gap should demote to Partial");
-        match result {
-            VerificationResult::Partial { partial_reason, .. } => {
-                assert_eq!(partial_reason, Some(PartialReason::UnsupportedTranslation));
-            }
-            _ => panic!("expected Partial, got {result:?}"),
-        }
+        assert!(
+            demote_if_all_spec_derived(&failed, 0, 1).is_none(),
+            "SAT is not demoted because the assignment map is empty"
+        );
     }
 
     #[test]
-    fn spec_derived_translation_type_error_demotes_to_partial() {
-        // "Translation error: Type error: Expected Bool" is a Z3 translator limitation —
-        // the condition parsed but cannot be expressed as a Z3 Bool.  Treat as a gap.
+    fn spec_derived_translation_type_error_stays_failed() {
         let failed = vec![(
             "Ensures".to_string(),
             "Z3: Z3 verification error: Translation error: Type error: Expected Bool".to_string(),
             true,
         )];
-        let result = demote_if_all_spec_derived(&failed, 0, 1)
-            .expect("translation type error should demote to Partial");
-        match result {
-            VerificationResult::Partial { partial_reason, .. } => {
-                assert_eq!(partial_reason, Some(PartialReason::UnsupportedTranslation));
-            }
-            _ => panic!("expected Partial, got {result:?}"),
-        }
+        assert!(
+            demote_if_all_spec_derived(&failed, 0, 1).is_none(),
+            "a translation type error is not a proof"
+        );
     }
 
     #[test]
@@ -1721,26 +1677,18 @@ mod failure_kind_tests {
     }
 
     #[test]
-    fn manual_no_named_assignments_demotes_to_partial() {
-        // "counterexample model has no named variable assignments" is ALWAYS a translator gap —
-        // not a real counterexample — regardless of whether the contract is spec-derived.
-        // This covers functions (e.g. connect_block) whose manually-written ensures fail with
-        // this message because the body translator cannot model the function.
+    fn manual_no_named_assignments_stay_failed() {
         let failed = vec![(
             "Ensures".to_string(),
             "Z3: Z3 verification unknown: Z3 found SAT but counterexample model has no named \
              variable assignments (incomplete translator); result is not a concrete witness \
              against the implementation (3 total failures)"
                 .to_string(),
-            false, // NOT spec-derived — manual contract
+            false,
         )];
-        let result = demote_if_all_spec_derived(&failed, 0, 1)
-            .expect("no-named-assignments gap must demote to Partial even for manual contracts");
-        match result {
-            VerificationResult::Partial { partial_reason, .. } => {
-                assert_eq!(partial_reason, Some(PartialReason::UnsupportedTranslation));
-            }
-            _ => panic!("expected Partial, got {result:?}"),
-        }
+        assert!(
+            demote_if_all_spec_derived(&failed, 0, 1).is_none(),
+            "a manual contract with no named assignments is not demoted"
+        );
     }
 }

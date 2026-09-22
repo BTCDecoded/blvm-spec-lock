@@ -8,6 +8,10 @@
 pub mod static_checker;
 
 #[cfg(feature = "z3")]
+pub mod consensus_set;
+#[cfg(feature = "z3")]
+pub mod production_lock;
+#[cfg(feature = "z3")]
 pub mod z3_translator;
 
 #[cfg(feature = "z3")]

@@ -20,7 +20,7 @@
 
 use crate::parser::contracts::Contract;
 use syn::{Block, Expr, ItemFn, Stmt};
-use z3::ast::{Ast, Bool, BV, Int};
+use z3::ast::{Ast, BV, Bool, Int};
 #[cfg(feature = "z3")]
 use z3::{Config, Context, Sort};
 
@@ -437,6 +437,9 @@ impl Z3Translator {
     ) -> Result<z3::ast::Dynamic<'a>, TranslationError> {
         match op {
             syn::BinOp::Add(_) => {
+                if let Some(sum) = bv_add(&left, &right) {
+                    return Ok(sum);
+                }
                 let left_int = left
                     .as_int()
                     .ok_or_else(|| TranslationError::TypeError("Expected Int".to_string()))?;
@@ -844,7 +847,10 @@ impl Z3Translator {
                         if let syn::Pat::Ident(ident) = &closure.inputs[0] {
                             let param = ident.ident.to_string();
                             let recv = self.translate_expr_with_vars(&method.receiver, vars)?;
-                            let bound = if recv.as_int().is_some() || recv.as_bool().is_some() {
+                            let bound = if recv.as_int().is_some()
+                                || recv.as_bool().is_some()
+                                || recv.as_bv().is_some()
+                            {
                                 recv
                             } else {
                                 let fresh = format!("map_{param}");
@@ -1049,7 +1055,10 @@ impl Z3Translator {
                         }
                     }
                     if let Ok(recv) = self.translate_expr_with_vars(receiver, vars) {
-                        if recv.as_int().is_some() || recv.as_bool().is_some() {
+                        if recv.as_int().is_some()
+                            || recv.as_bool().is_some()
+                            || recv.as_bv().is_some()
+                        {
                             return Ok(recv);
                         }
                     }
@@ -1883,12 +1892,7 @@ impl Z3Translator {
     }
 
     /// Bind `name = expr` when the RHS translates to Int/Bool.
-    fn bind_int_or_bool<'a>(
-        &'a self,
-        name: String,
-        expr: &Expr,
-        vars: &mut Z3VarMap<'a>,
-    ) {
+    fn bind_int_or_bool<'a>(&'a self, name: String, expr: &Expr, vars: &mut Z3VarMap<'a>) {
         if let Ok(z3_expr) = self.translate_expr_with_vars(expr, vars) {
             if z3_expr.as_int().is_some() || z3_expr.as_bool().is_some() {
                 vars.insert(name, z3_expr);
@@ -1930,27 +1934,21 @@ impl Z3Translator {
             let old_k = vars.insert(k_name.clone(), k_int.into());
             let before = vars.clone();
             let mut this_break: Option<z3::ast::Bool<'a>> = None;
-            let mut assigned: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut assigned: std::collections::HashSet<String> = std::collections::HashSet::new();
 
             for stmt in &fl.body.stmts {
                 match stmt {
                     Stmt::Local(local) => {
                         if let Some(init) = &local.init {
                             if let syn::Pat::Ident(ident) = &local.pat {
-                                self.bind_int_or_bool(
-                                    ident.ident.to_string(),
-                                    &init.expr,
-                                    vars,
-                                );
+                                self.bind_int_or_bool(ident.ident.to_string(), &init.expr, vars);
                             }
                         }
                     }
                     Stmt::Expr(expr, _) => {
                         if let Expr::If(if_expr) = expr {
                             if is_break_only_then(if_expr) {
-                                if let Ok(c) = self.translate_expr_with_vars(&if_expr.cond, vars)
-                                {
+                                if let Ok(c) = self.translate_expr_with_vars(&if_expr.cond, vars) {
                                     if let Some(b) = c.as_bool() {
                                         this_break = Some(b);
                                     }
@@ -1959,7 +1957,10 @@ impl Z3Translator {
                             }
                             // Overflow `if total >= CAP { return CAP }` — dead on the
                             // integer subsidy schedule; skip so the sum stays the body.
-                            if self.translate_if_with_early_return(if_expr, vars)?.is_some() {
+                            if self
+                                .translate_if_with_early_return(if_expr, vars)?
+                                .is_some()
+                            {
                                 continue;
                             }
                         } else if let Expr::Assign(assign) = expr {
@@ -1969,10 +1970,8 @@ impl Z3Translator {
                                 assigned.insert(var_name);
                             }
                         } else if let Expr::Binary(bin) = expr {
-                            if matches!(
-                                bin.op,
-                                syn::BinOp::AddAssign(_) | syn::BinOp::SubAssign(_)
-                            ) {
+                            if matches!(bin.op, syn::BinOp::AddAssign(_) | syn::BinOp::SubAssign(_))
+                            {
                                 if let Expr::Path(path) = &*bin.left {
                                     let var_name = path_to_string(&path.path);
                                     let left = vars.get(&var_name).cloned().unwrap_or_else(|| {
@@ -2029,8 +2028,7 @@ impl Z3Translator {
                     };
                     if let (Some(ai), Some(bi)) = (after_v.as_int(), before_v.as_int()) {
                         vars.insert(name.clone(), skip.not().ite(&ai, &bi).into());
-                    } else if let (Some(ab), Some(bb)) = (after_v.as_bool(), before_v.as_bool())
-                    {
+                    } else if let (Some(ab), Some(bb)) = (after_v.as_bool(), before_v.as_bool()) {
                         vars.insert(name.clone(), skip.not().ite(&ab, &bb).into());
                     }
                 }
@@ -2062,8 +2060,10 @@ impl Z3Translator {
         func: &ItemFn,
         vars: &mut Z3VarMap<'a>,
     ) -> Result<Option<z3::ast::Bool<'a>>, TranslationError> {
-        // Extract the function body
-        let body = &func.block;
+        // The locked body is the production cfg arm. The other copies are not
+        // a second consensus.
+        let kept = crate::translator::production_lock::retain_production(func.clone());
+        let body = &kept.block;
 
         // For simple functions, translate the body to a formula
         // result == <body_expression>
@@ -2299,6 +2299,8 @@ impl Z3Translator {
                             result_var.as_int().map(|r| r._eq(&int_val))
                         } else if let Some(bool_val) = z3_expr.as_bool() {
                             result_var.as_bool().map(|r| r._eq(&bool_val))
+                        } else if let Some(bv_val) = z3_expr.as_bv() {
+                            result_var.as_bv().map(|r| r._eq(&bv_val))
                         } else {
                             None
                         };
@@ -2369,6 +2371,8 @@ impl Z3Translator {
                                 rv.as_int().map(|r| r._eq(&int_val))
                             } else if let Some(bool_val) = z3_expr.as_bool() {
                                 rv.as_bool().map(|r| r._eq(&bool_val))
+                            } else if let Some(bv_val) = z3_expr.as_bv() {
+                                rv.as_bv().map(|r| r._eq(&bv_val))
                             } else {
                                 None
                             }
@@ -3206,7 +3210,10 @@ fn is_break_only_then(if_expr: &syn::ExprIf) -> bool {
         .iter()
         .filter(|s| !matches!(s, syn::Stmt::Macro(_)))
         .collect();
-    matches!(meaningful.as_slice(), [syn::Stmt::Expr(syn::Expr::Break(_), _)])
+    matches!(
+        meaningful.as_slice(),
+        [syn::Stmt::Expr(syn::Expr::Break(_), _)]
+    )
 }
 
 fn extract_int_literal(expr: &syn::Expr) -> Option<i64> {
@@ -3374,6 +3381,24 @@ impl std::fmt::Display for TranslationError {
 
 impl std::error::Error for TranslationError {}
 
+fn bv_add<'a>(
+    left: &z3::ast::Dynamic<'a>,
+    right: &z3::ast::Dynamic<'a>,
+) -> Option<z3::ast::Dynamic<'a>> {
+    if let (Some(left_bv), Some(right_bv)) = (left.as_bv(), right.as_bv()) {
+        return Some(left_bv.bvadd(&right_bv).into());
+    }
+    if let (Some(left_bv), Some(right_int)) = (left.as_bv(), right.as_int()) {
+        let width = left_bv.get_size();
+        return Some(left_bv.bvadd(&BV::from_int(&right_int, width)).into());
+    }
+    if let (Some(left_int), Some(right_bv)) = (left.as_int(), right.as_bv()) {
+        let width = right_bv.get_size();
+        return Some(BV::from_int(&left_int, width).bvadd(&right_bv).into());
+    }
+    None
+}
+
 fn dynamic_as_i64_bv<'a>(
     ctx: &'a Context,
     value: &z3::ast::Dynamic<'a>,
@@ -3465,7 +3490,10 @@ mod tests {
         let func: syn::ItemFn = syn::parse_str(code).expect("parse fn");
         let mut param_types = std::collections::HashMap::new();
         for (name, ty) in params {
-            param_types.insert((*name).to_string(), syn::parse_str::<syn::Type>(ty).unwrap());
+            param_types.insert(
+                (*name).to_string(),
+                syn::parse_str::<syn::Type>(ty).unwrap(),
+            );
         }
         let return_type: syn::Type = syn::parse_str(ret).unwrap();
         let (mut shared_vars, type_constraints) =
@@ -3494,11 +3522,9 @@ mod tests {
     }
 
     #[test]
-    fn checked_map_expect_i64_equality_is_not_proved() {
-        // Obligation stays `result == x + 1`. It is not weakened.
-        // checked_sub is now signed 64-bit. x is still an unbounded Int in the
-        // ensures, so Z3 finds a counterexample (SAT of the negation). That is
-        // a finding: this proof does not carry the i64 width.
+    fn checked_map_bvadd_overflows_at_i64_max() {
+        // Both sides are 64-bit bvadd, and the add must not overflow.
+        // No `requires(x < i64::MAX)`. The statement is false at i64::MAX.
         let tr = Z3Translator::new(10000);
         let code = r#"
             fn add_one(x: i64) -> i64 {
@@ -3509,30 +3535,40 @@ mod tests {
         let mut param_types = std::collections::HashMap::new();
         param_types.insert("x".to_string(), syn::parse_str::<syn::Type>("i64").unwrap());
         let return_type: syn::Type = syn::parse_str("i64").unwrap();
-        let (mut shared_vars, type_constraints) =
+        let (mut shared_vars, _type_constraints) =
             tr.build_shared_vars(&param_types, Some(&return_type));
-        let contract = Contract {
-            contract_type: crate::parser::contracts::ContractType::Ensures,
-            condition: syn::parse_str("result == x + 1").unwrap(),
-            comment: None,
-        };
-        let ensures_z3 = tr
-            .translate_contract_with_shared_vars(&contract, &mut shared_vars)
-            .unwrap();
+        let ctx = tr.context();
+        let x_bv = BV::new_const(ctx, "x", 64);
+        let result_bv = BV::new_const(ctx, "result", 64);
+        shared_vars.insert("x".to_string(), x_bv.clone().into());
+        shared_vars.insert("result".to_string(), result_bv.clone().into());
         let body_formula = tr
             .translate_function_body(&func, &mut shared_vars)
             .unwrap()
-            .unwrap();
-        let solver = Solver::new(tr.context());
-        for c in &type_constraints {
-            solver.assert(c);
-        }
+            .expect("body translates to a 64-bit bvadd");
+        let one = BV::from_i64(ctx, 1, 64);
+        let sum = x_bv.bvadd(&one);
+        let no_overflow = Bool::and(
+            ctx,
+            &[
+                &x_bv.bvadd_no_overflow(&one, true),
+                &x_bv.bvadd_no_underflow(&one),
+            ],
+        );
+        let clause = result_bv._eq(&sum) & no_overflow;
+        let solver = Solver::new(ctx);
         solver.assert(&body_formula);
-        solver.assert(&ensures_z3.as_bool().unwrap().not());
+        solver.assert(&clause.not());
+        assert_eq!(solver.check(), SatResult::Sat);
+        let model = solver.get_model().expect("i64::MAX model");
+        let got = model
+            .eval(&x_bv, true)
+            .and_then(|v| v.as_i64())
+            .expect("model value for x");
         assert_eq!(
-            solver.check(),
-            SatResult::Sat,
-            "result == x + 1 is unproved once checked_sub is i64 bitvector arithmetic"
+            got,
+            i64::MAX,
+            "counterexample is x = i64::MAX; model: {model}"
         );
     }
 

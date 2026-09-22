@@ -371,19 +371,10 @@ impl Z3Verifier {
                     // Always count the body as translated — the formula still helps Z3 prove
                     // UNSAT (valid contracts).  The `body_formula_vacuous` flag is used later
                     // to decide whether a SAT result is genuine or vacuous.
-                    body_translated = true;
-                    if body_formula_vacuous {
-                        // SAT on a vacuous body is not a genuine counterexample: mark the
-                        // translated body flag off so the is_vacuous check fires.
-                        body_translated = false;
-                    }
-                    // If callee contracts (non-negativity axioms, taproot axioms, struct-field
-                    // axioms) were injected, those provide concrete semantics even when the body
-                    // formula itself is vacuous — promote body_translated to true so genuine SAT
-                    // is not silently demoted to PARTIAL.
-                    if added_nonneg && !body_translated {
-                        body_translated = true;
-                    }
+                    // A vacuous body (uninterpreted wrapper, `(= result result)`) is not
+                    // the production body. Callee axioms do not promote it into a proof.
+                    body_translated = !body_formula_vacuous;
+                    let _ = added_nonneg;
                 }
                 // If translation fails, we still verify based on type constraints and requires.
                 // body_translated remains false; SAT in that case is vacuous (see below).
@@ -399,79 +390,24 @@ impl Z3Verifier {
         // Check satisfiability
         match solver.check() {
             SatResult::Unsat => {
-                // Negation is unsatisfiable, so property holds
-                VerificationResult::Verified { body_translated }
+                // The negation is unsatisfiable. That is a lock only when the
+                // production body is in the formula. A tautology is UNSAT here
+                // with no body, and that is not a proof.
+                if body_translated {
+                    VerificationResult::Verified {
+                        body_translated: true,
+                    }
+                } else {
+                    VerificationResult::Unknown {
+                        reason: "clause discharged without the production body; not a lock"
+                            .to_string(),
+                    }
+                }
             }
             SatResult::Sat => {
-                // Negation is satisfiable — Z3 found a model.
-                //
-                // Only treat this as a real counterexample when we have concrete variable
-                // assignments.  There are two reasons an empty-assignments result is vacuous:
-                //
-                // 1. Body translation failed: no implementation constraints were added,
-                //    so Z3 trivially satisfies !ensures from the postcondition alone.
-                // 2. Body translation succeeded but assignments map is empty: the current
-                //    extract_counterexample implementation is a stub; it does not yet walk
-                //    the Z3 model to extract named-variable values.  Until that is
-                //    implemented every SAT result carries an empty {} counterexample,
-                //    which gives no evidence of a real implementation violation.
-                //
-                // In both cases return Unknown so the caller classifies the result as a
-                // translation-gap (Partial) rather than a hard failure.  Once
-                // extract_counterexample is fully implemented this branch will only trigger
-                // for case 1; case 2 will produce non-empty assignments and fall through
-                // to the real Failed path below.
+                // SAT is the result. A missing body does not turn it into Unknown.
                 let counterexample = self.extract_counterexample(&solver);
-                // A counterexample is genuine only if:
-                // 1. Body was translated (otherwise no impl constraints, trivially SAT)
-                // 2. Counterexample contains at least one assignment
-                // 3. ALL assigned variable names are either:
-                //    a. A named function parameter (in param_types)
-                //    b. The "result" variable
-                //    c. A renamed parameter (prefix "r1_"/"r2_" for determinism runs)
-                //    If Z3 assigns values to translator-internal variables like
-                //    `for_loop_14` or `call_foo_result`, the body formula is
-                //    incomplete and those free variables are being exploited — the
-                //    counterexample is therefore a translator artifact, not a real
-                //    implementation violation.
-                let is_vacuous = !body_translated
-                    || counterexample.as_ref().is_none_or(|ce| {
-                        if ce.assignments.is_empty() {
-                            return true;
-                        }
-                        // Check for translator-internal variables in the counterexample.
-                        // Genuine counterexamples only involve:
-                        // - exact parameter names
-                        // - "result"
-                        // - determinism-prefixed names (r1_/r2_ + param or result)
-                        let known_names: std::collections::HashSet<&str> = param_types
-                            .keys()
-                            .map(|s| s.as_str())
-                            .chain(std::iter::once("result"))
-                            .collect();
-                        ce.assignments.keys().any(|k| {
-                            // Strip determinism prefixes before checking
-                            let bare = k
-                                .strip_prefix("r1_")
-                                .or_else(|| k.strip_prefix("r2_"))
-                                .unwrap_or(k.as_str());
-                            !known_names.contains(bare)
-                        })
-                    });
-                if is_vacuous {
-                    return VerificationResult::Unknown {
-                        reason: if !body_translated {
-                            "Could not translate function body to Z3 constraints; \
-                             SAT result without body constraints is not meaningful"
-                                .to_string()
-                        } else {
-                            "Z3 found SAT but counterexample model has no named variable \
-                             assignments (incomplete translator); result is not a concrete \
-                             witness against the implementation"
-                                .to_string()
-                        },
-                    };
-                }
+                let _ = param_types;
                 VerificationResult::Failed { counterexample }
             }
             SatResult::Unknown => VerificationResult::Unknown {
@@ -1159,4 +1095,30 @@ impl Z3Verifier {
 #[derive(Debug, Clone)]
 pub enum VerificationResult {
     Error { error: String },
+}
+
+#[cfg(all(test, feature = "z3"))]
+mod standin_tests {
+    use super::is_formula_body_vacuous;
+
+    #[test]
+    fn standin_body_is_not_a_lock() {
+        for name in [
+            "to_le_bytes",
+            "expand_target",
+            "get_next_work",
+            "check_proof_of_work",
+            "check_tx_inputs",
+            "merkle_tree_from_hashes",
+            "apply_transaction_with_id",
+            "hash256",
+            "connect_block",
+        ] {
+            let formula = format!("(= result ({name} x y))");
+            assert!(
+                is_formula_body_vacuous(&formula),
+                "{name} stand-in must not pass as a body"
+            );
+        }
+    }
 }

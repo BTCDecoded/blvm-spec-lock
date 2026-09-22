@@ -38,6 +38,8 @@ mod parser;
 mod translator;
 
 mod macro_impl;
+#[cfg(feature = "z3")]
+mod mutation;
 mod report;
 // CLI module is only used by the binary, not the library
 

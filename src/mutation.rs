@@ -366,6 +366,79 @@ mod tests {
     }
 
     #[test]
+    fn shipping_source_still_has_the_checks_the_mutants_delete() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../blvm-consensus/src");
+        if !root.exists() {
+            return;
+        }
+        let tx = std::fs::read_to_string(root.join("transaction.rs")).unwrap();
+        let check = tx
+            .split("pub fn check_transaction(")
+            .nth(1)
+            .expect("check_transaction");
+        let check = check.split("\npub fn ").next().unwrap();
+        assert!(
+            check.contains("seen_prevouts.insert"),
+            "M1: duplicate-input HashSet check is gone"
+        );
+        assert!(
+            check.contains("&input.prevout"),
+            "M2: duplicate check no longer uses the full prevout"
+        );
+        assert!(
+            check.contains("checked_add(output.value)")
+                || check.contains(".checked_add(output.value)"),
+            "M3: output sum no longer uses checked_add"
+        );
+        assert!(
+            check.contains("output.value > MAX_MONEY")
+                || check.contains("value_u64 > MAX_MONEY_U64"),
+            "M4: MAX_MONEY comparison is not a strict greater-than"
+        );
+        assert!(
+            check.contains("output.value < 0"),
+            "M5: negative output check is gone"
+        );
+        let der = std::fs::read_to_string(root.join("bip_validation.rs")).unwrap();
+        let der = der
+            .split("fn is_strict_der(")
+            .nth(1)
+            .expect("is_strict_der");
+        let der = der.split("\nfn ").next().unwrap();
+        assert!(
+            der.contains("signature.len() > 73"),
+            "M6: length 74 is accepted"
+        );
+        assert!(
+            der.contains("== 0x00") && der.contains("0x80"),
+            "M7: leading-zero check is gone"
+        );
+        assert!(
+            der.contains("signature[4] & 0x80"),
+            "M8: high-bit check on R is gone"
+        );
+        assert!(
+            der.contains("signature[0] != 0x30"),
+            "M9: tag is not required to be 0x30"
+        );
+        let mining = std::fs::read_to_string(root.join("mining.rs")).unwrap();
+        let merkle = mining
+            .split("fn merkle_tree_from_hashes(")
+            .nth(1)
+            .expect("merkle_tree_from_hashes");
+        let cmp = merkle
+            .find("hashes[pos] == hashes[pos + 1]")
+            .expect("M10: equal-adjacent check is gone");
+        let pad = merkle.find("hashes.len() & 1").expect("odd pad");
+        assert!(cmp < pad, "M11: equal-adjacent check is after the odd pad");
+        let connect = std::fs::read_to_string(root.join("block/connect.rs")).unwrap();
+        assert!(
+            !connect.contains("merkle_mutated && !ibd_mode"),
+            "IBD still skips the merkle mutation reject"
+        );
+    }
+
+    #[test]
     fn mutation_table_matches_committed_report() {
         let table = render_table();
         let path =

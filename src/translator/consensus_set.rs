@@ -137,6 +137,13 @@ fn build_rows() -> Vec<LockRow> {
     rows.extend(arith_rows());
     rows.extend(threshold_rows());
     rows.extend(preimage_rows());
+    rows.extend(signet_rows());
+    rows.extend(witness_rows());
+    rows.extend(multisig_rows());
+    rows.extend(tx_version_rows());
+    rows.extend(reorg_undo_rows());
+    rows.extend(reorg_window_rows());
+    rows.extend(genesis_coinbase_rows());
     rows.extend(opcode_rows());
     rows.extend(fold_rows());
     rows.extend(finish_coverage::rows());
@@ -1618,6 +1625,344 @@ fn expected_endian(name: &str) -> u8 {
     }
 }
 
+const SIGNET_DATA: &[(&str, &str)] = &[
+    ("version", "&version.to_le_bytes()"),
+    ("prev", "extend_from_slice(prev_hash)"),
+    ("merkle", "extend_from_slice(signet_merkle)"),
+    ("time", "&timestamp.to_le_bytes()"),
+];
+
+/// BIP325 header image order, null outpoint, and `OP_0` push of that image.
+fn signet_rows() -> Vec<LockRow> {
+    let src = repo("blvm-consensus/src/signet.rs");
+    let image = extract_fn(&src, "serialize_signet_block_data");
+    let solution = format!(
+        "{}\n{}\n{}\n{}",
+        extract_fn(&src, "build_signet_solution_txs"),
+        extract_fn(&src, "signet_to_spend_script_sig"),
+        extract_fn(&src, "read_script_op"),
+        extract_fn(&src, "fetch_and_clear_commitment_section"),
+    );
+    vec![
+        layout_row(
+            "serialize_signet_block_data",
+            &image,
+            SIGNET_DATA,
+            &swap_needles(&image, "&version.to_le_bytes()", "&timestamp.to_le_bytes()"),
+            &image.replacen("&version.to_le_bytes()", "&version.to_be_bytes()", 1),
+            &image.replace("out.extend_from_slice(&version.to_le_bytes());\n", ""),
+        ),
+        row(
+            "build_signet_solution_txs",
+            "preimage",
+            &solution,
+            &solution.replacen("index: 0xffff_ffff", "index: 0", 1),
+            &solution.replace("script_sig.push(OP_0);\n", ""),
+            signet_solution_query,
+        ),
+    ]
+}
+
+fn witness_rows() -> Vec<LockRow> {
+    let body = extract_fn(
+        &repo("blvm-consensus/src/witness.rs"),
+        "witness_stack_is_null",
+    );
+    let script = repo("blvm-consensus/src/script/mod.rs");
+    let queue = repo("blvm-consensus/src/checkqueue.rs");
+    let connect = repo("blvm-consensus/src/block/connect.rs");
+    let src = format!(
+        "{body}\n{}\n{}\n{}",
+        line_containing(&script, "witness_stack_is_null(witness_stack)"),
+        line_containing(&queue, "witness_stack_is_null(w)"),
+        connect
+            .lines()
+            .filter(|line| line.contains("witness_stack_is_null(w)"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let boundary = src.replacen(
+        "witness.is_empty()",
+        "witness.is_empty() || witness.iter().all(|elem| elem.is_empty())",
+        1,
+    );
+    let predicate = src.replacen("witness_stack_is_null(w)", "is_witness_empty(w)", 1);
+    vec![row(
+        "witness_stack_is_null",
+        "witness",
+        &src,
+        &boundary,
+        &predicate,
+        witness_null_query,
+    )]
+}
+
+fn multisig_rows() -> Vec<LockRow> {
+    let script = repo("blvm-consensus/src/script/mod.rs");
+    let resolver = repo("blvm-consensus/src/ecdsa_batch.rs");
+    let src = format!(
+        "{}\n{}\n{}",
+        extract_fn(&script, "checkmultisig_window"),
+        [
+            "checkmultisig_window(stack, m, false)",
+            "checkmultisig_window(&pushes, m, false)",
+            "checkmultisig_window(&stack, m, true)",
+            "let stack = &pushes[..pushes.len() - 1];",
+        ]
+        .into_iter()
+        .map(|needle| line_containing(&script, needle))
+        .collect::<Vec<_>>()
+        .join("\n"),
+        line_containing(
+            &resolver,
+            "p.sig_empty.len() == p.m as usize && valid_sigs == p.m"
+        ),
+    );
+    let boundary = src.replacen("items.len() - m", "1", 1);
+    let predicate = src.replacen("items.len() != need", "items.len() < need", 1);
+    vec![row(
+        "checkmultisig_window",
+        "multisig",
+        &src,
+        &boundary,
+        &predicate,
+        checkmultisig_window_query,
+    )]
+}
+
+fn tx_version_rows() -> Vec<LockRow> {
+    let ser = repo("blvm-primitives/src/serialization/transaction.rs");
+    let locks = repo("blvm-consensus/src/sequence_locks.rs");
+    let script = repo("blvm-consensus/src/script/mod.rs");
+    let connect = repo("blvm-consensus/src/block/connect.rs");
+    let writes = ser
+        .lines()
+        .filter(|line| line.contains("(tx.version as u32).to_le_bytes()"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let src = format!(
+        "{}\n{writes}\n{}\n{}\n{}",
+        extract_fn(&ser, "deserialize_transaction_with_witness"),
+        line_containing(&locks, "let enforce_bip68 = tx.version >= 2"),
+        line_containing(&script, "if tx.version < 2 {"),
+        line_containing(&connect, "if tx.version < 2 {"),
+    );
+    let boundary = src.replacen(
+        "let version = u32::from_le_bytes(",
+        "let version = i32::from_le_bytes(",
+        1,
+    );
+    let predicate = src.replacen(
+        "let enforce_bip68 = tx.version >= 2",
+        "let enforce_bip68 = (tx.version as i32) >= 2",
+        1,
+    );
+    vec![row(
+        "deserialize_transaction_with_witness",
+        "tx-version",
+        &src,
+        &boundary,
+        &predicate,
+        tx_version_wire_query,
+    )]
+}
+
+fn reorg_undo_rows() -> Vec<LockRow> {
+    let src_file = repo("blvm-consensus/src/reorganization.rs");
+    let src = format!(
+        "{}\n{}",
+        extract_fn(&src_file, "calculate_block_hash"),
+        line_containing(&src_file, "missing undo log"),
+    );
+    let boundary = src.replacen(
+        "block_header_hash(header)",
+        "header.version.to_le_bytes()",
+        1,
+    );
+    let predicate = src.replacen("missing undo log", "unwrap_or_else", 1);
+    vec![row(
+        "calculate_block_hash",
+        "reorg-undo",
+        &src,
+        &boundary,
+        &predicate,
+        reorg_undo_key_query,
+    )]
+}
+
+fn genesis_coinbase_rows() -> Vec<LockRow> {
+    let header = repo("blvm-consensus/src/block/header.rs");
+    let connect = repo("blvm-consensus/src/block/connect.rs");
+    let src = format!(
+        "{}\n{}\n{}\n{}",
+        extract_fn(&header, "genesis_header_hash"),
+        extract_fn(&connect, "is_genesis_block"),
+        extract_fn(&connect, "genesis_utxo_unchanged"),
+        line_containing(&connect, "if is_genesis_block(block, network)"),
+    );
+    let boundary = src.replacen(
+        "block_header_hash(&genesis_header(network))",
+        "genesis_header(network).prev_block_hash",
+        1,
+    );
+    let predicate = src.replacen("BlockUndoLog::new()", "apply_transaction_with_id(", 1);
+    vec![row(
+        "genesis_header_hash",
+        "genesis-coinbase",
+        &src,
+        &boundary,
+        &predicate,
+        genesis_coinbase_query,
+    )]
+}
+
+fn genesis_coinbase_query(src: &str) -> SatResult {
+    let hash_fn = extract_fn(src, "genesis_header_hash");
+    let identify = extract_fn(src, "is_genesis_block");
+    let unchanged = extract_fn(src, "genesis_utxo_unchanged");
+    let hashes_header = hash_fn.contains("block_header_hash(&genesis_header(network))");
+    let matches_network = identify.contains("== header::genesis_header_hash(network)");
+    let keeps_set = unchanged.contains("utxo_set,") && unchanged.contains("BlockUndoLog::new()");
+    let no_apply = !unchanged.contains("apply_transaction");
+    let called = src.contains("if is_genesis_block(block, network)");
+    let ok = hashes_header && matches_network && keeps_set && no_apply && called;
+    production_lock::check(|ctx, solver| {
+        solver.assert(&Bool::from_bool(ctx, ok).not());
+    })
+}
+
+fn reorg_window_rows() -> Vec<LockRow> {
+    let reorg = repo("blvm-consensus/src/reorganization.rs");
+    let node = repo("blvm-node/src/node/reorg_executor.rs");
+    let src = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        extract_fn(&reorg, "find_common_ancestor"),
+        extract_fn(&reorg, "disconnect_block"),
+        extract_fn(&reorg, "reorganize_chain_with_witnesses"),
+        extract_fn(&reorg, "should_reorganize"),
+        extract_fn(&node, "collect_fork_chains"),
+        extract_fn(&node, "refresh_active_height_index"),
+    );
+    let boundary = src.replacen("current_at.get(&hash)", "current_chain.get(new_i)", 1);
+    let predicate = src.replacen("active_hash == candidate_hash", "guard < 10_000", 1);
+    vec![row(
+        "find_common_ancestor",
+        "reorg-window",
+        &src,
+        &boundary,
+        &predicate,
+        reorg_window_query,
+    )]
+}
+
+fn reorg_window_query(src: &str) -> SatResult {
+    let ancestor = extract_fn(src, "find_common_ancestor");
+    let by_hash = ancestor.contains("current_at.get(&hash)");
+    let separate_index = ancestor.contains("current_chain_index: cur_i");
+    let disconnect = extract_fn(src, "disconnect_block");
+    let reorg = extract_fn(src, "reorganize_chain_with_witnesses");
+    let should = extract_fn(src, "should_reorganize");
+    let walk = extract_fn(src, "collect_fork_chains");
+    let refresh = extract_fn(src, "refresh_active_height_index");
+    let no_cap = !disconnect.contains("10_000")
+        && !reorg.contains("10_000")
+        && !should.contains("10_000")
+        && !walk.contains("10_000")
+        && !refresh.contains("10_000");
+    let aligned = walk.contains("active_hash == candidate_hash");
+    let ok = by_hash && separate_index && no_cap && aligned;
+    production_lock::check(|ctx, solver| {
+        solver.assert(&Bool::from_bool(ctx, ok).not());
+    })
+}
+
+fn reorg_undo_key_query(src: &str) -> SatResult {
+    let body = extract_fn(src, "calculate_block_hash");
+    let uses_header_hash = body.contains("block_header_hash(header)");
+    let no_wide_header = !body.contains("version.to_le_bytes()");
+    let miss_is_error = src.contains("missing undo log");
+    let no_empty_fallback = !src.contains("unwrap_or_else");
+    let ok = uses_header_hash && no_wide_header && miss_is_error && no_empty_fallback;
+    production_lock::check(|ctx, solver| {
+        solver.assert(&Bool::from_bool(ctx, ok).not());
+    })
+}
+
+fn tx_version_wire_query(src: &str) -> SatResult {
+    let body = extract_fn(src, "deserialize_transaction_with_witness");
+    let read_u32 = body.contains("let version = u32::from_le_bytes(");
+    let no_sign_extend = !body.contains("i32::from_le_bytes(");
+    let writes = src.matches("(tx.version as u32).to_le_bytes()").count() == 2;
+    let bip68 = src.contains("let enforce_bip68 = tx.version >= 2");
+    let below_two = src.matches("if tx.version < 2 {").count() == 2;
+    let no_signed = !src.contains("(tx.version as i32)");
+    let ok = read_u32 && no_sign_extend && writes && bip68 && below_two && no_signed;
+    production_lock::check(|ctx, solver| {
+        solver.assert(&Bool::from_bool(ctx, ok).not());
+    })
+}
+
+fn checkmultisig_window_query(src: &str) -> SatResult {
+    let body = extract_fn(src, "checkmultisig_window");
+    let top_m = body.contains("items.len() - m");
+    let exact = body.contains("items.len() != need");
+    let no_prefix = !body.contains("skip(1)") && !body.contains("[1..]");
+    let legacy_p2sh = src.contains("checkmultisig_window(stack, m, false)");
+    let legacy_bare = src.contains("checkmultisig_window(&pushes, m, false)");
+    let witness = src.contains("checkmultisig_window(&stack, m, true)");
+    let redeem_is_not_a_signature = src.contains("let stack = &pushes[..pushes.len() - 1];");
+    let every_signature = src.contains("p.sig_empty.len() == p.m as usize && valid_sigs == p.m");
+    let ok = top_m
+        && exact
+        && no_prefix
+        && legacy_p2sh
+        && legacy_bare
+        && witness
+        && redeem_is_not_a_signature
+        && every_signature;
+    production_lock::check(|ctx, solver| {
+        solver.assert(&Bool::from_bool(ctx, ok).not());
+    })
+}
+
+fn line_containing(src: &str, needle: &str) -> String {
+    src.lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("missing {needle}"))
+        .to_string()
+}
+
+fn witness_null_query(src: &str) -> SatResult {
+    let body = extract_fn(src, "witness_stack_is_null");
+    let body_is_item_count =
+        body.contains("witness.is_empty()") && !body.contains("elem.is_empty()");
+    let script_uses_null = src.contains("witness_stack_is_null(witness_stack)");
+    let pass_throughs = src.matches("if witness_stack_is_null(w)").count();
+    let ok = body_is_item_count && script_uses_null && pass_throughs == 3;
+    production_lock::check(|ctx, solver| {
+        solver.assert(&Bool::from_bool(ctx, ok).not());
+    })
+}
+
+fn signet_solution_query(src: &str) -> SatResult {
+    let null_outpoint = src.contains("index: 0xffff_ffff");
+    let spends_header_image = src.contains("signet_to_spend_script_sig(&block_data)");
+    let op0 = src.find("script_sig.push(OP_0)");
+    let push = src.find("push_script_data(&mut script_sig, block_data)");
+    let op0_then_push = op0.is_some_and(|at| push.is_some_and(|push_at| at < push_at));
+    let stripped_header_is_reencoded =
+        src.contains("push_script_data(&mut replacement, &pushdata)");
+    let reads_pushdata = src.contains("opcode == OP_PUSHDATA1");
+    let ok = null_outpoint
+        && spends_header_image
+        && op0_then_push
+        && stripped_header_is_reencoded
+        && reads_pushdata;
+    production_lock::check(|ctx, solver| {
+        solver.assert(&Bool::from_bool(ctx, ok).not());
+    })
+}
+
 fn opcode_rows() -> Vec<LockRow> {
     let script = repo("blvm-consensus/src/script/mod.rs");
     let arith = repo("blvm-consensus/src/script/arithmetic.rs");
@@ -2825,6 +3170,8 @@ pub const CENSUS: &[&str] = &[
     "build_bip143_preimage",
     "compute_taproot_signature_hash",
     "serialize_block_header",
+    "serialize_signet_block_data",
+    "build_signet_solution_txs",
     "push_advance",
     "OP_CHECKSIG_verifier",
     "OP_DUP",
@@ -2895,6 +3242,103 @@ pub const CENSUS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkmultisig_window_is_locked() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let got = multisig_rows();
+        assert_eq!(got.len(), 1);
+        let row = &got[0];
+        assert_eq!(row.unpatched, SatResult::Unsat, "unpatched {}", row.note);
+        assert_eq!(row.boundary, SatResult::Sat, "boundary");
+        assert_eq!(row.predicate, SatResult::Sat, "predicate");
+    }
+
+    #[test]
+    fn genesis_coinbase_is_locked() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let got = genesis_coinbase_rows();
+        assert_eq!(got.len(), 1);
+        let row = &got[0];
+        assert_eq!(row.unpatched, SatResult::Unsat, "unpatched {}", row.note);
+        assert_eq!(row.boundary, SatResult::Sat, "boundary");
+        assert_eq!(row.predicate, SatResult::Sat, "predicate");
+    }
+
+    #[test]
+    fn reorg_window_is_locked() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let got = reorg_window_rows();
+        assert_eq!(got.len(), 1);
+        let row = &got[0];
+        assert_eq!(row.unpatched, SatResult::Unsat, "unpatched {}", row.note);
+        assert_eq!(row.boundary, SatResult::Sat, "boundary");
+        assert_eq!(row.predicate, SatResult::Sat, "predicate");
+    }
+
+    #[test]
+    fn reorg_undo_key_is_locked() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let got = reorg_undo_rows();
+        assert_eq!(got.len(), 1);
+        let row = &got[0];
+        assert_eq!(row.unpatched, SatResult::Unsat, "unpatched {}", row.note);
+        assert_eq!(row.boundary, SatResult::Sat, "boundary");
+        assert_eq!(row.predicate, SatResult::Sat, "predicate");
+    }
+
+    #[test]
+    fn tx_version_wire_is_locked() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let got = tx_version_rows();
+        assert_eq!(got.len(), 1);
+        let row = &got[0];
+        assert_eq!(row.unpatched, SatResult::Unsat, "unpatched {}", row.note);
+        assert_eq!(row.boundary, SatResult::Sat, "boundary");
+        assert_eq!(row.predicate, SatResult::Sat, "predicate");
+    }
+
+    #[test]
+    fn witness_stack_null_is_locked() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let got = witness_rows();
+        assert_eq!(got.len(), 1);
+        let row = &got[0];
+        assert_eq!(row.unpatched, SatResult::Unsat, "unpatched {}", row.note);
+        assert_eq!(row.boundary, SatResult::Sat, "boundary");
+        assert_eq!(row.predicate, SatResult::Sat, "predicate");
+    }
+
+    #[test]
+    fn signet_solution_is_locked() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let got = signet_rows();
+        assert_eq!(got.len(), 2);
+        for row in got {
+            assert_eq!(
+                row.unpatched,
+                SatResult::Unsat,
+                "{} unpatched",
+                row.function
+            );
+            assert_eq!(row.boundary, SatResult::Sat, "{} boundary", row.function);
+            assert_eq!(row.predicate, SatResult::Sat, "{} predicate", row.function);
+        }
+    }
 
     #[test]
     fn census_is_locked() {

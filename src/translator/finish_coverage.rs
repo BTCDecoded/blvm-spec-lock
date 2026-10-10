@@ -242,7 +242,7 @@ fn build() -> Finish {
         "check_bip54_coinbase",
         "activation",
         &coin54,
-        &coin54.replace("saturating_sub(13)", "saturating_sub(12)"),
+        &coin54.replace("saturating_sub(1)", "saturating_sub(2)"),
         &coin54.replace("sequence == 0xffff_ffff", "sequence == 0"),
         bip54_coinbase_query,
     );
@@ -1457,10 +1457,10 @@ fn bip54_sigop_query(src: &str) -> SatResult {
 }
 
 fn bip54_coinbase_query(src: &str) -> SatResult {
-    let sub: u64 = if src.contains("saturating_sub(13)") {
-        13
+    let sub: u64 = if src.contains("saturating_sub(1)") && !src.contains("saturating_sub(2)") {
+        1
     } else {
-        12
+        2
     };
     let final_seq = src.contains("0xffff_ffff");
     production_lock::check(|ctx, solver| {

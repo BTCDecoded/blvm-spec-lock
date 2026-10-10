@@ -1613,7 +1613,7 @@ $S_{max} = 80,000$ (maximum sigops)
         assert_eq!(locktime_threshold(), 500_000_000);
         assert!(bip65_orders_ge());
         assert_eq!(bip54_sigop_cap(), 2500);
-        assert_eq!(bip54_locktime_delta(), 13);
+        assert_eq!(bip54_locktime_delta(), 1);
         assert_eq!(bip54_sequence_rejected(), 0xffff_ffff);
         assert_eq!(stripped_size_rejected(), 64);
         assert_eq!(bip54_timewarp_grace(), 7200);

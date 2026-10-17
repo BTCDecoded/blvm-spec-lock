@@ -300,8 +300,10 @@ pub fn tokens_to_rust_expr(tokens: &[Token]) -> String {
         }
         if i + 1 < tokens.len() {
             let next = &tokens[i + 1];
-            if !matches!(next, Token::Rparen | Token::Comma | Token::Op(_))
-                && !matches!(t, Token::Lparen | Token::Comma | Token::Op(_))
+            if !matches!(
+                next,
+                Token::Rparen | Token::Lparen | Token::Comma | Token::Op(_)
+            ) && !matches!(t, Token::Lparen | Token::Comma | Token::Op(_))
             {
                 out.push(' ');
             }

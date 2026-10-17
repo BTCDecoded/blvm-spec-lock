@@ -3263,6 +3263,8 @@ fn known_uninterpreted_function(name: &str) -> Option<(&'static str, Option<usiz
         "serialize_transaction_into" => Some(("serialize_into", Some(2))),
         "digest" => Some(("sha256_digest", Some(1))),
         "hash256" => Some(("hash256", Some(1))),
+        // Digest of the pair (witness root, reserved nonce). Not the 1-arg hash.
+        "implied_hash" => Some(("hash256_pair", Some(2))),
         "to_le_bytes" => Some(("to_le_bytes", Some(1))),
         "with_capacity" => Some(("vec_with_capacity", Some(1))),
         "get_locktime_type" => Some(("locktime_type", Some(1))),

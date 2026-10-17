@@ -17,6 +17,7 @@ Design doc for how blvm-spec-lock's Z3 translator handles complex Rust patterns.
 | Pattern | Translation |
 |---------|-------------|
 | `hash256(data)` | Uninterpreted `hash256(Int) -> Int` |
+| `implied_hash(root, nonce)` | Uninterpreted `hash256_pair(Int, Int) -> Int` (both halves are inputs; the compression function stays uninterpreted) |
 | `sha256(data)` | Uninterpreted (via digest) |
 | `digest()` / `finalize()` | Fresh var `{receiver}_digest` |
 | `[0u8; 32]` (zero hash) | Literal `0` |

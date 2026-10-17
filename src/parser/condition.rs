@@ -656,7 +656,15 @@ pub fn extract_parseable_condition(condition: &str) -> Option<String> {
                     || before_paren.contains("!=")
                     || before_paren.contains('>')
                     || before_paren.contains('<');
-                if is_prose_comment && before_has_op && !before_paren.is_empty() {
+                // `hash256(implied_preimage(root, nonce))` has a comma space inside the
+                // last parentheses. That is a call, not a comment. A comment has a space
+                // before the opening parenthesis.
+                let is_call = paren_start > 0
+                    && rust[..paren_start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+                if is_prose_comment && before_has_op && !before_paren.is_empty() && !is_call {
                     rust = before_paren.to_string();
                 }
             }
@@ -883,6 +891,29 @@ mod tests {
             "syn failed on {got}"
         );
         assert!(!got.contains("flags"), "prose must drop, got {got}");
+    }
+
+    #[test]
+    fn strengthened_witness_formulas_parse() {
+        let cases = [
+            "result == (byte * (byte - 128) != 0)",
+            "result == (len >= 1 && (prefix_nonzero != 0 || (last != 0 && last != 128)))",
+            "result == (script_sig_len == 0 && witness_flag != 0 && discourage == 0 && len >= 1 && (prefix_nonzero != 0 || (last != 0 && last != 128)))",
+            "result == ((has_commitment == 0 && any_witness == 0) || (has_commitment != 0 && reserved_len == 32 && stored == implied_hash(root, nonce)))",
+        ];
+        for formula in cases {
+            let got = extract_parseable_condition(formula).unwrap_or_else(|| {
+                panic!("unparseable: {formula}");
+            });
+            assert!(
+                syn::parse_str::<syn::Expr>(&got).is_ok(),
+                "syn failed on {got}"
+            );
+            assert!(
+                got.contains("result") && got.matches('(').count() == formula.matches('(').count(),
+                "formula collapsed, got {got} from {formula}"
+            );
+        }
     }
 
     #[test]

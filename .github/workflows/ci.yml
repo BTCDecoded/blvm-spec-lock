@@ -294,3 +294,44 @@ jobs:
           else
             echo "exists=${{ steps.check-version.outputs.exists }}" >> "$GITHUB_OUTPUT"
           fi
+
+      # Same as blvm-consensus "Create git tag": annotated v<version> after a successful publish.
+      # HEAD is the "Bump version" commit pushed above, i.e. the tree that was published.
+      - name: Create git tag
+        if: steps.gate.outputs.do_release == 'true' && steps.publish.outputs.published == 'true'
+        env:
+          REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+        run: |
+          VERSION_TAG="v${{ steps.version.outputs.version }}"
+          TAG_SHA=$(git rev-parse HEAD)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${VERSION_TAG}" >/dev/null 2>&1; then
+            echo "⚠️  Tag ${VERSION_TAG} already exists on origin, skipping tag creation"
+            exit 0
+          fi
+
+          if [ -z "${REPO_ACCESS_TOKEN}" ]; then
+            echo "::error::REPO_ACCESS_TOKEN org secret not available — cannot push release tag"
+            exit 1
+          fi
+
+          # Drop any leftover Actions credentials so the URL token is what git sends.
+          git config --local --unset-all 'http.https://github.com/.extraheader' 2>/dev/null || true
+          git config --local --name-only --get-regexp '^includeIf\.gitdir:' 2>/dev/null | while read -r key; do
+            git config --local --unset-all "$key" 2>/dev/null || true
+          done || true
+
+          git remote set-url origin "https://x-access-token:${REPO_ACCESS_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git tag -a "$VERSION_TAG" -m "Release ${VERSION_TAG}"
+          if ! git -c credential.helper= push origin "$VERSION_TAG" 2>/tmp/tag-push.err; then
+            cat /tmp/tag-push.err >&2
+            if grep -qiE 'workflows permission|workflow scope' /tmp/tag-push.err; then
+              echo "::error::Tag push rejected: authenticating credential lacks Workflows permission, and this release range modified .github/workflows/. REST POST /git/refs does not bypass this (same App permission). Tag manually as a human: git fetch origin && git tag -a ${VERSION_TAG} ${TAG_SHA} -m 'Release ${VERSION_TAG}' && git push origin ${VERSION_TAG}. If REPO_ACCESS_TOKEN is a GitHub App installation token, grant that App Workflows: Read and write (Contents alone is not enough)."
+            else
+              echo "::error::Failed to push release tag ${VERSION_TAG}. Tag manually at the published commit: git fetch origin && git tag -a ${VERSION_TAG} ${TAG_SHA} -m 'Release ${VERSION_TAG}' && git push origin ${VERSION_TAG}"
+            fi
+            exit 1
+          fi
+          echo "✅ Created and pushed tag ${VERSION_TAG} at ${TAG_SHA}"

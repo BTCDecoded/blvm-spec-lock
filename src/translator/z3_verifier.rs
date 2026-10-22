@@ -12,7 +12,10 @@
 //! 2. Translate the Rust implementation to Z3 formula
 //! 3. Prove: requires && implementation => ensures
 //!
-//! If Z3 proves this implication, the implementation is mathematically locked to the spec.
+//! If Z3 proves this implication, the function is annotated and Z3-checked against the
+//! contracts it carries. That is not formal verification of the function: the check covers
+//! only the translated contracts, and in blvm-consensus only 3 of 182 anchors are
+//! mutation-validated. See <https://github.com/BTCDecoded/blvm-consensus/blob/main/docs/VERIFICATION.md>.
 
 use crate::parser::contracts::{Contract, ContractType};
 #[cfg(feature = "z3")]

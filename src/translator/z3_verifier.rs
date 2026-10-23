@@ -14,7 +14,7 @@
 //!
 //! If Z3 proves this implication, the function is annotated and Z3-checked against the
 //! contracts it carries. That is not formal verification of the function: the check covers
-//! only the translated contracts, and in blvm-consensus only 3 of 182 anchors are
+//! only the translated contracts, and in blvm-consensus only 93 of 224 anchors are
 //! mutation-validated. See <https://github.com/BTCDecoded/blvm-consensus/blob/main/docs/VERIFICATION.md>.
 
 use crate::parser::contracts::{Contract, ContractType};
@@ -964,7 +964,7 @@ mod formula_sat_smoke_tests {
 }
 
 /// Bit shifts use UF `shr` / `shl` (`FuncDecl::new` with the same name shares one UF per [`Context`](z3::Context)).
-/// Literal `>> k` / `<< k` use [`Z3Translator::pow2_int`](crate::translator::z3_translator::Z3Translator::pow2_int) for correct `2^k` including `k=63`.
+/// Literal `>> k` divides by [`Z3Translator::pow2_int`](crate::translator::z3_translator::Z3Translator::pow2_int). Literal `<< k` wraps at 64 bits.
 /// The `shr(a,k)=a/2^k` axioms use [`Z3Translator::pow2_int`](crate::translator::z3_translator::Z3Translator::pow2_int) for `2^k` (k < 64) so k=63 is correct on the host.
 #[cfg(feature = "z3")]
 fn add_shift_axioms(ctx: &Context, solver: &mut Solver) {

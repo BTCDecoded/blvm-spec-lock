@@ -402,20 +402,22 @@ fn legacy_rows() -> Vec<LockRow> {
     let pow = repo("blvm-consensus/src/pow.rs");
     let check_pow = extract_fn(&pow, "check_proof_of_work");
     let meets = extract_fn(&pow, "proof_hash_meets_target");
-    let strict = meets.contains("hash_value < target") && !meets.contains("hash_value <= target");
-    let rounds = check_pow.matches("Sha256::digest").count() as u32;
+    let one_hash = check_pow.replacen("Sha256::digest", "skipped_digest", 1);
     rows.push(LockRow {
         function: "check_proof_of_work".into(),
         shape: "threshold",
-        unpatched: production_lock::pow_compare_query(strict),
-        boundary: production_lock::pow_compare_query(false),
-        predicate: production_lock::pow_double_hash_query(rounds.saturating_sub(1).max(1)),
+        unpatched: production_lock::pow_equality_query(&meets),
+        boundary: production_lock::pow_equality_query(
+            &meets.replace("hash_value <= target", "hash_value < target"),
+        ),
+        predicate: production_lock::pow_rounds_query(&one_hash),
         note: String::new(),
     });
-    // Unpatched double-hash is recorded by requiring rounds == 2 in the finish test via this row's
-    // predicate being the one-round query (SAT). The unpatched two-round query is folded in.
-    if production_lock::pow_double_hash_query(crate::parser::spec_expr::header_hash_rounds())
-        != SatResult::Unsat
+    if production_lock::pow_rounds_query(&check_pow) != SatResult::Unsat
+        || production_lock::pow_helper_query(&check_pow) != SatResult::Unsat
+        || production_lock::pow_above_query(&meets) != SatResult::Unsat
+        || production_lock::pow_sign_query(&meets) != SatResult::Unsat
+        || production_lock::pow_zero_target_query(&meets) != SatResult::Unsat
     {
         rows.last_mut().unwrap().unpatched = SatResult::Sat;
     }
@@ -452,6 +454,13 @@ fn legacy_rows() -> Vec<LockRow> {
         predicate: version_p,
         note: String::new(),
     });
+    if production_lock::header_rejects_zero(&valid, "timestamp") != SatResult::Unsat
+        || production_lock::header_rejects_zero(&valid, "bits") != SatResult::Unsat
+        || production_lock::header_future_query(&valid) != SatResult::Unsat
+        || production_lock::header_future_above_query(&valid) != SatResult::Unsat
+    {
+        rows.last_mut().unwrap().unpatched = SatResult::Sat;
+    }
     let mtp_below = production_lock::header_mtp_query(&valid, true);
     let mtp_eq = production_lock::header_mtp_query(&valid, false);
     let mtp_boundary = valid.replace("header.timestamp <= ctx.median_time_past", "false");

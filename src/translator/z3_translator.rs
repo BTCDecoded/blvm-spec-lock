@@ -2,8 +2,8 @@
 //!
 //! Translates Rust expressions AND function bodies to Z3 expressions for verification.
 //! Focused on Bitcoin-specific patterns (u64, i64, Vec, arithmetic, comparisons).
-//! Variable `>>` / `<<` use UF `shr` / `shl` with axioms in `z3_verifier`; literal RHS uses `div` /
-//! `mul` with exact `2^k` via [`Z3Translator::pow2_int`].
+//! A variable shift uses the uninterpreted `shr` / `shl`. A literal `>>` divides by `2^k`.
+//! A literal `<<` in `0..64` is a 64-bit bitvector shift, so bit 63 wraps.
 //! `%` (Rem) maps to Z3 `rem`; `&` with a constant mask uses `div`/`rem` patterns when the mask is
 //! a power of two or one less than a power of two (including mask on the left operand).
 //!
@@ -114,8 +114,9 @@ impl Z3Translator {
                             let left_int = left.as_int().ok_or_else(|| {
                                 TranslationError::TypeError("Expected Int".to_string())
                             })?;
-                            let multiplier = Self::pow2_int(&self.ctx, shift_val as u32);
-                            return Ok((left_int * multiplier).into());
+                            return Ok(
+                                Self::shl_wrap64(&self.ctx, &left_int, shift_val as u32).into()
+                            );
                         }
                     }
                 }
@@ -685,6 +686,13 @@ impl Z3Translator {
             _ => unreachable!("i64_checked_binop: {op}"),
         };
         (result, overflow_ok)
+    }
+
+    /// `left << k` for `k < 64`, wrapped at 64 bits. The low 64 bits of `left` are shifted.
+    pub(crate) fn shl_wrap64<'a>(ctx: &'a Context, left: &Int<'a>, k: u32) -> Int<'a> {
+        debug_assert!(k < 64);
+        let shifted = BV::from_int(left, 64).bvshl(&BV::from_u64(ctx, u64::from(k), 64));
+        shifted.to_int(false)
     }
 
     /// Exact `2^k` as Z3 `Int` for `k < 64` (avoids host `1i64 << 63` overflow).
@@ -3572,6 +3580,62 @@ mod tests {
             i64::MAX,
             "counterexample is x = i64::MAX; model: {model}"
         );
+    }
+
+    #[test]
+    fn u64_shl_wraps_when_the_top_bit_is_set() {
+        let tr = Z3Translator::new(10000);
+        let code = r#"
+            fn shl_one(x: u64) -> u64 {
+                x << 1
+            }
+        "#;
+        let func: syn::ItemFn = syn::parse_str(code).unwrap();
+        let mut param_types = std::collections::HashMap::new();
+        param_types.insert("x".to_string(), syn::parse_str::<syn::Type>("u64").unwrap());
+        let return_type: syn::Type = syn::parse_str("u64").unwrap();
+        let (mut shared_vars, _) = tr.build_shared_vars(&param_types, Some(&return_type));
+        let body = tr
+            .translate_function_body(&func, &mut shared_vars)
+            .unwrap()
+            .expect("body");
+        let ctx = tr.context();
+        let x = shared_vars.get("x").unwrap().as_int().unwrap();
+        let result = shared_vars.get("result").unwrap().as_int().unwrap();
+        let two = Int::from_i64(ctx, 2);
+        let modulus = Int::from_str(ctx, "18446744073709551616").unwrap();
+        let high = Int::from_str(ctx, "9223372036854775808").unwrap();
+        let wrapped = (x.clone() * two.clone()).rem(&modulus);
+        let in_u64 = Bool::and(ctx, &[&x.ge(&Int::from_i64(ctx, 0)), &x.lt(&modulus)]);
+        let solver = Solver::new(ctx);
+        solver.assert(&body);
+        solver.assert(&in_u64);
+        solver.assert(&result._eq(&wrapped).not());
+        assert_eq!(solver.check(), SatResult::Unsat);
+
+        let solver = Solver::new(ctx);
+        solver.assert(&body);
+        solver.assert(&x.ge(&high));
+        solver.assert(&x.lt(&modulus));
+        solver.assert(&result._eq(&(x.clone() * two)).not());
+        assert_eq!(solver.check(), SatResult::Sat);
+
+        let mutant = code.replace("x << 1", "x * 2");
+        let mutant_fn: syn::ItemFn = syn::parse_str(&mutant).unwrap();
+        let (mut mutant_vars, _) = tr.build_shared_vars(&param_types, Some(&return_type));
+        let mutant_body = tr
+            .translate_function_body(&mutant_fn, &mut mutant_vars)
+            .unwrap()
+            .expect("mutant body");
+        let mx = mutant_vars.get("x").unwrap().as_int().unwrap();
+        let mresult = mutant_vars.get("result").unwrap().as_int().unwrap();
+        let mwrapped = (mx.clone() * Int::from_i64(ctx, 2)).rem(&modulus);
+        let solver = Solver::new(ctx);
+        solver.assert(&mutant_body);
+        solver.assert(&mx.ge(&high));
+        solver.assert(&mx.lt(&modulus));
+        solver.assert(&mresult._eq(&mwrapped).not());
+        assert_eq!(solver.check(), SatResult::Sat);
     }
 
     #[test]

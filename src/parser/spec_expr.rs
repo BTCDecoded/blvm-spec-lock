@@ -143,11 +143,11 @@ pub fn timestamp_rejected() -> u64 {
     neq_in(protocol_text(), "timestamp").unwrap_or_else(|| panic!("spec has no timestamp ≠ N"))
 }
 
-/// H05 writes `timestamp ≥ MedianTimePast`. The census clause is the `<` rejection.
+/// H05 writes `timestamp > MedianTimePast`. Equality is not later.
 pub fn median_past_is_lower_bound() -> bool {
     math_blocks(protocol_text()).into_iter().any(|block| {
         let norm = normalize_math(&block);
-        norm.contains("timestamp") && norm.contains(">=") && norm.contains("MedianTimePast")
+        norm.contains("timestamp") && norm.contains('>') && norm.contains("MedianTimePast")
     })
 }
 

@@ -736,10 +736,11 @@ pub fn header_version_query(src: &str, version: u64) -> SatResult {
     })
 }
 
-/// A timestamp equal to the median is accepted. One below it is not.
+/// A timestamp equal to the median is rejected. One below it is rejected.
+/// Unsat means the source has no accepting counterexample.
 pub fn header_mtp_query(src: &str, below: bool) -> SatResult {
     if !crate::parser::spec_expr::median_past_is_lower_bound() {
-        panic!("spec H05 is not timestamp ≥ MedianTimePast");
+        panic!("spec H05 is not timestamp > MedianTimePast");
     }
     let lt = src.contains("header.timestamp < ctx.median_time_past");
     let le = src.contains("header.timestamp <= ctx.median_time_past");
@@ -758,11 +759,7 @@ pub fn header_mtp_query(src: &str, below: bool) -> SatResult {
         } else {
             Bool::from_bool(ctx, false)
         };
-        if below {
-            solver.assert(&rejected.not());
-        } else {
-            solver.assert(&rejected);
-        }
+        solver.assert(&rejected.not());
     })
 }
 
@@ -1213,10 +1210,11 @@ mod tests {
 
         let pow = consensus_file("pow.rs");
         let check = extract_fn(&pow, "check_proof_of_work");
-        assert!(check.contains("hash_value < target"));
+        let meets = extract_fn(&pow, "proof_hash_meets_target");
+        assert!(meets.contains("hash_value <= target"));
         assert_eq!(check.matches("Sha256::digest").count(), 2);
-        assert_eq!(pow_compare_query(true), SatResult::Unsat);
-        assert_eq!(pow_compare_query(false), SatResult::Sat);
+        assert_eq!(pow_compare_query(false), SatResult::Unsat);
+        assert_eq!(pow_compare_query(true), SatResult::Sat);
         assert_eq!(pow_double_hash_query(2), SatResult::Unsat);
         assert_eq!(pow_double_hash_query(1), SatResult::Sat);
 
@@ -1265,12 +1263,12 @@ mod tests {
         );
         assert_eq!(header_mtp_query(&valid, true), SatResult::Unsat);
         assert_eq!(header_mtp_query(&valid, false), SatResult::Unsat);
-        let dropped = valid.replace("header.timestamp < ctx.median_time_past", "false");
+        let dropped = valid.replace("header.timestamp <= ctx.median_time_past", "false");
         assert_eq!(header_mtp_query(&dropped, true), SatResult::Sat);
-        let le = valid.replace(
-            "header.timestamp < ctx.median_time_past",
+        let lt = valid.replace(
             "header.timestamp <= ctx.median_time_past",
+            "header.timestamp < ctx.median_time_past",
         );
-        assert_eq!(header_mtp_query(&le, false), SatResult::Sat);
+        assert_eq!(header_mtp_query(&lt, false), SatResult::Sat);
     }
 }

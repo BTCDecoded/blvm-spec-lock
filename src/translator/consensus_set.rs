@@ -401,8 +401,8 @@ fn legacy_rows() -> Vec<LockRow> {
 
     let pow = repo("blvm-consensus/src/pow.rs");
     let check_pow = extract_fn(&pow, "check_proof_of_work");
-    let strict =
-        check_pow.contains("hash_value < target") && !check_pow.contains("hash_value <= target");
+    let meets = extract_fn(&pow, "proof_hash_meets_target");
+    let strict = meets.contains("hash_value < target") && !meets.contains("hash_value <= target");
     let rounds = check_pow.matches("Sha256::digest").count() as u32;
     rows.push(LockRow {
         function: "check_proof_of_work".into(),
@@ -454,10 +454,10 @@ fn legacy_rows() -> Vec<LockRow> {
     });
     let mtp_below = production_lock::header_mtp_query(&valid, true);
     let mtp_eq = production_lock::header_mtp_query(&valid, false);
-    let mtp_boundary = valid.replace("header.timestamp < ctx.median_time_past", "false");
+    let mtp_boundary = valid.replace("header.timestamp <= ctx.median_time_past", "false");
     let mtp_predicate = valid.replace(
-        "header.timestamp < ctx.median_time_past",
         "header.timestamp <= ctx.median_time_past",
+        "header.timestamp < ctx.median_time_past",
     );
     let mtp_u = if mtp_below == SatResult::Unsat && mtp_eq == SatResult::Unsat {
         SatResult::Unsat

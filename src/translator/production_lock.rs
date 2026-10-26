@@ -271,7 +271,7 @@ pub fn facts_of(func: &syn::ItemFn) -> ProductionFacts {
         .cmps
         .iter()
         .all(|cmp| cmp.left.lit != Some(0x31) && cmp.right.lit != Some(0x31));
-    v.facts.merkle_eq_present = scanned.marks.iter().any(|mark| *mark == "merkle-eq");
+    v.facts.merkle_eq_present = scanned.marks.contains(&"merkle-eq");
     v.facts.merkle_eq_before_pad = v.facts.merkle_eq_present
         && match (
             scanned.marks.iter().position(|mark| *mark == "merkle-eq"),
@@ -1485,10 +1485,7 @@ pub fn op_success_query(src: &str) -> SatResult {
 
 /// `vsize` is `ceil(weight / 4)`.
 pub fn vsize_query(src: &str, weight: u64) -> SatResult {
-    let got = sample_eval::eval_u64(
-        src,
-        &[("weight", Val::Int(i128::try_from(weight).expect("weight")))],
-    );
+    let got = sample_eval::eval_u64(src, &[("weight", Val::Int(i128::from(weight)))]);
     let spec = weight.div_ceil(4);
     check(|ctx, solver| {
         let left = BV::from_u64(ctx, got, 64);
@@ -2881,10 +2878,8 @@ fn has_nonempty_input_witness(src: &str, witnesses: Option<&[Vec<Vec<u8>>]>) -> 
         witnesses.iter().all(|w| input_not_witness_empty(src, w))
     } else if src.contains(".any(") {
         witnesses.iter().any(|w| input_not_witness_empty(src, w))
-    } else if src.contains("\n    true\n") {
-        true
     } else {
-        false
+        src.contains("\n    true\n")
     }
 }
 
@@ -2908,9 +2903,7 @@ fn reserved_nonce(src: &str, witnesses: &[Vec<Vec<u8>>]) -> Option<[u8; 32]> {
     if witnesses.is_empty() && src.contains("coinbase_witnesses.is_empty()") {
         return Some([0u8; 32]);
     }
-    let Some(stack) = witnesses.first() else {
-        return None;
-    };
+    let stack = witnesses.first()?;
     if stack.is_empty() && src.contains("stack.is_empty()") {
         return Some([0u8; 32]);
     }
@@ -4270,7 +4263,7 @@ fn bip54_stripped(src: &str, tx: &Val, size: u64) -> bool {
 
 /// Valid unless the transaction is not a coinbase and its witness-stripped size is 64.
 fn spec_bip54_stripped(coinbase: bool, size: u64) -> bool {
-    !(!coinbase && size == 64)
+    coinbase || size != 64
 }
 
 pub fn bip54_stripped_query(src: &str, tx: &Val, coinbase: bool, size: u64) -> SatResult {
@@ -4309,11 +4302,8 @@ pub fn transaction_size_query(src: &str, wire: &[u8]) -> SatResult {
 fn header_record(version: i128, prev: u8, merkle: u8, time: i128, bits: i128, nonce: i128) -> Val {
     Val::Rec(vec![
         ("version".into(), Val::Int(version)),
-        (
-            "prev_block_hash".into(),
-            sample_eval::bytes(&vec![prev; 32]),
-        ),
-        ("merkle_root".into(), sample_eval::bytes(&vec![merkle; 32])),
+        ("prev_block_hash".into(), sample_eval::bytes(&[prev; 32])),
+        ("merkle_root".into(), sample_eval::bytes(&[merkle; 32])),
         ("timestamp".into(), Val::Int(time)),
         ("bits".into(), Val::Int(bits)),
         ("nonce".into(), Val::Int(nonce)),
@@ -6606,22 +6596,22 @@ mod tests {
         let key_src = extract_fn(&file, "extract_taproot_output_key");
         let valid = {
             let mut script = vec![0x51, 0x20];
-            script.extend(std::iter::repeat(0x11).take(32));
+            script.extend(std::iter::repeat_n(0x11, 32));
             script
         };
         let short = {
             let mut script = vec![0x51, 0x20];
-            script.extend(std::iter::repeat(0x11).take(31));
+            script.extend(std::iter::repeat_n(0x11, 31));
             script
         };
         let bad_prefix = {
             let mut script = vec![0x00, 0x20];
-            script.extend(std::iter::repeat(0x11).take(32));
+            script.extend(std::iter::repeat_n(0x11, 32));
             script
         };
         let bad_push = {
             let mut script = vec![0x51, 0x00];
-            script.extend(std::iter::repeat(0x11).take(32));
+            script.extend(std::iter::repeat_n(0x11, 32));
             script
         };
         for script in [&valid, &short, &bad_prefix, &bad_push] {
@@ -6689,12 +6679,12 @@ mod tests {
         );
         let p2wpkh = {
             let mut program = vec![0x00, 0x14];
-            program.extend(std::iter::repeat(0x11).take(20));
+            program.extend(std::iter::repeat_n(0x11, 20));
             program
         };
         let p2wsh = {
             let mut program = vec![0x00, 0x20];
-            program.extend(std::iter::repeat(0x22).take(32));
+            program.extend(std::iter::repeat_n(0x22, 32));
             program
         };
         let witness = [0x51u8];
@@ -7038,7 +7028,7 @@ mod tests {
         let push = extract_fn(&file, "sigop_count_push_opcode");
         let valid = {
             let mut script = vec![0xa9, 0x14];
-            script.extend(std::iter::repeat(0x11).take(20));
+            script.extend(std::iter::repeat_n(0x11, 20));
             script.push(0x87);
             script
         };
@@ -7947,7 +7937,7 @@ mod tests {
             redeem_push_query(&src, &trailer, &redeem22),
             SatResult::Unsat
         );
-        let wrong = direct(&vec![0u8; 22]);
+        let wrong = direct(&[0u8; 22]);
         assert_eq!(redeem_push_query(&src, &wrong, &redeem22), SatResult::Unsat);
         let mut bad_opcode = redeem22.clone();
         bad_opcode.insert(0, 0x4c);

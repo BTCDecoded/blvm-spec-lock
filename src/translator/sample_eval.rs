@@ -1008,7 +1008,7 @@ fn call_func(
             .next()
             .cloned()
             .unwrap_or_else(|| panic!("sample eval missing argument {name}"));
-        ctx.bind(&name, value);
+        ctx.bind(name, value);
     }
     let flow = eval_block(&func.block, ctx);
     let refs = func
@@ -1024,7 +1024,7 @@ fn call_func(
             }
             let name = pat_ident(&typed.pat);
             Some(
-                ctx.get(&name)
+                ctx.get(name)
                     .unwrap_or_else(|| panic!("missing mut {name}")),
             )
         })
@@ -1491,9 +1491,7 @@ fn u256_shift(bytes: &[u8], shift: i128, left: bool) -> Vec<u8> {
             }
         }
     } else if bit_shift == 0 {
-        for index in word_shift..4 {
-            result[index - word_shift] = limbs[index];
-        }
+        result[..(4 - word_shift)].copy_from_slice(&limbs[word_shift..4]);
     } else {
         for index in word_shift..4 {
             let mut word = limbs[index] >> bit_shift;

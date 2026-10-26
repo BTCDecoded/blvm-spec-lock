@@ -26,14 +26,36 @@ jobs:
       (!contains(github.event.head_commit.message, '[skip ci]') &&
        !contains(github.event.head_commit.message, '[ci skip]') &&
        !contains(github.event.head_commit.message, '[no ci]'))
+    defaults:
+      run:
+        working-directory: blvm-spec-lock
     steps:
       - uses: actions/checkout@v6
+        with:
+          path: blvm-spec-lock
+
+      # production_lock tests read ../blvm-consensus and ../blvm-primitives sources.
+      # Check them out at pinned commits so the locks always run against real code;
+      # bump these SHAs when the locks are re-checked against newer consensus.
+      - uses: actions/checkout@v6
+        with:
+          repository: BTCDecoded/blvm-consensus
+          ref: 994480ddb6d03a828b4c00654521986d7551fcaf
+          path: blvm-consensus
+
+      - uses: actions/checkout@v6
+        with:
+          repository: BTCDecoded/blvm-primitives
+          ref: 9720541b8897c383cbdd0f3f6334d4bcc0af9485
+          path: blvm-primitives
 
       - name: Install Rust
         uses: BTCDecoded/rust-ci/install-rust-toolchain@main
 
       - name: Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: blvm-spec-lock
 
       # Single job + no incremental: avoids flaky "could not parse/generate dep info" (.d missing)
       # on self-hosted runners (NFS / high parallelism / cache races).

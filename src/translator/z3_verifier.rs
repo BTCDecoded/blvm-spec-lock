@@ -207,6 +207,12 @@ impl Z3Verifier {
                         let k = k.as_str();
                         (k.starts_with("call_") && k.ends_with("_result"))
                             || k.starts_with("for_loop_")
+                            || k.starts_with("index_")
+                            || k.ends_with("_sum")
+                            || k.ends_with("_fold")
+                            || k.ends_with("_reduce")
+                            || k.ends_with("_collect")
+                            || k.ends_with("_map")
                     });
                     let formula_str;
                     let body_formula_vacuous = if looks_wrapper_or_placeholder {
@@ -809,7 +815,8 @@ fn is_formula_body_vacuous(formula_str: &str) -> bool {
     // user-defined functions are named by the translator as snake_case identifiers.
     const Z3_BUILTIN_PREFIX: &[&str] = &[
         "+", "-", "*", "/", "div", "mod", "rem", ">=", "<=", ">", "<", "=", "not", "and", "or",
-        "ite", "=>", "bvshr", "bvshl", "bvand", "bvor", "bvnot", "let", "forall", "exists",
+        "ite", "=>", "bvshr", "bvshl", "bvand", "bvor", "bvnot", "select", "store", "let",
+        "forall", "exists",
         // Axiomatized in add_shift_axioms: shr(a,k)=a/2^k for k<64, 0 for k>=64.
         "shr", "shl",
     ];
@@ -836,7 +843,7 @@ fn is_formula_body_vacuous(formula_str: &str) -> bool {
         // Arithmetic
         "(+ ", "(- ", "(* ", "(/ ", " div ", " mod ", "(div ", "(rem ",
         // Bit-vector shifts and axiomatized integer shifts (add_shift_axioms)
-        "bvshr", "bvshl", "(shr ", "(shl ", // Comparison (prefix application style)
+        "bvshr", "bvshl", "select", "(shr ", "(shl ", // Comparison (prefix application style)
         "(>= ", "(<= ", "(> ", "(< ", // Boolean
         "(and ", "(or ", "(not ",
         "(ite ",
@@ -911,6 +918,227 @@ mod vacuity_tests {
         assert!(is_formula_body_vacuous(
             "(= result call_get_block_subsidy_result)"
         ));
+    }
+
+    #[test]
+    fn fresh_index_is_vacuous() {
+        assert!(is_formula_body_vacuous("(= result index_0)"));
+    }
+}
+
+#[cfg(all(test, feature = "z3"))]
+mod translation_holes {
+    use super::{VerificationResult, Z3Verifier, extract_parameter_types, extract_return_type};
+    use crate::parser::contracts::{Contract, ContractType};
+    use crate::translator::z3_translator::Z3Translator;
+
+    fn prove(src: &str, ensures: &str) -> VerificationResult {
+        let func: syn::ItemFn = syn::parse_str(src).unwrap();
+        let condition: syn::Expr = syn::parse_str(ensures).unwrap();
+        let contract = Contract {
+            contract_type: ContractType::Ensures,
+            condition,
+            comment: None,
+        };
+        let mut verifier = Z3Verifier::new(10_000);
+        verifier.verify_contract_with_context(&contract, Some(&func), &[], &[])
+    }
+
+    fn is_verified(result: &VerificationResult) -> bool {
+        matches!(result, VerificationResult::Verified { .. })
+    }
+
+    fn body(src: &str) -> String {
+        let func: syn::ItemFn = syn::parse_str(src).unwrap();
+        let translator = Z3Translator::new(2_000);
+        let params = extract_parameter_types(&func);
+        let ret = extract_return_type(&func);
+        let (mut vars, _) = translator.build_shared_vars(&params, ret.as_ref());
+        translator
+            .translate_function_body(&func, &mut vars)
+            .expect("translate")
+            .expect("formula")
+            .to_string()
+    }
+
+    #[test]
+    fn saturating_sub_is_zero_at_and_past_the_minuend() {
+        let result = prove(
+            "fn f(a: u64) -> u64 { 3u64.saturating_sub(a) }",
+            "(a >= 3) == (result == 0)",
+        );
+        assert!(is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn cast_to_u8_keeps_a_byte() {
+        let result = prove(
+            "fn f(x: i64) -> i64 { (x as u8) as i64 }",
+            "result >= 0 && result < 256",
+        );
+        assert!(is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn non_power_mask_is_bounded() {
+        let result = prove("fn f(x: u64) -> u64 { x & 0x000000f0 }", "result <= 240");
+        assert!(is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn subsidy_calls_depend_on_their_arguments() {
+        let result = prove(
+            "fn f(a: u64, b: u64) -> i64 { get_block_subsidy(a) - get_block_subsidy(b) }",
+            "result == 0",
+        );
+        assert!(!is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn hash256_is_sha256_twice() {
+        let single = body("fn single(x: u64) -> u64 { sha256_hash(x) }");
+        let double = body("fn double(x: u64) -> u64 { hash256(x) }");
+        assert_eq!(single.matches("sha256").count(), 1, "{single}");
+        assert_eq!(double.matches("sha256").count(), 2, "{double}");
+        assert_ne!(single, double);
+    }
+
+    #[test]
+    fn constant_for_counts() {
+        let result = prove(
+            "fn f() -> u64 { let mut t = 0u64; for _k in 0..4 { t += 1; } t }",
+            "result == 4",
+        );
+        assert!(
+            matches!(
+                result,
+                VerificationResult::Verified {
+                    body_translated: true
+                }
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn variable_bound_for_does_not_prove_the_initializer() {
+        let src = "fn f(n: u64) -> u64 { let mut t = 0u64; for _k in 0..n { t += 1; } t }";
+        let func: syn::ItemFn = syn::parse_str(src).unwrap();
+        let translator = Z3Translator::new(2_000);
+        let params = extract_parameter_types(&func);
+        let ret = extract_return_type(&func);
+        let (mut vars, _) = translator.build_shared_vars(&params, ret.as_ref());
+        let translated = translator.translate_function_body(&func, &mut vars);
+        assert!(
+            translated.is_err(),
+            "an unrolled-or-nothing loop must not leave t at 0"
+        );
+        let result = prove(src, "result == 0");
+        assert!(!is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn u8_add_wraps_at_the_top() {
+        let result = prove("fn f(a: u8) -> u8 { a + 1 }", "(a == 255) == (result == 0)");
+        assert!(is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn wrapping_add_wraps_at_the_top() {
+        let result = prove(
+            "fn f(a: u8) -> u8 { a.wrapping_add(1) }",
+            "(a == 255) == (result == 0)",
+        );
+        assert!(is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn saturating_mul_clamps_a_u8_square() {
+        let result = prove(
+            "fn f(a: u8) -> u8 { a.saturating_mul(a) }",
+            "(a >= 16) == (result == 255)",
+        );
+        assert!(is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn index_read_is_not_zero() {
+        let result = prove("fn f(xs: u64) -> u64 { xs[0] }", "result == 0");
+        assert!(!is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn index_store_is_the_next_read() {
+        let result = prove("fn f(xs: u64) -> u64 { xs[0] = 7; xs[0] }", "result == 7");
+        assert!(is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn byte_index_stays_in_a_byte() {
+        let result = prove(
+            "fn f(xs: &[u8]) -> u64 { xs[0] as u64 }",
+            "result >= 0 && result < 256",
+        );
+        assert!(is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn typed_local_add_wraps() {
+        let result = prove("fn f() -> u8 { let t: u8 = 255; t + 1 }", "result == 0");
+        assert!(is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn u128_saturating_mul_is_not_the_double() {
+        let result = prove(
+            "fn f(a: u128) -> u128 { a.saturating_mul(2) }",
+            "result == a * 2",
+        );
+        assert!(!is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn u128_concrete_product_is_twelve() {
+        let result = prove("fn f() -> u128 { 3u128.saturating_mul(4) }", "result == 12");
+        assert!(is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn iterator_sum_is_not_proved_zero() {
+        let result = prove("fn f(xs: u64) -> u64 { xs.iter().sum() }", "result == 0");
+        assert!(!is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn saturating_mul_of_concrete_operands_is_the_product() {
+        let result = prove("fn f() -> u64 { 3u64.saturating_mul(4) }", "result == 12");
+        assert!(is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn saturating_mul_of_a_symbol_is_not_the_square() {
+        let result = prove(
+            "fn f(a: u64) -> u64 { a.saturating_mul(a) }",
+            "result == a * a",
+        );
+        assert!(!is_verified(&result), "{result:?}");
+    }
+
+    #[test]
+    fn while_does_not_prove_the_initializer() {
+        let src = "fn f() -> u64 { let mut t = 0u64; while t < 4 { t += 1; } t }";
+        let func: syn::ItemFn = syn::parse_str(src).unwrap();
+        let translator = Z3Translator::new(2_000);
+        let params = extract_parameter_types(&func);
+        let ret = extract_return_type(&func);
+        let (mut vars, _) = translator.build_shared_vars(&params, ret.as_ref());
+        let translated = translator.translate_function_body(&func, &mut vars);
+        assert!(
+            translated.is_err(),
+            "one pass of the body would prove result == 1"
+        );
+        let result = prove(src, "result == 0");
+        assert!(!is_verified(&result), "{result:?}");
     }
 }
 

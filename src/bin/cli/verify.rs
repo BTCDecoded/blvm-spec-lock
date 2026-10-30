@@ -1169,9 +1169,17 @@ fn verify_with_z3(
     // when verifying ensures.  Axioms differ from requires only semantically:
     // requires are caller-supplied preconditions; axioms are trusted properties
     // of the result that the body translator cannot independently derive.
+    // An axiom that copies the ensures under check does not prove that ensures.
+    let restates_axiom = axiom_contracts
+        .iter()
+        .any(|c| c.condition.trim() == contract.condition.trim());
     let requires_library: Vec<_> = requires_contracts
         .iter()
-        .chain(axiom_contracts.iter())
+        .chain(
+            axiom_contracts
+                .iter()
+                .filter(|c| c.condition.trim() != contract.condition.trim()),
+        )
         .filter_map(|c| {
             c.expr.as_ref().map(|expr| LibraryContract {
                 contract_type: LibraryContractType::Requires,
@@ -1198,10 +1206,25 @@ fn verify_with_z3(
             } else {
                 "Contract violated (no counterexample available)".to_string()
             };
-            Err(msg)
+            Err(restated_axiom_message(restates_axiom, msg))
         }
-        VerificationResult::Unknown { reason } => Err(format!("Z3 verification unknown: {reason}")),
-        VerificationResult::Error { error } => Err(format!("Z3 verification error: {error}")),
+        VerificationResult::Unknown { reason } => Err(restated_axiom_message(
+            restates_axiom,
+            format!("Z3 verification unknown: {reason}"),
+        )),
+        VerificationResult::Error { error } => Err(restated_axiom_message(
+            restates_axiom,
+            format!("Z3 verification error: {error}"),
+        )),
+    }
+}
+
+#[cfg(feature = "z3")]
+fn restated_axiom_message(restates: bool, msg: String) -> String {
+    if restates {
+        format!("ensures restates an axiom; body did not discharge it: {msg}")
+    } else {
+        msg
     }
 }
 
@@ -1314,6 +1337,7 @@ fn demote_if_all_spec_derived(
             || reason.contains("Could not translate function body")
             || reason.contains("counterexample model has no named variable assignments")
             || reason.contains("Translation error")
+            || reason.contains("ensures restates an axiom")
     };
 
     let all_gaps = failed_contracts
@@ -1676,5 +1700,62 @@ mod failure_kind_tests {
             }
             other => panic!("expected Partial, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn restated_axiom_does_not_stay_failed() {
+        let failed = vec![(
+            "Ensures".to_string(),
+            "Z3: ensures restates an axiom; body did not discharge it: Contract violated"
+                .to_string(),
+            false,
+        )];
+        let result = demote_if_all_spec_derived(&failed, 0, 1).expect("restated axiom is partial");
+        assert!(matches!(
+            result,
+            VerificationResult::Partial {
+                partial_reason: Some(PartialReason::UnsupportedTranslation),
+                ..
+            }
+        ));
+    }
+}
+
+#[cfg(all(test, feature = "z3"))]
+mod axiom_restatement {
+    use super::{Contract, ContractType, verify_with_z3};
+    use syn::parse_quote;
+
+    fn ctr(kind: ContractType, cond: &str) -> Contract {
+        Contract {
+            contract_type: kind,
+            condition: cond.to_string(),
+            expr: Some(syn::parse_str(cond).unwrap()),
+            is_spec_derived: false,
+        }
+    }
+
+    #[test]
+    fn copied_axiom_does_not_prove_ensures() {
+        let func: syn::ItemFn = parse_quote! {
+            fn f(x: i64) -> i64 { x }
+        };
+        let ensures = ctr(ContractType::Ensures, "result >= 0");
+        let axiom = ctr(ContractType::Axiom, "result >= 0");
+        let err = verify_with_z3(&ensures, Some(&func), &[], &[&axiom], 5, &[])
+            .expect_err("the body is the identity");
+        assert!(err.contains("ensures restates an axiom"), "{err}");
+    }
+
+    #[test]
+    fn distinct_axiom_is_still_assumed() {
+        let func: syn::ItemFn = parse_quote! {
+            fn g(x: i64) -> i64 { x }
+        };
+        let ensures = ctr(ContractType::Ensures, "result >= 0");
+        let axiom = ctr(ContractType::Axiom, "x >= 0");
+        let body_translated =
+            verify_with_z3(&ensures, Some(&func), &[], &[&axiom], 5, &[]).expect("proved");
+        assert!(body_translated);
     }
 }

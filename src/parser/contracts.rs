@@ -29,9 +29,9 @@ pub enum ContractType {
     /// provably correct by human inspection but whose bodies contain constructs
     /// (loops, bitwise arithmetic) the Z3 translator cannot fully model.
     ///
-    /// An axiom enables the corresponding `ensures` to be discharged: the
-    /// ensures formula is negated and checked for satisfiability; the axiom
-    /// makes that negation UNSAT, producing a PASSED result.
+    /// An axiom is assumed while checking a different `ensures`. An `ensures`
+    /// whose condition is the same text as an axiom is not discharged by that
+    /// axiom. The body has to prove it, or the result stays partial.
     Axiom,
 }
 

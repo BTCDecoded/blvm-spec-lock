@@ -3253,6 +3253,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn op_add_concrete_sum_differs_from_sub() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let body =
+            find_fn(&repo("blvm-consensus/src/script/arithmetic.rs"), "op_add").expect("op_add");
+        assert!(body.contains("b + a"), "{body}");
+        let args = [
+            ("b", crate::translator::sample_eval::Val::Int(2)),
+            ("a", crate::translator::sample_eval::Val::Int(3)),
+        ];
+        let sum = crate::translator::sample_eval::eval_int(
+            "fn f(b: i64, a: i64) -> i64 { b + a }",
+            &args,
+        );
+        let diff = crate::translator::sample_eval::eval_int(
+            "fn f(b: i64, a: i64) -> i64 { b - a }",
+            &args,
+        );
+        assert_eq!(sum, 5);
+        assert_eq!(diff, -1);
+        let swapped = body.replace("b + a", "b - a");
+        assert_ne!(classify(&body).kind, classify(&swapped).kind);
+    }
+
+    #[test]
     fn checkmultisig_window_is_locked() {
         if !crate::parser::spec_expr::consensus_workspace_present() {
             return;

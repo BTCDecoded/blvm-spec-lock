@@ -2,10 +2,11 @@
 //!
 //! Translates Rust expressions AND function bodies to Z3 expressions for verification.
 //! Focused on Bitcoin-specific patterns (u64, i64, Vec, arithmetic, comparisons).
-//! A variable shift uses the uninterpreted `shr` / `shl`. A literal `>>` divides by `2^k`.
-//! A literal `<<` in `0..64` is a 64-bit bitvector shift, so bit 63 wraps.
-//! `%` (Rem) maps to Z3 `rem`; `&` with a constant mask uses `div`/`rem` patterns when the mask is
-//! a power of two or one less than a power of two (including mask on the left operand).
+//! A literal `>>` divides by `2^k`. A literal `<<` in `0..64` wraps at 64 bits.
+//! A variable `>>` / `<<` is that same 64-bit shift (`bvlshr` / `bvshl`), not an uninterpreted `shr`.
+//! `%` (Rem) maps to Z3 `rem`. `&` with a constant mask uses `div`/`rem` when the mask is
+//! a power of two or one less than a power of two; every other non-negative constant mask
+//! is the low 64 bits of `bvand`. `as uN` / `as iN` keeps the low N bits.
 //!
 //! ## Key Insight: Implementation IS the Formula
 //!
@@ -20,7 +21,7 @@
 
 use crate::parser::contracts::Contract;
 use syn::{Block, Expr, ItemFn, Stmt};
-use z3::ast::{Ast, BV, Bool, Int};
+use z3::ast::{Array, Ast, BV, Bool, Int};
 #[cfg(feature = "z3")]
 use z3::{Config, Context, Sort};
 
@@ -32,6 +33,15 @@ pub type Z3VarMap<'a> = std::collections::HashMap<String, z3::ast::Dynamic<'a>>;
 /// Z3 translator for Rust expressions
 pub struct Z3Translator {
     ctx: Context,
+    /// Machine-word width of named Z3 constants, keyed by AST identity.
+    /// Numerals are not recorded: Z3 hash-conses them, so a width on `1`
+    /// would change every later use of that numeral.
+    words: std::cell::RefCell<std::collections::HashMap<usize, (u32, bool)>>,
+    /// Width of a Rust binding. Looked up by name so a suffixed local is not
+    /// stored on a hash-consed numeral.
+    name_words: std::cell::RefCell<std::collections::HashMap<String, (u32, bool)>>,
+    /// Bindings whose index is a byte (`&[u8]`, `[u8; N]`, `Vec<u8>`).
+    byte_names: std::cell::RefCell<std::collections::HashSet<String>>,
 }
 
 #[cfg(feature = "z3")]
@@ -47,7 +57,161 @@ impl Z3Translator {
         }
         let ctx = Context::new(&cfg);
 
-        Z3Translator { ctx }
+        Z3Translator {
+            ctx,
+            words: std::cell::RefCell::new(std::collections::HashMap::new()),
+            name_words: std::cell::RefCell::new(std::collections::HashMap::new()),
+            byte_names: std::cell::RefCell::new(std::collections::HashSet::new()),
+        }
+    }
+
+    fn expr_word(&self, expr: &Expr) -> Option<(u32, bool)> {
+        match expr {
+            Expr::Path(path) => {
+                let name = path_to_string(&path.path);
+                self.name_words.borrow().get(&name).copied()
+            }
+            Expr::Lit(lit) => match &lit.lit {
+                syn::Lit::Int(int_lit) => lit_word(int_lit),
+                _ => None,
+            },
+            Expr::Paren(paren) => self.expr_word(&paren.expr),
+            _ => None,
+        }
+    }
+
+    fn remember_word(&self, ast: &dyn Ast<'_>, word: (u32, bool)) {
+        self.words
+            .borrow_mut()
+            .insert(ast.get_z3_ast() as usize, word);
+    }
+
+    fn word_of(&self, ast: &dyn Ast<'_>) -> Option<(u32, bool)> {
+        self.words
+            .borrow()
+            .get(&(ast.get_z3_ast() as usize))
+            .copied()
+    }
+
+    /// Width to use for an operation. A bare literal inherits the typed operand.
+    /// Two recorded widths that disagree are a type error, not a silent `Int` op.
+    fn operand_word(
+        &self,
+        left: &dyn Ast<'_>,
+        right: &dyn Ast<'_>,
+    ) -> Result<Option<(u32, bool)>, TranslationError> {
+        match (self.word_of(left), self.word_of(right)) {
+            (Some(left_word), Some(right_word)) if left_word != right_word => Err(
+                TranslationError::TypeError("machine-word widths differ".to_string()),
+            ),
+            (Some(word), _) | (_, Some(word)) => Ok(Some(word)),
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// `+` / `-` / `*` at a known machine width. The result is that width's
+    /// wrap, so a proof is not a proof of unbounded arithmetic.
+    fn word_arith<'a>(
+        &'a self,
+        op: &str,
+        left: &Int<'a>,
+        right: &Int<'a>,
+        word: (u32, bool),
+    ) -> Int<'a> {
+        let (bits, signed) = word;
+        let left_bv = BV::from_int(left, bits);
+        let right_bv = BV::from_int(right, bits);
+        let result = match op {
+            "add" => left_bv.bvadd(&right_bv),
+            "sub" => left_bv.bvsub(&right_bv),
+            "mul" => left_bv.bvmul(&right_bv),
+            _ => unreachable!("word_arith {op}"),
+        };
+        let as_int = result.to_int(signed);
+        self.remember_word(&as_int, word);
+        as_int
+    }
+
+    fn int_binop<'a>(
+        &'a self,
+        op: &str,
+        left: &z3::ast::Dynamic<'a>,
+        right: &z3::ast::Dynamic<'a>,
+        hinted: Option<(u32, bool)>,
+    ) -> Result<z3::ast::Dynamic<'a>, TranslationError> {
+        if op == "add" {
+            if let Some(sum) = bv_add(left, right) {
+                return Ok(sum);
+            }
+        }
+        let left_int = left
+            .as_int()
+            .ok_or_else(|| TranslationError::TypeError("Expected Int".to_string()))?;
+        let right_int = right
+            .as_int()
+            .ok_or_else(|| TranslationError::TypeError("Expected Int".to_string()))?;
+        let word = self.operand_word(&left_int, &right_int)?.or(hinted);
+        if let Some(word) = word {
+            return Ok(self.word_arith(op, &left_int, &right_int, word).into());
+        }
+        let math = match op {
+            "add" => left_int + right_int,
+            "sub" => left_int - right_int,
+            "mul" => left_int * right_int,
+            _ => unreachable!("int_binop {op}"),
+        };
+        Ok(math.into())
+    }
+
+    fn saturating_mul_word<'a>(
+        &'a self,
+        left: &Int<'a>,
+        right: &Int<'a>,
+        word: (u32, bool),
+    ) -> Int<'a> {
+        let (bits, signed) = word;
+        let left_bv = BV::from_int(left, bits);
+        let right_bv = BV::from_int(right, bits);
+        let prod = left_bv.bvmul(&right_bv);
+        let as_int = if signed {
+            let ok = Bool::and(
+                &self.ctx,
+                &[
+                    &left_bv.bvmul_no_overflow(&right_bv, true),
+                    &left_bv.bvmul_no_underflow(&right_bv),
+                ],
+            );
+            let zero = BV::from_i64(&self.ctx, 0, bits);
+            let both_neg = left_bv.bvslt(&zero) & right_bv.bvslt(&zero);
+            let both_nonneg = left_bv.bvslt(&zero).not() & right_bv.bvslt(&zero).not();
+            let positive = both_neg | both_nonneg;
+            let max = signed_max_bv(&self.ctx, bits);
+            let min = signed_min_bv(&self.ctx, bits);
+            let clamped = positive.ite(&max, &min);
+            ok.ite(&prod, &clamped).to_int(true)
+        } else {
+            let ok = left_bv.bvmul_no_overflow(&right_bv, false);
+            let max = unsigned_max_bv(&self.ctx, bits);
+            ok.ite(&prod, &max).to_int(false)
+        };
+        self.remember_word(&as_int, word);
+        as_int
+    }
+
+    fn array_of<'a>(&'a self, base: &str, vars: &mut Z3VarMap<'a>) -> Array<'a> {
+        let key = format!("__arr_{base}");
+        if let Some(existing) = vars.get(&key).and_then(|value| value.as_array()) {
+            return existing;
+        }
+        let domain = Sort::int(&self.ctx);
+        let range = if self.byte_names.borrow().contains(base) {
+            Sort::bitvector(&self.ctx, 8)
+        } else {
+            Sort::int(&self.ctx)
+        };
+        let created = Array::new_const(&self.ctx, key.clone(), &domain, &range);
+        vars.insert(key, created.clone().into());
+        created
     }
 
     /// Get the Z3 context
@@ -96,6 +260,7 @@ impl Z3Translator {
             Expr::Binary(bin) => {
                 let left = self.translate_expr_with_vars(&bin.left, vars)?;
                 let right = self.translate_expr_with_vars(&bin.right, vars)?;
+                let hinted = self.expr_word(&bin.left).or(self.expr_word(&bin.right));
                 // Concrete shr/shl when right is literal (avoids uninterpreted function)
                 if matches!(bin.op, syn::BinOp::Shr(_)) {
                     if let Some(shift_val) = extract_int_literal(&bin.right) {
@@ -165,7 +330,13 @@ impl Z3Translator {
                             }
                         }
                     }
-                    // Fallback: uninterpreted function (like Shr/Shl for non-constant)
+                    // Any other non-negative constant mask: low 64 bits, not an uninterpreted `bitand`.
+                    if let Some(masked) =
+                        self.constant_mask_bvand(&left_int, &right_int, &bin.left, &bin.right)
+                    {
+                        return Ok(masked);
+                    }
+                    // Variable mask: still uninterpreted. A byte-array model is a separate change.
                     let bitand_fn = z3::FuncDecl::new(
                         &self.ctx,
                         "bitand",
@@ -174,7 +345,7 @@ impl Z3Translator {
                     );
                     return Ok(bitand_fn.apply(&[&left_int, &right_int]));
                 }
-                self.translate_binary_op(bin.op, left, right)
+                self.translate_binary_op(bin.op, left, right, hinted)
             }
             Expr::MethodCall(method) => self.translate_method_call(method, vars),
             Expr::Call(call) => self.translate_call(call, vars),
@@ -184,8 +355,15 @@ impl Z3Translator {
             }
             Expr::Paren(paren) => self.translate_expr_with_vars(&paren.expr, vars),
             Expr::Cast(cast) => {
-                // (expr) as Type - pass through (we model as Int)
-                self.translate_expr_with_vars(&cast.expr, vars)
+                let inner = self.translate_expr_with_vars(&cast.expr, vars)?;
+                if let Some((bits, signed)) = int_cast_width(&cast.ty) {
+                    let inner_int = inner.as_int().ok_or_else(|| {
+                        TranslationError::TypeError("cast operand must be Int".to_string())
+                    })?;
+                    let truncated = BV::from_int(&inner_int, bits).to_int(signed);
+                    return Ok(truncated.into());
+                }
+                Ok(inner)
             }
             Expr::Reference(reference) => {
                 // &expr - pass through (we don't model pointers)
@@ -227,15 +405,23 @@ impl Z3Translator {
             }
             Expr::Field(field) => self.translate_field_access(field, vars),
             Expr::Index(index) => {
-                // slice[i] or vec[i] - model as fresh Int (conservative; no array semantics)
                 let _ = self.translate_expr_with_vars(&index.expr, vars)?;
-                let _ = self.translate_expr_with_vars(&index.index, vars)?;
-                let fresh = format!("index_{}", vars.len());
-                let var = vars.entry(fresh.clone()).or_insert_with(|| {
-                    let symbol = z3::Symbol::String(fresh);
-                    Int::new_const(&self.ctx, symbol).into()
-                });
-                Ok(var.clone())
+                let idx = self.translate_expr_with_vars(&index.index, vars)?;
+                let idx_int = idx
+                    .as_int()
+                    .ok_or_else(|| TranslationError::TypeError("index must be Int".to_string()))?;
+                let base = expr_to_var_hint(&index.expr);
+                let arr = self.array_of(&base, vars);
+                let selected = arr.select(&idx_int);
+                if let Some(selected_int) = selected.as_int() {
+                    return Ok(selected_int.into());
+                }
+                if let Some(selected_bv) = selected.as_bv() {
+                    return Ok(selected_bv.to_int(false).into());
+                }
+                Err(TranslationError::TypeError(
+                    "array select must be Int or a byte".to_string(),
+                ))
             }
             Expr::Block(block) => {
                 // Block expression: { stmts; expr } - process lets for bindings, translate last expr
@@ -263,9 +449,13 @@ impl Z3Translator {
             }
             Expr::Match(match_expr) => self.translate_match(match_expr, vars),
             Expr::ForLoop(fl) => {
+                // Literal `for i in LO..HI` with span 1..=64 unrolls into the
+                // accumulators. A bound that is not that span is not one pass
+                // and not "the accumulator stayed put".
                 if !self.try_unroll_constant_for(fl, vars)? {
-                    let _ = self.translate_expr_with_vars(&fl.expr, vars);
-                    let _ = self.translate_block_to_result_formula(&fl.body, vars);
+                    return Err(TranslationError::UnsupportedExpression(
+                        "for loop bound is not a literal span".to_string(),
+                    ));
                 }
                 let name = format!("for_loop_{}", vars.len());
                 let var = vars.entry(name.clone()).or_insert_with(|| {
@@ -316,24 +506,12 @@ impl Z3Translator {
                 // Standalone if (not in block context) - translate to ite
                 self.translate_if_expr_to_dynamic(if_expr, vars)
             }
-            Expr::While(while_expr) => {
-                let _ = self.translate_expr_with_vars(&while_expr.cond, vars);
-                let _ = self.translate_block_to_result_formula(&while_expr.body, vars);
-                let name = format!("while_loop_{}", vars.len());
-                let var = vars.entry(name.clone()).or_insert_with(|| {
-                    let symbol = z3::Symbol::String(name);
-                    Int::new_const(&self.ctx, symbol).into()
-                });
-                Ok(var.clone())
-            }
-            Expr::Loop(loop_expr) => {
-                let _ = self.translate_block_to_result_formula(&loop_expr.body, vars);
-                let name = format!("loop_{}", vars.len());
-                let var = vars.entry(name.clone()).or_insert_with(|| {
-                    let symbol = z3::Symbol::String(name);
-                    Int::new_const(&self.ctx, symbol).into()
-                });
-                Ok(var.clone())
+            Expr::While(_) | Expr::Loop(_) => {
+                // One pass is a different function. A fresh symbol is not the loop.
+                // Constant `for` still unrolls; this refusal does not apply to it.
+                Err(TranslationError::UnsupportedExpression(
+                    "while loop is not the formula".to_string(),
+                ))
             }
             Expr::Let(let_expr) => {
                 // if let Some(x)=opt / Ok(x)=res / Err(e)=res / None=opt - used as condition in if
@@ -435,38 +613,12 @@ impl Z3Translator {
         op: syn::BinOp,
         left: z3::ast::Dynamic<'a>,
         right: z3::ast::Dynamic<'a>,
+        hinted: Option<(u32, bool)>,
     ) -> Result<z3::ast::Dynamic<'a>, TranslationError> {
         match op {
-            syn::BinOp::Add(_) => {
-                if let Some(sum) = bv_add(&left, &right) {
-                    return Ok(sum);
-                }
-                let left_int = left
-                    .as_int()
-                    .ok_or_else(|| TranslationError::TypeError("Expected Int".to_string()))?;
-                let right_int = right
-                    .as_int()
-                    .ok_or_else(|| TranslationError::TypeError("Expected Int".to_string()))?;
-                Ok((left_int + right_int).into())
-            }
-            syn::BinOp::Sub(_) => {
-                let left_int = left
-                    .as_int()
-                    .ok_or_else(|| TranslationError::TypeError("Expected Int".to_string()))?;
-                let right_int = right
-                    .as_int()
-                    .ok_or_else(|| TranslationError::TypeError("Expected Int".to_string()))?;
-                Ok((left_int - right_int).into())
-            }
-            syn::BinOp::Mul(_) => {
-                let left_int = left
-                    .as_int()
-                    .ok_or_else(|| TranslationError::TypeError("Expected Int".to_string()))?;
-                let right_int = right
-                    .as_int()
-                    .ok_or_else(|| TranslationError::TypeError("Expected Int".to_string()))?;
-                Ok((left_int * right_int).into())
-            }
+            syn::BinOp::Add(_) => self.int_binop("add", &left, &right, hinted),
+            syn::BinOp::Sub(_) => self.int_binop("sub", &left, &right, hinted),
+            syn::BinOp::Mul(_) => self.int_binop("mul", &left, &right, hinted),
             syn::BinOp::Div(_) => {
                 // Z3 integer division
                 let left_int = left
@@ -493,14 +645,7 @@ impl Z3Translator {
                 let right_int = right
                     .as_int()
                     .ok_or_else(|| TranslationError::TypeError("Expected Int".to_string()))?;
-
-                let shift_fn = z3::FuncDecl::new(
-                    &self.ctx,
-                    "shr",
-                    &[&Sort::int(&self.ctx), &Sort::int(&self.ctx)],
-                    &Sort::int(&self.ctx),
-                );
-                Ok(shift_fn.apply(&[&left_int, &right_int]))
+                Ok(self.bv_shift64(&left_int, &right_int, false))
             }
             syn::BinOp::Shl(_) => {
                 let left_int = left
@@ -509,14 +654,7 @@ impl Z3Translator {
                 let right_int = right
                     .as_int()
                     .ok_or_else(|| TranslationError::TypeError("Expected Int".to_string()))?;
-
-                let shift_fn = z3::FuncDecl::new(
-                    &self.ctx,
-                    "shl",
-                    &[&Sort::int(&self.ctx), &Sort::int(&self.ctx)],
-                    &Sort::int(&self.ctx),
-                );
-                Ok(shift_fn.apply(&[&left_int, &right_int]))
+                Ok(self.bv_shift64(&left_int, &right_int, true))
             }
             syn::BinOp::Eq(_) => {
                 // Equality: Bool-Bool, Int-Int, and Bool-Int (spec: \in {true,false} for 0/1)
@@ -695,6 +833,77 @@ impl Z3Translator {
         shifted.to_int(false)
     }
 
+    /// Variable `<<` / `>>` on the low 64 bits. Literal shifts are handled earlier.
+    fn bv_shift64<'a>(
+        &'a self,
+        left: &Int<'a>,
+        right: &Int<'a>,
+        left_shift: bool,
+    ) -> z3::ast::Dynamic<'a> {
+        let l = BV::from_int(left, 64);
+        let r = BV::from_int(right, 64);
+        let shifted = if left_shift {
+            l.bvshl(&r)
+        } else {
+            l.bvlshr(&r)
+        };
+        shifted.to_int(false).into()
+    }
+
+    /// `value & mask` for a non-negative constant mask, on the low 64 bits.
+    fn constant_mask_bvand<'a>(
+        &'a self,
+        left_int: &Int<'a>,
+        right_int: &Int<'a>,
+        left_expr: &Expr,
+        right_expr: &Expr,
+    ) -> Option<z3::ast::Dynamic<'a>> {
+        let (value, mask) = if let Some(m) = extract_int_literal(right_expr).filter(|m| *m >= 0) {
+            (left_int.clone(), m)
+        } else if let Some(m) = extract_int_literal(left_expr).filter(|m| *m >= 0) {
+            (right_int.clone(), m)
+        } else {
+            return None;
+        };
+        let bits = BV::from_int(&value, 64);
+        let mask_bv = BV::from_i64(&self.ctx, mask, 64);
+        Some(bits.bvand(&mask_bv).to_int(false).into())
+    }
+
+    fn apply_int_fn<'a>(&'a self, name: &str, args: &[Int<'a>]) -> z3::ast::Dynamic<'a> {
+        let int_sort = Sort::int(&self.ctx);
+        let sorts: Vec<&Sort> = vec![&int_sort; args.len()];
+        let decl = z3::FuncDecl::new(&self.ctx, name, &sorts, &int_sort);
+        let refs: Vec<&dyn Ast> = args.iter().map(|a| a as &dyn Ast).collect();
+        decl.apply(&refs)
+    }
+
+    /// `sha256` applied `rounds` times. `hash256` is two rounds. Single SHA is one.
+    /// Compression stays uninterpreted. The two functions are not the same symbol.
+    fn hash_rounds<'a>(
+        &'a self,
+        arg: Option<&Expr>,
+        rounds: u32,
+        vars: &mut Z3VarMap<'a>,
+    ) -> Result<z3::ast::Dynamic<'a>, TranslationError> {
+        let arg = arg.ok_or_else(|| {
+            TranslationError::UnsupportedExpression("hash needs 1 arg".to_string())
+        })?;
+        let data = self.translate_expr_with_vars(arg, vars)?;
+        let mut cur = data
+            .as_int()
+            .ok_or_else(|| TranslationError::TypeError("hash arg must be Int".to_string()))?;
+        let int_sort = Sort::int(&self.ctx);
+        let decl = z3::FuncDecl::new(&self.ctx, "sha256", &[&int_sort], &int_sort);
+        for _ in 0..rounds {
+            cur = decl
+                .apply(&[&cur as &dyn Ast])
+                .as_int()
+                .ok_or_else(|| TranslationError::TypeError("sha256 must return Int".to_string()))?;
+        }
+        Ok(cur.into())
+    }
+
     /// Exact `2^k` as Z3 `Int` for `k < 64` (avoids host `1i64 << 63` overflow).
     pub(crate) fn pow2_int(ctx: &Context, k: u32) -> Int<'_> {
         debug_assert!(k < 64);
@@ -825,19 +1034,8 @@ impl Z3Translator {
                 });
                 Ok(var.clone())
             }
-            "hash256" | "hash" => {
-                // Uninterpreted: hash256/hash(data) for determinism
-                let arg = method.args.first().ok_or_else(|| {
-                    TranslationError::UnsupportedExpression("hash256/hash needs 1 arg".to_string())
-                })?;
-                let data = self.translate_expr_with_vars(arg, vars)?;
-                let data_int = data.as_int().ok_or_else(|| {
-                    TranslationError::TypeError("hash arg must be Int".to_string())
-                })?;
-                let int_sort = Sort::int(&self.ctx);
-                let fn_decl = z3::FuncDecl::new(&self.ctx, "hash256", &[&int_sort], &int_sort);
-                Ok(fn_decl.apply(&[&data_int]))
-            }
+            "hash256" => self.hash_rounds(method.args.first(), 2, vars),
+            "hash" => self.hash_rounds(method.args.first(), 1, vars),
             "into" => self.translate_expr_with_vars(&method.receiver, vars),
             "clone" | "serialize" => {
                 // x.clone() / x.serialize() - pass through (same value for determinism)
@@ -882,14 +1080,9 @@ impl Z3Translator {
                         }
                     }
                 }
-                let _ = self.translate_expr_with_vars(&method.receiver, vars);
-                let base = expr_to_var_hint(&method.receiver);
-                let name = format!("{base}_map");
-                let var = vars.entry(name.clone()).or_insert_with(|| {
-                    let symbol = z3::Symbol::String(name);
-                    Int::new_const(&self.ctx, symbol).into()
-                });
-                Ok(var.clone())
+                return Err(TranslationError::UnsupportedExpression(
+                    "iterator map closure is not the formula".to_string(),
+                ));
             }
             "borrow_mut" | "borrow" => {
                 let _ = self.translate_expr_with_vars(&method.receiver, vars);
@@ -950,44 +1143,12 @@ impl Z3Translator {
                 });
                 Ok(var.clone())
             }
-            "sum" => {
-                // iter.sum() - return fresh var for sum (e.g. witness_data.iter().map(|w| w.len()).sum())
-                let _ = self.translate_expr_with_vars(&method.receiver, vars);
-                let base = expr_to_var_hint(&method.receiver);
-                let name = format!("{base}_sum");
-                let var = vars.entry(name.clone()).or_insert_with(|| {
-                    let symbol = z3::Symbol::String(name);
-                    Int::new_const(&self.ctx, symbol).into()
-                });
-                Ok(var.clone())
-            }
-            "fold" => {
-                // iter.fold(init, |acc, x| body) - return fresh var for folded result
-                let _ = self.translate_expr_with_vars(&method.receiver, vars);
-                if let Some(init) = method.args.first() {
-                    let _ = self.translate_expr_with_vars(init, vars);
-                }
-                let base = expr_to_var_hint(&method.receiver);
-                let name = format!("{base}_fold");
-                let var = vars.entry(name.clone()).or_insert_with(|| {
-                    let symbol = z3::Symbol::String(name);
-                    Int::new_const(&self.ctx, symbol).into()
-                });
-                Ok(var.clone())
-            }
-            "reduce" => {
-                // iter.reduce(|a, b| body) - return fresh var for reduced result
-                let _ = self.translate_expr_with_vars(&method.receiver, vars);
-                let base = expr_to_var_hint(&method.receiver);
-                let name = format!("{base}_reduce");
-                let var = vars.entry(name.clone()).or_insert_with(|| {
-                    let symbol = z3::Symbol::String(name);
-                    Int::new_const(&self.ctx, symbol).into()
-                });
-                Ok(var.clone())
-            }
+            "sum" | "fold" | "reduce" => Err(TranslationError::UnsupportedExpression(format!(
+                "{method_name} closure is not the formula"
+            ))),
             "saturating_sub" => {
-                // a.saturating_sub(b) - model as a - b (determinism: same inputs => same output)
+                // Unsigned clamp. `a - b` is false when `a < b`: the Rust value is 0,
+                // and a proof of `result == a - b` would accept a negative result.
                 let left = self.translate_expr_with_vars(&method.receiver, vars)?;
                 let arg = method.args.first().ok_or_else(|| {
                     TranslationError::UnsupportedExpression(
@@ -1001,7 +1162,9 @@ impl Z3Translator {
                 let right_int = right.as_int().ok_or_else(|| {
                     TranslationError::TypeError("saturating_sub: expected Int".to_string())
                 })?;
-                Ok((left_int - right_int).into())
+                let zero = Int::from_i64(&self.ctx, 0);
+                let diff = left_int.clone() - right_int.clone();
+                Ok(left_int.lt(&right_int).ite(&zero, &diff).into())
             }
             "to_le_bytes" => {
                 // x.to_le_bytes() - uninterpreted for determinism (bytes from int)
@@ -1100,8 +1263,34 @@ impl Z3Translator {
                 let numerator = left_int + right_int.clone() - one;
                 Ok((numerator / right_int).into())
             }
+            "wrapping_add" | "wrapping_sub" | "wrapping_mul" => {
+                let left = self.translate_expr_with_vars(&method.receiver, vars)?;
+                let arg = method.args.first().ok_or_else(|| {
+                    TranslationError::UnsupportedExpression(
+                        "wrapping arithmetic needs 1 arg".to_string(),
+                    )
+                })?;
+                let right = self.translate_expr_with_vars(arg, vars)?;
+                let left_int = left.as_int().ok_or_else(|| {
+                    TranslationError::TypeError("wrapping arithmetic: expected Int".to_string())
+                })?;
+                let right_int = right.as_int().ok_or_else(|| {
+                    TranslationError::TypeError("wrapping arithmetic: expected Int".to_string())
+                })?;
+                let word = self
+                    .operand_word(&left_int, &right_int)?
+                    .unwrap_or((64, false));
+                let op = match method_name.as_str() {
+                    "wrapping_add" => "add",
+                    "wrapping_sub" => "sub",
+                    _ => "mul",
+                };
+                Ok(self.word_arith(op, &left_int, &right_int, word).into())
+            }
             "saturating_mul" => {
-                // a.saturating_mul(b) — model as a * b (same as checked_mul for Z3 Int)
+                // A concrete product that fits in u64 is the Rust value.
+                // A typed operand saturates at that width. Anything else is
+                // not the mathematical square.
                 let left = self.translate_expr_with_vars(&method.receiver, vars)?;
                 let arg = method.args.first().ok_or_else(|| {
                     TranslationError::UnsupportedExpression(
@@ -1115,7 +1304,15 @@ impl Z3Translator {
                 let right_int = right.as_int().ok_or_else(|| {
                     TranslationError::TypeError("saturating_mul: expected Int".to_string())
                 })?;
-                Ok((left_int * right_int).into())
+                if u64_saturating_mul_is_product(&left_int, &right_int) {
+                    return Ok((left_int * right_int).into());
+                }
+                if let Some(word) = self.operand_word(&left_int, &right_int)? {
+                    return Ok(self.saturating_mul_word(&left_int, &right_int, word).into());
+                }
+                Err(TranslationError::UnsupportedExpression(
+                    "saturating_mul is not the product".to_string(),
+                ))
             }
             "is_empty" => {
                 // x.is_empty() == (x.len() == 0)
@@ -1260,6 +1457,17 @@ impl Z3Translator {
             }
             return Ok(Bool::from_bool(&self.ctx, false).into());
         }
+        let hash_rounds = match base {
+            "sha256_hash" => Some(1),
+            "hash256" | "double_sha256_hash" | "calculate_tx_id" => Some(2),
+            _ => None,
+        };
+        if let Some(rounds) = hash_rounds {
+            let arg = call.args.first().ok_or_else(|| {
+                TranslationError::UnsupportedExpression(format!("{base} needs 1 arg"))
+            })?;
+            return self.hash_rounds(Some(arg), rounds, vars);
+        }
         // Bool-returning uninterpreted (Result<bool>, Option<bool>)
         if let Some((fn_name, arity_opt)) = known_bool_uninterpreted_function(&name) {
             let mut arg_asts: Vec<z3::ast::Int> = Vec::new();
@@ -1347,13 +1555,27 @@ impl Z3Translator {
             let result = fn_decl.apply(&arg_refs);
             return Ok(result);
         }
-        if let Some(fresh_name) = known_int_returning_function(&name) {
-            // Translate args (for variable binding; we don't model the relation yet)
+        if let Some(slot) = known_int_returning_function(&name) {
+            // The result is a function of the arguments. One shared constant made
+            // `get_block_subsidy(h1)` and `get_block_subsidy(h2)` the same term.
+            let mut arg_asts = Vec::new();
+            let mut args_are_int = true;
             for arg in &call.args {
-                let _ = self.translate_expr_with_vars(arg, vars);
+                match self.translate_expr_with_vars(arg, vars) {
+                    Ok(z) => match z.as_int() {
+                        Some(i) => arg_asts.push(i),
+                        None => args_are_int = false,
+                    },
+                    Err(_) => args_are_int = false,
+                }
             }
-            let var = vars.entry(fresh_name.clone()).or_insert_with(|| {
-                let symbol = z3::Symbol::String(fresh_name);
+            if args_are_int {
+                let applied = self.apply_int_fn(&slot, &arg_asts);
+                vars.insert(slot, applied.clone());
+                return Ok(applied);
+            }
+            let var = vars.entry(slot.clone()).or_insert_with(|| {
+                let symbol = z3::Symbol::String(slot.clone());
                 Int::new_const(&self.ctx, symbol).into()
             });
             return Ok(var.clone());
@@ -1842,16 +2064,48 @@ impl Z3Translator {
     ) -> (Z3VarMap<'a>, Vec<z3::ast::Bool<'a>>) {
         let mut vars = Z3VarMap::new();
         let mut type_constraints = Vec::new();
+        self.words.borrow_mut().clear();
+        self.name_words.borrow_mut().clear();
+        self.byte_names.borrow_mut().clear();
 
         for (name, ty) in param_types {
             let symbol = z3::Symbol::String(name.clone());
             let var = Int::new_const(&self.ctx, symbol);
-            vars.insert(name.clone(), var.into());
-            if is_unsigned_type(ty) {
-                if let Some(var_ref) = vars.get(name).and_then(|v| v.as_int()) {
-                    type_constraints.push(var_ref.ge(&Int::from_i64(&self.ctx, 0)));
-                }
+            if is_byte_slot(ty) {
+                self.byte_names.borrow_mut().insert(name.clone());
             }
+            if let Some(word) = int_cast_width(ty) {
+                self.remember_word(&var, word);
+                self.name_words.borrow_mut().insert(name.clone(), word);
+                let (bits, signed) = word;
+                if bits > 64 {
+                    let (min, max) = if signed {
+                        (
+                            "-170141183460469231731687303715884105728",
+                            "170141183460469231731687303715884105727",
+                        )
+                    } else {
+                        ("0", "340282366920938463463374607431768211455")
+                    };
+                    type_constraints.push(var.ge(&Int::from_str(&self.ctx, min).unwrap()));
+                    type_constraints.push(var.le(&Int::from_str(&self.ctx, max).unwrap()));
+                } else if signed {
+                    let (min, max) = signed_bounds(bits);
+                    type_constraints.push(var.ge(&Int::from_i64(&self.ctx, min)));
+                    type_constraints.push(var.le(&Int::from_i64(&self.ctx, max)));
+                } else {
+                    let max = if bits == 64 {
+                        Int::from_u64(&self.ctx, u64::MAX)
+                    } else {
+                        Int::from_u64(&self.ctx, (1u64 << bits) - 1)
+                    };
+                    type_constraints.push(var.ge(&Int::from_i64(&self.ctx, 0)));
+                    type_constraints.push(var.le(&max));
+                }
+            } else if is_unsigned_type(ty) {
+                type_constraints.push(var.ge(&Int::from_i64(&self.ctx, 0)));
+            }
+            vars.insert(name.clone(), var.into());
         }
 
         if let Some(return_ty) = return_type {
@@ -1926,6 +2180,9 @@ impl Z3Translator {
         let Some(k_name) = loop_ident(&fl.pat) else {
             return Ok(false);
         };
+        if let Some(word) = range_start_word(&fl.expr) {
+            self.name_words.borrow_mut().insert(k_name.clone(), word);
+        }
 
         // Only `ite`-merge locals that existed before the loop (accumulators).
         // Merging per-iteration bindings (`period_start`, `count`, …) nests their
@@ -2106,11 +2363,14 @@ impl Z3Translator {
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Local(local) => {
-                    // let x = expr;
                     if let Some(init) = &local.init {
-                        if let syn::Pat::Ident(ident) = &local.pat {
-                            let var_name = ident.ident.to_string();
-                            // Translate the init expression
+                        if let Some(var_name) = local_name(&local.pat) {
+                            if let Some(word) = local_word(local) {
+                                self.name_words.borrow_mut().insert(var_name.clone(), word);
+                            }
+                            if is_byte_slot_pat(&local.pat) {
+                                self.byte_names.borrow_mut().insert(var_name.clone());
+                            }
                             if let Ok(z3_expr) = self.translate_expr_with_vars(&init.expr, vars) {
                                 if z3_expr.as_int().is_some() || z3_expr.as_bool().is_some() {
                                     vars.insert(var_name, z3_expr);
@@ -2131,17 +2391,20 @@ impl Z3Translator {
                                 }
                             }
                         } else if let Expr::Index(index) = &*assign.left {
-                            let _ = self.translate_expr_with_vars(&index.expr, vars);
-                            let _ = self.translate_expr_with_vars(&index.index, vars);
-                            if let Ok(val) = self.translate_expr_with_vars(&assign.right, vars) {
-                                let base = expr_to_var_hint(&index.expr);
-                                let idx = extract_int_literal(&index.index).unwrap_or(0);
-                                let name = format!("{base}_after_{idx}");
-                                vars.insert(name.clone(), val.clone());
-                                // Update base var so return sees final value (hash[i]=x; hash)
-                                if let Expr::Path(path) = &*index.expr {
-                                    let base_name = path_to_string(&path.path);
-                                    vars.insert(base_name, val);
+                            let idx = self.translate_expr_with_vars(&index.index, vars);
+                            let val = self.translate_expr_with_vars(&assign.right, vars);
+                            if let (Ok(idx), Ok(val)) = (idx, val) {
+                                if let (Some(idx_int), Some(val_int)) = (idx.as_int(), val.as_int())
+                                {
+                                    let base = expr_to_var_hint(&index.expr);
+                                    let arr = self.array_of(&base, vars);
+                                    let stored = if self.byte_names.borrow().contains(&base) {
+                                        let byte = BV::from_int(&val_int, 8);
+                                        arr.store(&idx_int, &byte)
+                                    } else {
+                                        arr.store(&idx_int, &val_int)
+                                    };
+                                    vars.insert(format!("__arr_{base}"), stored.into());
                                 }
                             }
                         }
@@ -2173,14 +2436,14 @@ impl Z3Translator {
                         }
                     } else if let Expr::ForLoop(fl) = expr {
                         if !self.try_unroll_constant_for(fl, vars)? {
-                            let _ = self.translate_expr_with_vars(&fl.expr, vars);
-                            let _ = self.translate_block_to_result_formula(&fl.body, vars);
+                            return Err(TranslationError::UnsupportedExpression(
+                                "for loop bound is not a literal span".to_string(),
+                            ));
                         }
-                    } else if let Expr::While(while_expr) = expr {
-                        let _ = self.translate_expr_with_vars(&while_expr.cond, vars);
-                        let _ = self.translate_block_to_result_formula(&while_expr.body, vars);
-                    } else if let Expr::Loop(loop_expr) = expr {
-                        let _ = self.translate_block_to_result_formula(&loop_expr.body, vars);
+                    } else if matches!(expr, Expr::While(_) | Expr::Loop(_)) {
+                        return Err(TranslationError::UnsupportedExpression(
+                            "while loop is not the formula".to_string(),
+                        ));
                     } else if let Expr::If(if_expr) = expr {
                         if let Some((cond, result_formula)) =
                             self.translate_if_with_early_return(if_expr, vars)?
@@ -2216,6 +2479,11 @@ impl Z3Translator {
                     }
                 }
                 Stmt::Expr(expr, None) => {
+                    if matches!(expr, Expr::While(_) | Expr::Loop(_)) {
+                        return Err(TranslationError::UnsupportedExpression(
+                            "while loop is not the formula".to_string(),
+                        ));
+                    }
                     // For non-last if-expressions (guard patterns like `if bad { return Err }`),
                     // capture the Err-guard condition so the Ok path has `!bad` as a constraint.
                     // The last Stmt::Expr(_, None) is the function's return value and is handled
@@ -2224,8 +2492,9 @@ impl Z3Translator {
                     if !is_last {
                         if let Expr::ForLoop(fl) = expr {
                             if !self.try_unroll_constant_for(fl, vars)? {
-                                let _ = self.translate_expr_with_vars(&fl.expr, vars);
-                                let _ = self.translate_block_to_result_formula(&fl.body, vars);
+                                return Err(TranslationError::UnsupportedExpression(
+                                    "for loop bound is not a literal span".to_string(),
+                                ));
                             }
                             continue;
                         }
@@ -2354,6 +2623,11 @@ impl Z3Translator {
         // so that translate_return_expr's internal `vars.get("result")` lookup finds the right var.
         let base_formula = if let Some(Stmt::Expr(expr, None)) = block.stmts.last() {
             match expr {
+                Expr::While(_) | Expr::Loop(_) => {
+                    return Err(TranslationError::UnsupportedExpression(
+                        "while loop is not the formula".to_string(),
+                    ));
+                }
                 // Complex forms handled by translate_return_expr — restore result_slot first.
                 Expr::Return(_) | Expr::If(_) | Expr::Call(_) => {
                     let saved_result = vars.get("result").cloned();
@@ -3181,6 +3455,26 @@ fn parse_lit_int(int_lit: &syn::LitInt) -> Option<i64> {
 /// Max trip count for bounded `for` unroll (`total_supply` is `0..64`).
 const MAX_FOR_UNROLL: i64 = 64;
 
+fn int_cast_width(ty: &syn::Type) -> Option<(u32, bool)> {
+    let syn::Type::Path(path) = ty else {
+        return None;
+    };
+    let name = path.path.segments.last()?.ident.to_string();
+    match name.as_str() {
+        "u8" => Some((8, false)),
+        "u16" => Some((16, false)),
+        "u32" => Some((32, false)),
+        "u64" => Some((64, false)),
+        "u128" => Some((128, false)),
+        "i8" => Some((8, true)),
+        "i16" => Some((16, true)),
+        "i32" => Some((32, true)),
+        "i64" => Some((64, true)),
+        "i128" => Some((128, true)),
+        _ => None,
+    }
+}
+
 fn constant_half_open_range(expr: &syn::Expr) -> Option<(i64, i64)> {
     let range = match expr {
         syn::Expr::Range(r) => r,
@@ -3270,15 +3564,13 @@ fn known_uninterpreted_function(name: &str) -> Option<(&'static str, Option<usiz
         "serialize_transaction" => Some(("serialize", Some(1))),
         "serialize_transaction_into" => Some(("serialize_into", Some(2))),
         "digest" => Some(("sha256_digest", Some(1))),
-        "hash256" => Some(("hash256", Some(1))),
         // Digest of the pair (witness root, reserved nonce). Not the 1-arg hash.
+        // `sha256_hash` / `hash256` / `double_sha256_hash` / `calculate_tx_id` are
+        // `sha256` composed in `translate_call`, not this table.
         "implied_hash" => Some(("hash256_pair", Some(2))),
         "to_le_bytes" => Some(("to_le_bytes", Some(1))),
         "with_capacity" => Some(("vec_with_capacity", Some(1))),
         "get_locktime_type" => Some(("locktime_type", Some(1))),
-        "sha256_hash" => Some(("hash256", Some(1))),
-        "double_sha256_hash" => Some(("hash256", Some(1))),
-        "calculate_tx_id" => Some(("hash256", Some(1))),
         "serialize_header" => Some(("serialize_header", Some(1))),
         // "total_supply" moved to known_int_returning_function to allow non-neg constraint injection.
         "calculate_transaction_size" => Some(("tx_size", Some(1))),
@@ -3314,8 +3606,10 @@ fn known_uninterpreted_function(name: &str) -> Option<(&'static str, Option<usiz
     }
 }
 
-/// Known functions that return Int/u64/i64. Returns fresh var name for the call result.
-/// Multiple calls to same function share a var (conservative; models "some value").
+/// Known functions that return Int/u64/i64. The string is the Z3 function name.
+/// Each call is that function applied to its arguments. The same name is also the
+/// `shared_vars` slot holding the latest application, so callee postconditions
+/// still bind `call_{fn}_result`.
 fn known_int_returning_function(name: &str) -> Option<String> {
     let base = name.split("::").last().unwrap_or(name);
     match base {
@@ -3390,6 +3684,147 @@ impl std::fmt::Display for TranslationError {
 }
 
 impl std::error::Error for TranslationError {}
+
+/// True when `left.saturating_mul(right)` on `u64` is the mathematical product.
+/// Both sides must already be numerals. A negative operand is `i64` saturation,
+/// which is a different function.
+fn signed_bounds(bits: u32) -> (i64, i64) {
+    if bits == 64 {
+        (i64::MIN, i64::MAX)
+    } else {
+        let max = ((1u64 << (bits - 1)) - 1) as i64;
+        (-max - 1, max)
+    }
+}
+
+fn unsigned_max_bv<'a>(ctx: &'a Context, bits: u32) -> BV<'a> {
+    BV::from_i64(ctx, -1, bits)
+}
+
+fn signed_max_bv<'a>(ctx: &'a Context, bits: u32) -> BV<'a> {
+    if bits <= 64 {
+        BV::from_i64(ctx, signed_bounds(bits).1, bits)
+    } else {
+        BV::from_i64(ctx, -1, bits).bvlshr(&BV::from_u64(ctx, 1, bits))
+    }
+}
+
+fn signed_min_bv<'a>(ctx: &'a Context, bits: u32) -> BV<'a> {
+    if bits <= 64 {
+        BV::from_i64(ctx, signed_bounds(bits).0, bits)
+    } else {
+        BV::from_u64(ctx, 1, bits).bvshl(&BV::from_u64(ctx, u64::from(bits - 1), bits))
+    }
+}
+
+fn lit_word(int_lit: &syn::LitInt) -> Option<(u32, bool)> {
+    match int_lit.suffix() {
+        "u8" => Some((8, false)),
+        "u16" => Some((16, false)),
+        "u32" => Some((32, false)),
+        "u64" => Some((64, false)),
+        "u128" => Some((128, false)),
+        "i8" => Some((8, true)),
+        "i16" => Some((16, true)),
+        "i32" => Some((32, true)),
+        "i64" => Some((64, true)),
+        "i128" => Some((128, true)),
+        _ => None,
+    }
+}
+
+fn local_name(pat: &syn::Pat) -> Option<String> {
+    match pat {
+        syn::Pat::Ident(ident) => Some(ident.ident.to_string()),
+        syn::Pat::Type(typed) => local_name(&typed.pat),
+        _ => None,
+    }
+}
+
+fn local_word(local: &syn::Local) -> Option<(u32, bool)> {
+    if let syn::Pat::Type(typed) = &local.pat {
+        if let Some(word) = int_cast_width(&typed.ty) {
+            return Some(word);
+        }
+    }
+    let init = local.init.as_ref()?;
+    let syn::Expr::Lit(lit) = &*init.expr else {
+        return None;
+    };
+    let syn::Lit::Int(int_lit) = &lit.lit else {
+        return None;
+    };
+    lit_word(int_lit)
+}
+
+fn is_u8_type(ty: &syn::Type) -> bool {
+    int_cast_width(ty) == Some((8, false))
+}
+
+fn is_byte_slot(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Reference(reference) => is_byte_slot(&reference.elem),
+        syn::Type::Slice(slice) => is_u8_type(&slice.elem),
+        syn::Type::Array(array) => is_u8_type(&array.elem),
+        syn::Type::Path(path) => {
+            let Some(seg) = path.path.segments.last() else {
+                return false;
+            };
+            if seg.ident != "Vec" {
+                return false;
+            }
+            let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+                return false;
+            };
+            match args.args.first() {
+                Some(syn::GenericArgument::Type(inner)) => is_u8_type(inner),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn is_byte_slot_pat(pat: &syn::Pat) -> bool {
+    match pat {
+        syn::Pat::Type(typed) => is_byte_slot(&typed.ty),
+        _ => false,
+    }
+}
+
+fn range_start_word(expr: &syn::Expr) -> Option<(u32, bool)> {
+    let range = match expr {
+        syn::Expr::Range(range) => range,
+        syn::Expr::Paren(paren) => {
+            let syn::Expr::Range(range) = &*paren.expr else {
+                return None;
+            };
+            range
+        }
+        _ => return None,
+    };
+    let start = range.start.as_ref()?;
+    let syn::Expr::Lit(lit) = start.as_ref() else {
+        return None;
+    };
+    let syn::Lit::Int(int_lit) = &lit.lit else {
+        return None;
+    };
+    lit_word(int_lit)
+}
+
+fn u64_saturating_mul_is_product(left: &Int<'_>, right: &Int<'_>) -> bool {
+    let Some(a) = left.simplify().as_i64() else {
+        return false;
+    };
+    let Some(b) = right.simplify().as_i64() else {
+        return false;
+    };
+    if a < 0 || b < 0 {
+        return false;
+    }
+    !(a as u64).overflowing_mul(b as u64).1
+}
 
 fn bv_add<'a>(
     left: &z3::ast::Dynamic<'a>,
@@ -3627,15 +4062,11 @@ mod tests {
             .translate_function_body(&mutant_fn, &mut mutant_vars)
             .unwrap()
             .expect("mutant body");
-        let mx = mutant_vars.get("x").unwrap().as_int().unwrap();
-        let mresult = mutant_vars.get("result").unwrap().as_int().unwrap();
-        let mwrapped = (mx.clone() * Int::from_i64(ctx, 2)).rem(&modulus);
-        let solver = Solver::new(ctx);
-        solver.assert(&mutant_body);
-        solver.assert(&mx.ge(&high));
-        solver.assert(&mx.lt(&modulus));
-        solver.assert(&mresult._eq(&mwrapped).not());
-        assert_eq!(solver.check(), SatResult::Sat);
+        let text = mutant_body.to_string();
+        assert!(
+            text.contains("bvmul"),
+            "u64 multiply is a 64-bit wrap, not unbounded Int: {text}"
+        );
     }
 
     #[test]

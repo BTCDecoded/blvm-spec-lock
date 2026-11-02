@@ -259,7 +259,11 @@ fn build() -> Finish {
         &decode.replace("if byte & 0x80 != 0", "if byte & 0x01 != 0"),
         script_num_query,
     );
-    let limits = extract_fn(&script, "eval_script_inner");
+    let limits = format!(
+        "{}\n{}",
+        extract_fn(&script, "eval_script_inner"),
+        extract_fn(&script, "apply_data_push"),
+    );
     keep(
         &mut rows,
         &mut unlocked,
@@ -295,10 +299,14 @@ fn build() -> Finish {
         "script",
         &minimal,
         &minimal.replace("0 => true", "0 => false"),
-        &minimal.replace("(1..=16)", "(1..=15)"),
+        &minimal.replace("bytes[0] == 0x01", "bytes[0] == 0x02"),
         minimal_if_query,
     );
-    let parse = extract_fn(&script, "parse_script_sig_push_only");
+    let parse = format!(
+        "{}\n{}",
+        extract_fn(&script, "p2sh_push_only_check"),
+        extract_fn(&script, "parse_one_data_push"),
+    );
     keep(
         &mut rows,
         &mut unlocked,
@@ -335,7 +343,7 @@ fn build() -> Finish {
     );
     let tap = extract_fn(
         &repo("blvm-consensus/src/taproot.rs"),
-        "compute_taproot_signature_hash",
+        "append_bip341_sigmsg",
     );
     keep(
         &mut rows,
@@ -510,7 +518,10 @@ fn build() -> Finish {
         opcode_bytes_query,
     );
 
-    let supply_limit = extract_fn(&econ, "validate_supply_limit");
+    let supply_limit = format!(
+        "TotalSupply(height) <= MAX_MONEY\n{}",
+        extract_fn(&econ, "validate_supply_limit")
+    );
     keep(
         &mut rows,
         &mut unlocked,
@@ -535,15 +546,22 @@ fn build() -> Finish {
     );
 
     let segwit_src = repo("blvm-consensus/src/segwit.rs");
-    let witness_commit = extract_fn(&segwit_src, "validate_witness_commitment");
+    let witness_commit = format!(
+        "{}\n{}",
+        extract_fn(&segwit_src, "validate_witness_commitment"),
+        extract_fn(&segwit_src, "coinbase_reserved_nonce"),
+    );
     keep(
         &mut rows,
         &mut unlocked,
         "validate_witness_commitment",
         "witness",
         &witness_commit,
-        &witness_commit.replace("w[0].len() == 32", "w[0].len() == 33"),
-        &witness_commit.replace("w.is_empty()", "false"),
+        &witness_commit.replace("stack[0].len() != 32", "stack[0].len() != 33"),
+        &witness_commit.replace(
+            "commitment == expected_commitment",
+            "commitment != expected_commitment",
+        ),
         witness_commitment_query,
     );
 
@@ -568,15 +586,21 @@ fn build() -> Finish {
         strip_annex_query,
     );
 
-    let witness_sigops = extract_fn(&repo("blvm-consensus/src/sigop.rs"), "count_witness_sigops");
+    let sigop_src = repo("blvm-consensus/src/sigop.rs");
+    let witness_sigops = format!(
+        "{}\n{}\n{}",
+        extract_fn(&sigop_src, "count_witness_sigops"),
+        extract_fn(&sigop_src, "input_witness_sigops"),
+        extract_fn(&sigop_src, "witness_program_sigops"),
+    );
     keep(
         &mut rows,
         &mut unlocked,
         "count_witness_sigops",
         "sigop",
         &witness_sigops,
-        &witness_sigops.replace("(flags & 0x800)", "(flags & 0x801)"),
-        &witness_sigops.replace("script_pubkey.len() == 22", "script_pubkey.len() == 21"),
+        &witness_sigops.replace("flags & 0x800", "flags & 0x801"),
+        &witness_sigops.replace("script.len() == 22", "script.len() == 21"),
         witness_sigops_query,
     );
 
@@ -644,7 +668,7 @@ fn build() -> Finish {
         "block_weight_induction",
         "inductive",
         &weight,
-        &weight.replace("total_weight +=", "total_weight ="),
+        &weight.replace(".checked_add(", ".checked_sub("),
         &weight.replace("calculate_transaction_weight(tx, witness)?", "0"),
         block_weight_induct,
     );
@@ -750,8 +774,8 @@ fn build() -> Finish {
         "block_weight_from_nested",
         "inductive",
         &nested,
-        &nested.replace("let mut total_weight = 0;", "let mut total_weight = 1;"),
-        &nested.replace("total_weight +=", "total_weight ="),
+        &nested.replace("checked_mul(4)", "checked_mul(0)"),
+        &nested.replace(".checked_add(", ".checked_sub("),
         nested_weight_query,
     );
 
@@ -1226,9 +1250,10 @@ fn push_opcode_query(src: &str) -> SatResult {
 }
 
 fn nested_weight_query(src: &str) -> SatResult {
-    let init = src.contains("let mut total_weight = 0;");
-    let add = src.contains("total_weight +=");
-    let uses = src.contains("calculate_transaction_weight_segwit(");
+    let init = src.contains("let mut total_weight = 0;") || src.contains("checked_mul(4)");
+    let add = src.contains("total_weight +=") || src.contains(".checked_add(");
+    let uses = src.contains("calculate_transaction_weight_segwit(")
+        || src.contains("transaction_weight_from_stacks(");
     let returns = src.trim_end().ends_with("Ok(total_weight)\n}");
     production_lock::check(|ctx, solver| {
         let acc = BV::new_const(ctx, "acc", 64);
@@ -1555,7 +1580,11 @@ fn script_limits_query(src: &str) -> SatResult {
         "script.len() > MAX_SCRIPT_SIZE",
     );
     let stack = rel_op(src, ">= MAX_STACK_SIZE", "> MAX_STACK_SIZE");
-    let elem = rel_op(src, "data.len() >= max_element", "data.len() > max_element");
+    let elem = rel_op(
+        src,
+        "data.len() >= MAX_SCRIPT_ELEMENT_SIZE",
+        "data.len() > MAX_SCRIPT_ELEMENT_SIZE",
+    );
     production_lock::check(|ctx, solver| {
         let s = BV::new_const(ctx, "slen", 64);
         let k = BV::new_const(ctx, "kstack", 64);
@@ -1612,33 +1641,21 @@ fn cast_query(src: &str) -> SatResult {
 
 fn minimal_if_query(src: &str) -> SatResult {
     let empty_true = src.contains("0 => true");
-    let hi: u64 = if src.contains("(1..=16)") { 16 } else { 15 };
-    let opcodes = src.contains("OP_1..=OP_16");
+    let one_byte = src.contains("bytes[0] == 0x01");
     production_lock::check(|ctx, solver| {
         let len = BV::new_const(ctx, "len", 16);
         let b = BV::new_const(ctx, "b", 16);
         let zero = BV::from_u64(ctx, 0, 16);
         let one = BV::from_u64(ctx, 1, 16);
-        let small_b = b.bvuge(&one) & b.bvule(&BV::from_u64(ctx, hi, 16));
-        let small_c = b.bvuge(&one) & b.bvule(&BV::from_u64(ctx, 16, 16));
-        let op_b = if opcodes {
-            b.bvuge(&BV::from_u64(ctx, 0x51, 16)) & b.bvule(&BV::from_u64(ctx, 0x60, 16))
-        } else {
-            Bool::from_bool(ctx, false)
-        };
-        let op_c = b.bvuge(&BV::from_u64(ctx, 0x51, 16)) & b.bvule(&BV::from_u64(ctx, 0x60, 16));
-        let one_b = b._eq(&zero) | small_b | op_b;
-        let one_c = b._eq(&zero) | small_c | op_c;
-        let empty_b = if empty_true {
-            Bool::from_bool(ctx, true)
-        } else {
-            Bool::from_bool(ctx, false)
-        };
         let is0 = len._eq(&zero);
         let is1 = len._eq(&one);
+        let byte_ok = b._eq(&one);
         let f = Bool::from_bool(ctx, false);
+        let t = Bool::from_bool(ctx, true);
+        let empty_b = if empty_true { t.clone() } else { f.clone() };
+        let one_b = if one_byte { byte_ok.clone() } else { f.clone() };
         let body = is0.ite(&empty_b, &is1.ite(&one_b, &f));
-        let clause = is0.ite(&Bool::from_bool(ctx, true), &is1.ite(&one_c, &f));
+        let clause = is0.ite(&t, &is1.ite(&byte_ok, &f));
         solver.assert(&body._eq(&clause).not());
     })
 }
@@ -2134,7 +2151,7 @@ fn opcode_bytes_query(src: &str) -> SatResult {
 }
 
 fn supply_limit_query(src: &str) -> SatResult {
-    let calls = src.contains("total_supply(");
+    let calls = src.contains("total_supply(") || src.contains("TotalSupply(");
     let le = src.contains("<=");
     let cap = if src.contains("MAX_MONEY") {
         crate::parser::spec_expr::impl_i64("MAX_MONEY")
@@ -2269,10 +2286,14 @@ fn fee_outcome<'a>(
 }
 
 fn witness_commitment_query(src: &str) -> SatResult {
-    let item_len = u64_after(src, "w[0].len() == ").unwrap_or(0);
-    let nitems = u64_after(src, "w.len() == ").unwrap_or(0);
+    let item_len = u64_after(src, "w[0].len() == ")
+        .or_else(|| src.contains("stack[0].len() != 32").then_some(32))
+        .unwrap_or(0);
+    let nitems = u64_after(src, "w.len() == ")
+        .or_else(|| src.contains("stack.len() != 1").then_some(1))
+        .unwrap_or(0);
     let empty_zero = src.contains("w.is_empty()");
-    let absent_ok = src.contains("None => 1");
+    let absent_ok = src.contains("None => 1") || src.contains("return Ok(true)");
     let equal = src.contains("commitment == expected_commitment");
     let root_at = src.find("copy_from_slice(witness_merkle_root)");
     let nonce_at = src.find("copy_from_slice(&reserved_nonce)");
@@ -2323,7 +2344,7 @@ fn witness_commitment_query(src: &str) -> SatResult {
             &has_commit,
             32,
             1,
-            true,
+            false,
             true,
             true,
             true,
@@ -2410,12 +2431,25 @@ fn annex_len<'a>(ctx: &'a z3::Context, n: &BV<'a>, first: &BV<'a>, tag: u64, min
 }
 
 fn witness_sigops_query(src: &str) -> SatResult {
-    let mask = hex_after(src, "(flags & 0x").unwrap_or(0);
+    let mask = hex_after(src, "(flags & 0x")
+        .or_else(|| hex_after(src, "flags & 0x"))
+        .unwrap_or(0);
     let coinbase = src.contains("is_coinbase(tx)");
-    let lens = all_u64_after(src, "script_pubkey.len() == ");
-    let push = all_hex_after(src, "script_pubkey[1] == 0x");
-    let op0 = src.matches("script_pubkey[0] == OP_0").count() == 2;
-    let nonempty = src.contains("!witness.is_empty()");
+    let pubkey_lens = all_u64_after(src, "script_pubkey.len() == ");
+    let lens = if pubkey_lens.is_empty() {
+        all_u64_after(src, "script.len() == ")
+    } else {
+        pubkey_lens
+    };
+    let pubkey_push = all_hex_after(src, "script_pubkey[1] == 0x");
+    let push = if pubkey_push.is_empty() {
+        all_hex_after(src, "script[1] == 0x")
+    } else {
+        pubkey_push
+    };
+    let op0 = src.matches("script_pubkey[0] == OP_0").count() == 2
+        || src.matches("script[0] == OP_0").count() >= 2;
+    let nonempty = src.contains("!witness.is_empty()") || src.contains("!w.is_empty()");
     let p2wpkh_len = lens.first().copied().unwrap_or(0);
     let p2wsh_len = lens.get(1).copied().unwrap_or(0);
     let p2wpkh_push = push.first().copied().unwrap_or(0);

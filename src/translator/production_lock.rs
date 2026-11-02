@@ -1024,6 +1024,9 @@ pub fn pow_double_hash_query(rounds: u32) -> SatResult {
 }
 
 /// CHECKSIG pushes the verifier result. A constant `true` or a negated `is_valid` is SAT.
+///
+/// The arm calls `eval_checksig_ecdsa`. That name is the entry. [`checksig_helper_query`]
+/// requires `verify_signature` inside the helper.
 pub fn checksig_query(src: &str) -> SatResult {
     let body = ast_body::analyze(src);
     let arm = ast_body::arm_named(&body.arms, "OP_CHECKSIG");
@@ -1045,6 +1048,7 @@ pub fn checksig_query(src: &str) -> SatResult {
                 || seg == "verify_ecdsa"
                 || seg == "verify_schnorr"
                 || seg == "verify_tapscript_schnorr_signature"
+                || seg == "eval_checksig_ecdsa"
         })
     });
     check(|ctx, solver| {
@@ -1057,6 +1061,21 @@ pub fn checksig_query(src: &str) -> SatResult {
             Bool::from_bool(ctx, true)
         };
         solver.assert(&result._eq(&verifier).not());
+    })
+}
+
+/// `eval_checksig_ecdsa` calls `verify_signature`. Removing that call is SAT.
+pub fn checksig_helper_query(src: &str) -> SatResult {
+    let body = ast_body::analyze(src);
+    let calls_verifier = body.calls.iter().any(|call| {
+        call.path
+            .iter()
+            .any(|seg| seg == "verify_signature")
+    });
+    check(|ctx, solver| {
+        let called = Bool::from_bool(ctx, calls_verifier);
+        let required = Bool::from_bool(ctx, true);
+        solver.assert(&called._eq(&required).not());
     })
 }
 
@@ -5186,12 +5205,33 @@ mod tests {
             "verify_p2wpkh_inline",
             "verify_p2pkh_inline",
             "verify_p2pk_inline",
+            "finish_p2wpkh_ecdsa",
+            "verify_p2sh_p2pkh_redeem",
+            "verify_p2sh_p2pk_redeem",
         ] {
             if ast_body::call_named(&parsed.calls, callee) {
-                return calls_verifier(&extract_fn(file, callee));
+                let next = extract_fn(file, callee);
+                if calls_verifier(&next) {
+                    return true;
+                }
+                return fast_path_calls_verifier(file, &next);
             }
         }
         false
+    }
+
+    #[test]
+    fn p2wpkh_tail_still_reaches_verify_signature() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let script = consensus_file("script/mod.rs");
+        let fast = extract_fn(&script, "try_verify_p2wpkh_fast_path");
+        assert!(fast_path_calls_verifier(&script, &fast));
+        let skipped = fast.replace("verify_p2wpkh_inline(", "/*gone*/(");
+        assert!(!fast_path_calls_verifier(&script, &skipped));
+        let nested = extract_fn(&script, "verify_p2wpkh_in_p2sh_inline");
+        assert!(fast_path_calls_verifier(&script, &nested));
     }
 
     #[test]
@@ -5249,6 +5289,11 @@ mod tests {
         );
         assert_ne!(flipped, checksig);
         assert_eq!(checksig_query(&flipped), SatResult::Sat);
+        let helper = extract_fn(&script, "eval_checksig_ecdsa");
+        assert_eq!(checksig_helper_query(&helper), SatResult::Unsat);
+        let dropped_verify = helper.replace("verify_signature(", "verify_signature_skipped(");
+        assert_ne!(dropped_verify, helper);
+        assert_eq!(checksig_helper_query(&dropped_verify), SatResult::Sat);
 
         let p2pk = extract_fn(&script, "try_verify_p2pk_fast_path");
         assert!(ast_body::call_named(
@@ -5283,9 +5328,11 @@ mod tests {
                 SatResult::Sat
             );
             let skipped = body
-                .replace("verify_signature(", "/*gone*/(")
-                .replace("verify_ecdsa_direct(", "/*gone*/(")
-                .replace("verify_p2wpkh_inline(", "/*gone*/(");
+                .replace("verify_signature(", "verify_signature_skipped(")
+                .replace("verify_ecdsa_direct(", "verify_ecdsa_direct_skipped(")
+                .replace("verify_p2wpkh_inline(", "verify_p2wpkh_inline_skipped(")
+                .replace("verify_p2sh_p2pkh_redeem(", "verify_p2sh_p2pkh_redeem_skipped(")
+                .replace("verify_p2sh_p2pk_redeem(", "verify_p2sh_p2pk_redeem_skipped(");
             assert!(!fast_path_calls_verifier(&script, &skipped));
             assert_eq!(fast_path_query(true, false), SatResult::Sat);
         }
@@ -5814,7 +5861,7 @@ mod tests {
             SatResult::Sat
         );
         assert_eq!(
-            vsize_query(&vsize.replace("div_ceil(4)", "/ 4"), 5),
+            vsize_query(&vsize.replace("weight.div_ceil(4)", "weight / 4"), 5),
             SatResult::Sat
         );
 

@@ -429,7 +429,7 @@ fn legacy_rows() -> Vec<LockRow> {
         "threshold",
         &program,
         &program.replace("SEGWIT_P2WPKH_LENGTH", "SEGWIT_P2WSH_LENGTH"),
-        &program.replace("TAPROOT_PROGRAM_LENGTH", "0"),
+        &program.replace("== TAPROOT_PROGRAM_LENGTH", "== 0"),
         production_lock::witness_program_query,
     ));
 
@@ -493,7 +493,7 @@ fn legacy_rows() -> Vec<LockRow> {
 
     let script = repo("blvm-consensus/src/script/mod.rs");
     for (name, gate) in [
-        ("try_verify_p2pk_fast_path", "len != 35 && len != 67"),
+        ("try_verify_p2pk_fast_path", "canonical_p2pk_pubkey"),
         ("try_verify_p2pkh_fast_path", "script_pubkey.len() != 25"),
         ("try_verify_p2sh_fast_path", "script_pubkey.len() != 23"),
         ("try_verify_p2wpkh_fast_path", "script_pubkey.len() != 22"),
@@ -579,6 +579,12 @@ fn tx_facts(fast_src: &str, check_src: &str) -> ProductionFacts {
     main
 }
 
+fn mentions_call(body: &str, callee: &str) -> bool {
+    let needle = format!("{callee}(");
+    body.match_indices(&needle)
+        .any(|(at, _)| !body[..at].ends_with("fn "))
+}
+
 fn fast_calls(file: &str, body: &str) -> bool {
     if body.contains("verify_signature(")
         || body.contains("verify_ecdsa_direct(")
@@ -590,15 +596,12 @@ fn fast_calls(file: &str, body: &str) -> bool {
         "verify_p2wpkh_inline",
         "verify_p2pkh_inline",
         "verify_p2pk_inline",
+        "finish_p2wpkh_ecdsa",
+        "verify_p2sh_p2pkh_redeem",
+        "verify_p2sh_p2pk_redeem",
     ] {
-        if body.contains(&format!("{callee}(")) {
-            let c = extract_fn(file, callee);
-            if c.contains("verify_signature(")
-                || c.contains("verify_ecdsa_direct(")
-                || c.contains("verify_schnorr")
-            {
-                return true;
-            }
+        if mentions_call(body, callee) {
+            return fast_calls(file, &extract_fn(file, callee));
         }
     }
     false
@@ -937,8 +940,8 @@ fn threshold_rows() -> Vec<LockRow> {
             &act,
             &act.replace("TAPROOT_ACTIVATION_MAINNET", "TAPROOT_ACTIVATION_TESTNET"),
             &act.replace(
-                "network == Network::Signet {\n        1\n",
-                "network == Network::Signet {\n        2\n",
+                "network == Network::Signet || network == Network::Testnet4 {\n        1\n",
+                "network == Network::Signet || network == Network::Testnet4 {\n        2\n",
             ),
             activation_map_query,
         ),
@@ -954,7 +957,10 @@ fn threshold_rows() -> Vec<LockRow> {
             "check_bip34",
             "threshold",
             &bip34,
-            &bip34.replace("script_sig.is_empty()", "false && script_sig.is_empty()"),
+            &bip34.replace(
+                "script_sig_starts_with_height",
+                "false && script_sig_starts_with_height",
+            ),
             &bip34.replace("!activation.is_fork_active(ForkId::Bip34, height)", "false"),
             bip34_query,
         ),
@@ -1099,6 +1105,12 @@ fn first_int(src: &str) -> Option<u64> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i].is_ascii_digit() {
+            if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                continue;
+            }
             let mut n = 0u64;
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 n = n * 10 + u64::from(bytes[i] - b'0');
@@ -1150,13 +1162,13 @@ fn bip30_query(src: &str) -> SatResult {
 
 fn bip34_query(src: &str) -> SatResult {
     let skips = src.contains("!activation.is_fork_active");
-    let empty_rejects =
-        src.contains("script_sig.is_empty()") && !src.contains("false && script_sig.is_empty()");
+    let checks = src.contains("script_sig_starts_with_height")
+        && !src.contains("false && script_sig_starts_with_height");
     production_lock::check(|ctx, solver| {
         let active = Bool::new_const(ctx, "active");
-        let empty = Bool::new_const(ctx, "empty");
-        let rejected = if empty_rejects {
-            empty.clone()
+        let height_ok = Bool::new_const(ctx, "height_ok");
+        let rejected = if checks {
+            height_ok.not()
         } else {
             Bool::from_bool(ctx, false)
         };
@@ -1165,7 +1177,7 @@ fn bip34_query(src: &str) -> SatResult {
         } else {
             rejected
         };
-        let clause_reject = active & empty;
+        let clause_reject = active & height_ok.not();
         solver.assert(&body_reject._eq(&clause_reject).not());
     })
 }
@@ -1394,9 +1406,10 @@ fn preimage_rows() -> Vec<LockRow> {
     let hash = repo("blvm-consensus/src/transaction_hash.rs");
     let legacy = extract_fn(&hash, "compute_legacy_sighash_nocache");
     let bip143 = extract_fn(&hash, "build_bip143_preimage");
+    // The BIP341 layout bytes live in the helper. The census name stays the public function.
     let tap = extract_fn(
         &repo("blvm-consensus/src/taproot.rs"),
-        "compute_taproot_signature_hash",
+        "append_bip341_sigmsg",
     );
     let header = repo("blvm-primitives/src/serialization/block.rs");
     let ser = extract_fn(&header, "serialize_block_header");
@@ -1550,7 +1563,7 @@ const TAPROOT: &[(&str, &str)] = &[
     ("spk", "sha_scriptpubkeys"),
     ("seqs", "sha_sequences"),
     ("outputs", "sha_outputs"),
-    ("spend", "spend_type"),
+    ("spend", "sigmsg.push(spend_type)"),
     ("index", "input_index as u32"),
 ];
 
@@ -1715,7 +1728,7 @@ fn multisig_rows() -> Vec<LockRow> {
         [
             "checkmultisig_window(stack, m, false)",
             "checkmultisig_window(&pushes, m, false)",
-            "checkmultisig_window(&stack, m, true)",
+            "checkmultisig_window(items, m, true)",
             "let stack = &pushes[..pushes.len() - 1];",
         ]
         .into_iter()
@@ -1918,7 +1931,7 @@ fn checkmultisig_window_query(src: &str) -> SatResult {
     let no_prefix = !body.contains("skip(1)") && !body.contains("[1..]");
     let legacy_p2sh = src.contains("checkmultisig_window(stack, m, false)");
     let legacy_bare = src.contains("checkmultisig_window(&pushes, m, false)");
-    let witness = src.contains("checkmultisig_window(&stack, m, true)");
+    let witness = src.contains("checkmultisig_window(items, m, true)");
     let redeem_is_not_a_signature = src.contains("let stack = &pushes[..pushes.len() - 1];");
     let every_signature = src.contains("p.sig_empty.len() == p.m as usize && valid_sigs == p.m");
     let ok = top_m
@@ -2020,17 +2033,25 @@ fn opcode_rows() -> Vec<LockRow> {
         });
     }
     let full = extract_fn(&script, "execute_opcode_with_context_full");
-    let arm = full.split("OP_CHECKSIG =>").nth(1).unwrap_or(&full);
     rows.push(row(
         "OP_CHECKSIG_verifier",
         "opcode",
-        arm,
-        &arm.replace(
-            "if is_valid { 1 } else { 0 }",
-            "if is_valid { 0 } else { 1 }",
+        &full,
+        &full.replace(
+            "script_bool_bytes(is_valid)",
+            "script_bool_bytes(!is_valid)",
         ),
-        &arm.replace("if is_valid { 1 } else { 0 }", "if true { 1 } else { 0 }"),
+        &full.replace("script_bool_bytes(is_valid)", "script_bool_bytes(true)"),
         production_lock::checksig_query,
+    ));
+    let helper = extract_fn(&script, "eval_checksig_ecdsa");
+    rows.push(row(
+        "eval_checksig_ecdsa",
+        "opcode",
+        &helper,
+        &helper.replace("verify_signature(", "verify_signature_skipped("),
+        &helper.replace("signature::verify_signature(", "signature::verify_signature_skipped("),
+        production_lock::checksig_helper_query,
     ));
     rows
 }
@@ -2294,7 +2315,9 @@ fn classify(src: &str) -> Effect {
     let step = step_of(src);
     let mut e = if src.contains("OkTrueBypass") {
         effect(K_NOP, 0)
-    } else if src.contains("script_num_encode(n + ") {
+    } else if src.contains("script_num_encode(n + ")
+        || (src.contains("eval_checksig_tapscript") && src.contains("n + 1"))
+    {
         let arg = if src.contains("n + 2") {
             2
         } else if src.contains("n + 0") {
@@ -2363,6 +2386,7 @@ fn classify(src: &str) -> Effect {
             step,
         }
     } else if src.contains("verify_signature(")
+        || src.contains("eval_checksig_ecdsa(")
         || src.contains("verify_tapscript_schnorr")
         || src.contains("verify_schnorr")
     {
@@ -2530,6 +2554,8 @@ fn classify(src: &str) -> Effect {
         effect(K_FAIL, 0)
     } else if src.contains("Ok(true)") && !src.contains("stack.push") && !src.contains("verify_") {
         effect(K_NOP, 0)
+    } else if src.contains("upgradable_nop(") {
+        effect(K_NOP, 0)
     } else {
         effect(K_UNKNOWN, min)
     };
@@ -2620,6 +2646,12 @@ fn boundary_patch(src: &str) -> String {
 
 fn predicate_patch(name: &str, src: &str) -> String {
     let before = classify(src);
+    if src.contains("eval_checksig_ecdsa(") {
+        let patched = src.replace("eval_checksig_ecdsa(", "eval_checksig_gone(");
+        if classify(&patched) != before {
+            return patched;
+        }
+    }
     if src.contains("verify_") {
         let patched = src.replace("verify_", "gone_");
         if classify(&patched) != before {
@@ -2794,31 +2826,38 @@ fn opcode_names(src: &str) -> Vec<String> {
 }
 
 fn best_arm(src: &str, name: &str) -> Option<String> {
-    let mut best: Option<(i32, String)> = None;
     if (1..=16).any(|n| name == format!("OP_{n}")) {
         if let Some(i) = src.find("OP_1..=OP_16 =>") {
             let arm = slice_arm(&src[i..]);
             return Some(arm);
         }
     }
-    let markers = [format!("{name} =>"), format!("opcode == {name}")];
-    for marker in markers {
-        let mut from = 0;
-        while let Some(rel) = src[from..].find(&marker) {
-            let at = from + rel;
-            let end = at + marker.len();
-            let next = src[end..].chars().next();
-            if next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
-                from = end;
-                continue;
-            }
-            let arm = slice_arm(&src[at..]);
-            let s = arm_score(&arm);
-            if best.as_ref().map(|(b, _)| s >= *b).unwrap_or(true) {
-                best = Some((s, arm));
-            }
-            from = at + marker.len();
+    // A `NAME =>` arm is the opcode. `opcode == NAME` also matches guards and
+    // helper predicates, and those slices outscore the real arm.
+    let arrow = format!("{name} =>");
+    if let Some(arm) = best_marker(src, &arrow) {
+        return Some(arm);
+    }
+    best_marker(src, &format!("opcode == {name}"))
+}
+
+fn best_marker(src: &str, marker: &str) -> Option<String> {
+    let mut best: Option<(i32, String)> = None;
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(marker) {
+        let at = from + rel;
+        let end = at + marker.len();
+        let next = src[end..].chars().next();
+        if next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+            from = end;
+            continue;
         }
+        let arm = slice_arm(&src[at..]);
+        let s = arm_score(&arm);
+        if best.as_ref().map(|(b, _)| s >= *b).unwrap_or(true) {
+            best = Some((s, arm));
+        }
+        from = at + marker.len();
     }
     best.map(|(_, a)| a)
 }
@@ -2843,6 +2882,9 @@ fn arm_score(text: &str) -> i32 {
         || text.contains("is_sequence_disabled")
     {
         s += 40;
+    }
+    if text.contains("eval_checksig") {
+        s += 50;
     }
     if text.contains("stack.push") || text.contains("stack.pop") || text.contains("control_stack") {
         s += 40;
@@ -2895,7 +2937,7 @@ fn slice_arm(rest: &str) -> String {
             if started && depth == 0 {
                 return rest[..=i].to_string();
             }
-        } else if b[i] == b',' && depth == 0 && paren == 0 && !started {
+        } else if (b[i] == b',' || b[i] == b';') && depth == 0 && paren == 0 && !started {
             return rest[..=i].to_string();
         }
         i += 1;
@@ -2988,7 +3030,7 @@ fn fold_rows() -> Vec<LockRow> {
             "calculate_block_weight",
             "fold",
             &weight,
-            &weight.replace("total_weight +=", "total_weight ="),
+            &weight.replace(".checked_add(", ".checked_sub("),
             &weight.replace("calculate_transaction_weight(tx, witness)?", "0"),
             block_weight_query,
         ),
@@ -3062,9 +3104,9 @@ fn sigop_query(src: &str) -> SatResult {
 }
 
 fn block_weight_query(src: &str) -> SatResult {
-    let accumulates = src.contains("total_weight +=");
+    let accumulates = src.contains("total_weight +=") || src.contains(".checked_add(");
     let uses = src.contains("calculate_transaction_weight");
-    let init = zero_init(src, "calculate_block_weight", "let mut total_weight = 0;");
+    let base = src.contains("let mut total_weight = 0;") || src.contains("checked_mul(4)");
     production_lock::check(|ctx, solver| {
         let acc = BV::new_const(ctx, "acc", 64);
         let w = BV::new_const(ctx, "w", 64);
@@ -3077,7 +3119,7 @@ fn block_weight_query(src: &str) -> SatResult {
         } else {
             acc.clone()
         };
-        let base_ok = BV::from_u64(ctx, init, 64)._eq(&BV::from_u64(ctx, 0, 64));
+        let base_ok = Bool::from_bool(ctx, base);
         solver.assert(&(base_ok & body._eq(&acc.bvadd(&w))).not());
     })
 }
@@ -3183,6 +3225,7 @@ pub const CENSUS: &[&str] = &[
     "build_signet_solution_txs",
     "push_advance",
     "OP_CHECKSIG_verifier",
+    "eval_checksig_ecdsa",
     "OP_DUP",
     "OP_EQUAL",
     "OP_EQUALVERIFY",
@@ -3373,6 +3416,55 @@ mod tests {
             assert_eq!(row.boundary, SatResult::Sat, "{} boundary", row.function);
             assert_eq!(row.predicate, SatResult::Sat, "{} predicate", row.function);
         }
+    }
+
+    #[test]
+    fn taproot_sigmsg_bytes_stay_in_append_bip341_sigmsg() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let tap = extract_fn(
+            &repo("blvm-consensus/src/taproot.rs"),
+            "append_bip341_sigmsg",
+        );
+        for needle in [
+            "// epoch",
+            "sigmsg.push(0x00u8)",
+            "sigmsg.push(sighash_type)",
+            "(tx.version as u32).to_le_bytes()",
+            "(tx.lock_time as u32).to_le_bytes()",
+            "sha_prevouts",
+            "sha_amounts",
+            "sha_scriptpubkeys",
+            "sha_sequences",
+            "sha_outputs",
+            "sigmsg.push(spend_type)",
+            "input_index as u32",
+            "sighash_type & 0x80",
+        ] {
+            assert!(tap.contains(needle), "{needle}");
+        }
+        assert!(!tap.contains("to_be_bytes"));
+        assert_ne!(tap.replace("sigmsg.push(0x00u8);\n", ""), tap);
+        assert_ne!(
+            tap.replacen(
+                "(tx.version as u32).to_le_bytes()",
+                "(tx.version as u32).to_be_bytes()",
+                1,
+            ),
+            tap
+        );
+        let key = extract_fn(
+            &repo("blvm-consensus/src/taproot.rs"),
+            "compute_taproot_signature_hash",
+        );
+        assert!(key.contains("prevout_values.len() < tx.inputs.len()"));
+        let script = extract_fn(
+            &repo("blvm-consensus/src/taproot.rs"),
+            "compute_tapscript_signature_hash",
+        );
+        assert!(!script.contains("prevout_values.len() < tx.inputs.len()"));
+        assert!(script.contains("tap_leaf_hash"));
     }
 
     #[test]

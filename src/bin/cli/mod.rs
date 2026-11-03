@@ -11,6 +11,7 @@ pub mod lean_census;
 pub mod lean_diff;
 pub mod lean_evidence;
 pub mod lean_gate;
+pub mod lean_negative;
 pub mod output;
 pub mod spec_enrich;
 pub mod verify;

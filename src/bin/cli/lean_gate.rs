@@ -22,6 +22,7 @@ pub struct AnchorLink {
     pub module: String,
     pub classification: String,
     pub statement_expr: Option<String>,
+    pub definition: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,6 +212,10 @@ pub fn load_links(text: &str) -> Result<Vec<AnchorLink>, String> {
             .get("statement_expr")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        let definition = item
+            .get("definition")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         links.push(AnchorLink {
             function,
             row_id,
@@ -218,6 +223,7 @@ pub fn load_links(text: &str) -> Result<Vec<AnchorLink>, String> {
             module,
             classification,
             statement_expr,
+            definition,
         });
     }
     Ok(links)
@@ -253,6 +259,14 @@ pub fn overlay_for_links(
             return Err(format!("{} contains {hit}", link.declaration));
         }
         declaration_present(&source, &link.declaration)?;
+        if let Some(definition) = &link.definition {
+            if !source.contains(definition) {
+                return Err(format!(
+                    "{} does not mention {definition}",
+                    link.declaration
+                ));
+            }
+        }
         build(&link.module)?;
         let found = axioms_of(link)?;
         let allow = allowlist();

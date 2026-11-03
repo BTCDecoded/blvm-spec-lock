@@ -319,6 +319,9 @@ enum Commands {
         #[arg(long)]
         crate_path: Option<PathBuf>,
     },
+
+    /// Run the pinned btc-lean static gates and cover only links that pass.
+    LeanGate,
 }
 
 #[derive(Clone, Debug)]
@@ -457,6 +460,7 @@ fn main() {
             output,
             crate_path: _,
         } => handle_extract_property_tests(resolve_spec_paths(spec_path), bindings_path, output),
+        Commands::LeanGate => handle_lean_gate(),
     };
 
     std::process::exit(exit_code);
@@ -962,7 +966,14 @@ fn handle_verify(args: VerifyArgs) -> i32 {
         results.push((func.clone(), result));
     }
 
-    let overlay = cli::lean_evidence::EvidenceOverlay::empty();
+    let (overlay, lean_failed) = match cli::lean_gate::locate_checkout() {
+        Err(err) => (cli::lean_evidence::EvidenceOverlay::empty(), Some(err)),
+        Ok(None) => (cli::lean_evidence::EvidenceOverlay::empty(), None),
+        Ok(Some(root)) => match cli::lean_gate::run_required(&root) {
+            Ok(overlay) => (overlay, None),
+            Err(err) => (cli::lean_evidence::EvidenceOverlay::empty(), Some(err)),
+        },
+    };
 
     // Format and output results
     let format_str = match format {
@@ -1017,10 +1028,40 @@ fn handle_verify(args: VerifyArgs) -> i32 {
         .iter()
         .any(|(_, r)| matches!(r, cli::verify::VerificationResult::NoContracts { .. }));
 
-    if has_failures || has_no_contracts {
+    if let Some(ref err) = lean_failed {
+        eprintln!("lean gate: {err}");
+    }
+
+    if has_failures || has_no_contracts || lean_failed.is_some() {
         1
     } else {
         0
+    }
+}
+
+fn handle_lean_gate() -> i32 {
+    match cli::lean_gate::locate_checkout() {
+        Err(err) => {
+            eprintln!("lean gate: {err}");
+            1
+        }
+        Ok(None) => {
+            eprintln!("lean gate: btc-lean checkout not found");
+            1
+        }
+        Ok(Some(root)) => match cli::lean_gate::run_required(&root) {
+            Ok(overlay) => {
+                println!(
+                    "lean gate: static gates passed; {} anchor(s) lean-covered",
+                    overlay.len()
+                );
+                0
+            }
+            Err(err) => {
+                eprintln!("lean gate: {err}");
+                1
+            }
+        },
     }
 }
 

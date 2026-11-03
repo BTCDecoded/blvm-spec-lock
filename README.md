@@ -7,7 +7,7 @@
 
 Purpose-built formal verification tool for Bitcoin Commons.
 
-**Locking mechanism**: See [docs/LOCKING_MECHANISM.md](docs/LOCKING_MECHANISM.md) for the full lifecycle (discover → enrich → verify), attribute syntax, status semantics, and **exit codes** (Partial is non-fatal unless **`--strict`**). **Spec wording**: See [SPEC_WORDING.md](SPEC_WORDING.md) for parseable condition patterns. **How to annotate**: See [docs/ANNOTATION_GUIDE.md](docs/ANNOTATION_GUIDE.md) for adding `#[spec_locked]` to new functions. **Verify JSON (CI / attestation)**: See [docs/VERIFY_JSON.md](docs/VERIFY_JSON.md) (`report_format` **1**, `--json-out`, **`results[].anchor_kind`** — **`function` \| `formula` \| `constant`**, optional **`results[].detail`** — **`failure_kind`** on **`failed`**, **`partial_reason`** on **`partial`** or on **`solver_unknown`** **`failed`** rows as **`z3_timeout`** vs **`z3_unknown`**). **Dashboard `jq` examples** (summaries, anchor kinds): [docs/VERIFY_JSON.md — `jq` recipes](docs/VERIFY_JSON.md#jq-recipes); nested **`formula_registry`** (merged **`F_*`** gate) matches **`schemas/formula_verify_report_v1.json`** when **`verify`** runs with **`--spec-path`**.
+**Locking mechanism**: See [docs/LOCKING_MECHANISM.md](docs/LOCKING_MECHANISM.md) for the full lifecycle (discover → enrich → verify), attribute syntax, status semantics, and **exit codes** (Partial is non-fatal unless **`--strict`**). **Spec wording**: See [SPEC_WORDING.md](SPEC_WORDING.md) for parseable condition patterns. **How to annotate**: See [docs/ANNOTATION_GUIDE.md](docs/ANNOTATION_GUIDE.md) for adding `#[spec_locked]` to new functions. **Verify JSON (CI / attestation)**: See [docs/VERIFY_JSON.md](docs/VERIFY_JSON.md) (`report_format` **2**, `--json-out`, **`results[].anchor_kind`** — **`function` \| `formula` \| `constant`**, optional **`results[].detail`** — **`failure_kind`** on **`failed`**, **`partial_reason`** on **`partial`** or on **`solver_unknown`** **`failed`** rows as **`z3_timeout`** vs **`z3_unknown`**). **Dashboard `jq` examples** (summaries, anchor kinds): [docs/VERIFY_JSON.md — `jq` recipes](docs/VERIFY_JSON.md#jq-recipes); nested **`formula_registry`** (merged **`F_*`** gate) matches **`schemas/formula_verify_report_v1.json`** when **`verify`** runs with **`--spec-path`**.
 
 ## Overview
 
@@ -15,6 +15,7 @@ BLVM Spec Lock annotates Bitcoin consensus functions and Z3-checks their contrac
 - Linking Rust functions to Orange Paper specifications via `#[spec_locked]` attributes
 - Verifying contracts (`#[requires]` and `#[ensures]`) using static analysis and Z3
 - Providing a `cargo test`-like CLI experience
+- Reporting an evidence set per anchor (`z3_contract`, `lean_formula`, `lean_model`, `differential`, `none`). See [docs/btc-lean/EVIDENCE.md](docs/btc-lean/EVIDENCE.md). `verify` JSON is `report_format` 2.
 
 ## Installation
 

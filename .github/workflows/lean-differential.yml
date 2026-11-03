@@ -1,0 +1,25 @@
+name: Lean differential
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    name: Hash-checked vector comparison
+    runs-on: [self-hosted, Linux, X64, builds]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: BTCDecoded/rust-ci/install-rust-toolchain@main
+
+      - name: Download the pinned data archive
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/btc-lean-data.tar.gz" \
+            https://github.com/Rob1Ham/btc-lean/releases/download/data-2026.10.17/btc-lean-data-2026.10.17.tar.gz
+
+      - name: Verify the digest before use
+        run: cargo run --bin cargo-spec-lock -- lean-differential --archive "$RUNNER_TEMP/btc-lean-data.tar.gz"

@@ -166,6 +166,16 @@ rules:
 "#;
 
     #[test]
+    fn excluded_ids_are_fixed() {
+        assert_eq!(RESIDUAL.len(), 18);
+        assert!(RESIDUAL.contains(&"BLK-008"));
+        assert!(RESIDUAL.contains(&"TXV-069"));
+        assert_eq!(OUT_OF_LEDGER.len(), 6);
+        assert!(OUT_OF_LEDGER.contains(&"INV-046"));
+        assert!(OUT_OF_LEDGER.contains(&"INV-138"));
+    }
+
+    #[test]
     fn sample_rows_have_one_class_each() {
         let rows = parse_rules(SAMPLE).unwrap();
         assert_eq!(rows.len(), 5);

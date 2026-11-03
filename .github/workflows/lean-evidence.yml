@@ -26,7 +26,7 @@ jobs:
         uses: BTCDecoded/rust-ci/install-rust-toolchain@main
 
       - name: Negative tests
-        run: cargo test --bin cargo-spec-lock -- fails_the_gate residual_row cited_module
+        run: cargo test --bin cargo-spec-lock -- lean_
 
       - name: Static gates at the pin
         env:

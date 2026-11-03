@@ -10,6 +10,7 @@ use super::lean_census::{self, CensusRow, RowClass};
 use super::lean_evidence::{AnchorLean, EvidenceOverlay, LeanStatus};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const PIN: &str = include_str!("../../../docs/btc-lean/PIN");
 pub const ALLOWLIST: &str = include_str!("../../../docs/btc-lean/axiom-allowlist.txt");
@@ -113,6 +114,124 @@ pub fn formula_defeq(outcome: Defeq) -> Result<(), String> {
             "Lean elaborator is not available; a lean_formula anchor stays uncovered".to_string(),
         ),
     }
+}
+
+/// Outcome of starting `lake env lean` on a probe that is not stored in the checkout.
+#[derive(Clone, Debug)]
+pub enum ProbeStart {
+    Missing,
+    Ran {
+        code: i32,
+        stdout: String,
+        stderr: String,
+    },
+}
+
+pub fn axiom_probe_source(module: &str, declaration: &str) -> Result<String, String> {
+    lean_name(module)?;
+    lean_name(declaration)?;
+    Ok(format!("import {module}\n#print axioms {declaration}\n"))
+}
+
+pub fn defeq_probe_source(
+    module: &str,
+    declaration: &str,
+    emitted: &str,
+) -> Result<String, String> {
+    lean_name(module)?;
+    lean_name(declaration)?;
+    emitted_is_probe_safe(emitted)?;
+    Ok(format!(
+        "import {module}\nexample : ({emitted}) := {declaration}\n"
+    ))
+}
+
+pub fn defeq_from_probe(start: ProbeStart) -> Result<Defeq, String> {
+    match start {
+        ProbeStart::Missing => Ok(Defeq::Unavailable),
+        ProbeStart::Ran { code: 0, .. } => Ok(Defeq::Equal),
+        ProbeStart::Ran { stderr, .. } if stderr.to_lowercase().contains("type mismatch") => {
+            Ok(Defeq::Different)
+        }
+        ProbeStart::Ran { .. } => {
+            Err("elaborator could not check the cited declaration".to_string())
+        }
+    }
+}
+
+pub fn axioms_from_probe(start: ProbeStart, declaration: &str) -> Result<Vec<String>, String> {
+    match start {
+        ProbeStart::Missing => Err(
+            "Lean elaborator is not available; the cited declaration stays uncovered".to_string(),
+        ),
+        ProbeStart::Ran {
+            code: 0, stdout, ..
+        } => axiom_line(&stdout, declaration),
+        ProbeStart::Ran { .. } => Err("elaborator could not print axioms".to_string()),
+    }
+}
+
+pub fn axiom_line(text: &str, declaration: &str) -> Result<Vec<String>, String> {
+    let Some(line) = text.lines().find(|line| {
+        line.contains(&format!("'{declaration}'"))
+            && (line.contains("depends on axioms")
+                || line.contains("does not depend on any axioms"))
+    }) else {
+        return Err(format!("{declaration} has no #print axioms line"));
+    };
+    if line.contains("does not depend on any axioms") {
+        return Ok(Vec::new());
+    }
+    let names = parse_print_axioms(line);
+    if names.is_empty() {
+        return Err(format!("{declaration} axiom line has no names"));
+    }
+    Ok(names)
+}
+
+pub fn same_axioms(live: &[String], manifest: &[String]) -> bool {
+    let mut live = live.to_vec();
+    let mut manifest = manifest.to_vec();
+    live.sort();
+    manifest.sort();
+    live == manifest
+}
+
+fn lean_name(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("lean name is empty".to_string());
+    }
+    for part in value.split('.') {
+        let mut chars = part.chars();
+        let Some(first) = chars.next() else {
+            return Err("lean name is not an identifier".to_string());
+        };
+        if !first.is_ascii_alphabetic() && first != '_' {
+            return Err("lean name is not an identifier".to_string());
+        }
+        if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err("lean name is not an identifier".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn emitted_is_probe_safe(emitted: &str) -> Result<(), String> {
+    if emitted.is_empty()
+        || emitted.contains('\n')
+        || emitted.contains('\r')
+        || emitted.contains("--")
+        || emitted.contains("/-")
+        || emitted.contains("sorry")
+        || emitted.contains("admit")
+        || emitted.contains("import")
+        || emitted.contains('#')
+        || emitted.contains(':')
+        || emitted.contains(';')
+    {
+        return Err("emitted formula is not a single proposition".to_string());
+    }
+    Ok(())
 }
 
 pub fn declaration_present(source: &str, declaration: &str) -> Result<(), String> {
@@ -235,7 +354,7 @@ pub fn overlay_for_links(
     sources: &dyn Fn(&AnchorLink) -> Result<String, String>,
     axioms_of: &dyn Fn(&AnchorLink) -> Result<Vec<String>, String>,
     build: &dyn Fn(&str) -> Result<(), String>,
-    defeq: &dyn Fn(&str, &AnchorLink) -> Defeq,
+    defeq: &dyn Fn(&str, &AnchorLink) -> Result<Defeq, String>,
 ) -> Result<EvidenceOverlay, String> {
     let mut overlay = EvidenceOverlay::empty();
     for link in links {
@@ -245,6 +364,12 @@ pub fn overlay_for_links(
             .ok_or_else(|| format!("row {} is not in the census", link.row_id))?;
         if link.classification == "lean_formula" || link.classification == "lean_model" {
             lean_census::reject_covered(row.class, true)?;
+            if link.definition.as_deref().unwrap_or("").is_empty() {
+                return Err(format!(
+                    "{} needs the Lean definition it is about",
+                    link.declaration
+                ));
+            }
         }
         if row.class != RowClass::Unmapped && link.classification != row.class.as_str() {
             return Err(format!(
@@ -287,7 +412,7 @@ pub fn overlay_for_links(
                     .map_err(|err| format!("statement_expr did not parse: {err}"))?;
                 let emitted = crate::parser::lean_emit::emit_lean_statement(&parsed)
                     .map_err(|err| format!("{}: {}", err.marker, err.detail))?;
-                formula_defeq(defeq(&emitted, link))?;
+                formula_defeq(defeq(&emitted, link)?)?;
                 if !same_proposition(&link.classification) {
                     return Err("classification is not lean_formula".to_string());
                 }
@@ -342,9 +467,9 @@ pub fn run_required(root: &Path) -> Result<super::lean_evidence::EvidenceOverlay
         &links,
         &rows,
         &|link| read_decl_source(root, link),
-        &|link| axioms_from_manifest(root, link),
+        &|link| cited_axioms(root, link),
         &|module| build_module(root, module),
-        &|_emitted, _link| Defeq::Unavailable,
+        &|emitted, link| check_defeq(root, emitted, link),
     )
 }
 
@@ -364,13 +489,54 @@ fn expect_count(
 fn read_decl_source(root: &Path, link: &AnchorLink) -> Result<String, String> {
     let rel = link.module.replace('.', "/");
     let path = root.join("spec/proofs").join(format!("{rel}.lean"));
-    std::fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))
+    std::fs::read_to_string(&path).map_err(|_| format!("could not read module {}", link.module))
+}
+
+fn cited_axioms(root: &Path, link: &AnchorLink) -> Result<Vec<String>, String> {
+    let source = axiom_probe_source(&link.module, &link.declaration)?;
+    let live = axioms_from_probe(spawn_probe(root, &source)?, &link.declaration)?;
+    let manifest = axioms_from_manifest(root, link)?;
+    if !same_axioms(&live, &manifest) {
+        return Err(format!(
+            "{} #print axioms does not match the manifest",
+            link.declaration
+        ));
+    }
+    Ok(live)
+}
+
+fn check_defeq(root: &Path, emitted: &str, link: &AnchorLink) -> Result<Defeq, String> {
+    let source = defeq_probe_source(&link.module, &link.declaration, emitted)?;
+    defeq_from_probe(spawn_probe(root, &source)?)
+}
+
+fn spawn_probe(root: &Path, source: &str) -> Result<ProbeStart, String> {
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("spec-lock-lean-{}-{n}.lean", std::process::id()));
+    std::fs::write(&path, source)
+        .map_err(|_| "could not write the elaborator probe".to_string())?;
+    let output = Command::new("lake")
+        .args(["env", "lean"])
+        .arg(&path)
+        .current_dir(root.join("spec/proofs"))
+        .output();
+    let _ = std::fs::remove_file(&path);
+    match output {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(ProbeStart::Missing),
+        Err(_) => Err("elaborator failed to start".to_string()),
+        Ok(output) => Ok(ProbeStart::Ran {
+            code: output.status.code().unwrap_or(1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        }),
+    }
 }
 
 fn axioms_from_manifest(root: &Path, link: &AnchorLink) -> Result<Vec<String>, String> {
     let path = root.join("spec/db/axiom-manifest.txt");
-    let text =
-        std::fs::read_to_string(&path).map_err(|err| format!("read axiom manifest: {err}"))?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|_| "could not read the axiom manifest".to_string())?;
     let needle = format!("'{}'", link.declaration);
     let Some(line) = text.lines().find(|line| line.contains(&needle)) else {
         return Err(format!(
@@ -416,5 +582,51 @@ mod tests {
         assert!(formula_defeq(Defeq::Unavailable).is_err());
         assert!(formula_defeq(Defeq::Different).is_err());
         assert!(formula_defeq(Defeq::Equal).is_ok());
+        let probe = axiom_probe_source(
+            "BitcoinProofs.AF.PDW51",
+            "BitcoinProofs.AF.PDW51.blockWeight_row",
+        )
+        .unwrap();
+        assert!(probe.contains("#print axioms"));
+        assert!(axiom_probe_source("Bad-Name", "T").is_err());
+        assert!(defeq_probe_source("M", "T", "result = 0\nimport X").is_err());
+        assert_eq!(
+            defeq_from_probe(ProbeStart::Missing).unwrap(),
+            Defeq::Unavailable
+        );
+        assert_eq!(
+            defeq_from_probe(ProbeStart::Ran {
+                code: 1,
+                stdout: String::new(),
+                stderr: "type mismatch".to_string(),
+            })
+            .unwrap(),
+            Defeq::Different
+        );
+        assert!(
+            defeq_from_probe(ProbeStart::Ran {
+                code: 1,
+                stdout: String::new(),
+                stderr: "unknown module".to_string(),
+            })
+            .is_err()
+        );
+        let names = axiom_line(
+            "'Bitcoin.Data.moneyRange_zero' does not depend on any axioms\n",
+            "Bitcoin.Data.moneyRange_zero",
+        )
+        .unwrap();
+        assert!(names.is_empty());
+        let names = axiom_line(
+            "'Bitcoin.DataLaws.bip68Enabled_iff' depends on axioms: [propext]\n",
+            "Bitcoin.DataLaws.bip68Enabled_iff",
+        )
+        .unwrap();
+        assert_eq!(names, vec!["propext".to_string()]);
+        assert!(same_axioms(
+            &["Quot.sound".to_string(), "propext".to_string()],
+            &["propext".to_string(), "Quot.sound".to_string()]
+        ));
+        assert!(axioms_from_probe(ProbeStart::Missing, "T").is_err());
     }
 }

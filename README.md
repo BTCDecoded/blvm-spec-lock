@@ -96,7 +96,7 @@ cargo spec-lock verify --format junit
 
 Field-level documentation, **`jq`** examples, and **`detail`** codes: **[docs/VERIFY_JSON.md](docs/VERIFY_JSON.md)**. Optional JSON Schemas: **`schemas/verify_report_v1.json`** (**`verify`**), **`schemas/formula_verify_report_v1.json`** (**`verify-formulas`**).
 
-Coverage JSON (**`cargo spec-lock coverage --format json`**) is documented in **[docs/COVERAGE_JSON.md](docs/COVERAGE_JSON.md)**; schemas: **`schemas/coverage_inventory_v1.json`** (no **`--spec-path`**) and **`schemas/coverage_spec_rollup_v1.json`** (**`--spec-path`** set). Optional **`coverage --rollup-from-verify-json`** reads **`cargo spec-lock verify`** JSON (**`report_format` 1**) and adds **`formulas_verify_rollup`/`constants_verify_rollup`** (**`formula_anchor`** / **`constant_anchor`** row subsets).
+Coverage JSON (**`cargo spec-lock coverage --format json`**) is documented in **[docs/COVERAGE_JSON.md](docs/COVERAGE_JSON.md)**; schemas: **`schemas/coverage_inventory_v1.json`** (no **`--spec-path`**) and **`schemas/coverage_spec_rollup_v1.json`** (**`--spec-path`** set). Optional **`coverage --rollup-from-verify-json`** reads **`cargo spec-lock verify`** JSON (**`report_format` 1 or 2**) and adds **`formulas_verify_rollup`/`constants_verify_rollup`** (**`formula_anchor`** / **`constant_anchor`** row subsets).
 
 ## Writing Contracts
 

@@ -16,7 +16,7 @@ Pin: `d390f7932e64a134aec3cca1614bed3276539f2d`. The checkout is `BTC_LEAN_ROOT`
 
 `z3_contract` together with `lean_formula` is the only pair that supports "the Rust satisfies the property." That pair is one summary slot, `z3_contract+lean_formula`. `lean_model` and `differential` are never that claim.
 
-`lean_covered` is true only when the pin matches, `make gates` passes, the cited module builds by name, the cited source has no `sorry` or `admit`, the declaration's axioms are inside the allowlist, and a `lean_formula` link is definitionally equal to the emitted statement. The default `lake build BitcoinProofs` is not that check. The elaborator is not wired, so a `lean_formula` link stays uncovered.
+`lean_covered` is true only when the pin matches, `make gates` passes, the cited module builds by name, the cited source has no `sorry` or `admit`, the declaration names the Lean definition it is about, `#print axioms` matches the committed manifest and stays inside the allowlist, and a `lean_formula` link is definitionally equal to the emitted statement. The probe is a temporary file outside the checkout. `lake env lean` runs it from `spec/proofs`. The default `lake build BitcoinProofs` is not that check. If `lake` is not available, the cited link stays uncovered. The empty anchor map does not invoke `lake`.
 
 ## Allowlist
 
@@ -26,7 +26,7 @@ Pin: `d390f7932e64a134aec3cca1614bed3276539f2d`. The checkout is `BTC_LEAN_ROOT`
 - `Classical.choice`
 - `Quot.sound`
 
-Anything else fails the gate. The static manifest at the pin names only these three. That manifest is not a fresh `#print axioms` of every cited declaration. A cited declaration missing from the manifest is not covered.
+Anything else fails the gate. The static manifest at the pin names only these three. A cited declaration is checked with a fresh `#print axioms`, and that output has to match its manifest line. A cited declaration missing from the manifest is not covered. The manifest is not a substitute for the elaborator.
 
 ## Trust base
 
@@ -54,4 +54,4 @@ The 18 residual ids stay excluded even though the pinned `docs/RESIDUALS.md` cal
 
 `cargo spec-lock lean-gate` requires the checkout and fails if the pin or the static gates fail. `cargo spec-lock verify` runs the same gate when the checkout is present. A missing checkout does not mark Lean coverage and does not change the Z3 verdict.
 
-`cargo spec-lock lean-differential --archive <file>` hashes the file against `1ac846bdc24740cfdcf599c3ccf357e48bed50d7fd32071efae605d2a84168b8` before reading rows. `--vectors` is a JSON array of `{anchor, rust, lean}`.
+`cargo spec-lock lean-differential --archive <file>` hashes the file against `1ac846bdc24740cfdcf599c3ccf357e48bed50d7fd32071efae605d2a84168b8` before reading rows. `--vectors` is a JSON array of `{anchor, rust, lean}`. The command does not run blvm-consensus or the btc-lean executable. A row is differential evidence only for that comparison, and only in this command's report. `verify` does not copy it onto an anchor.

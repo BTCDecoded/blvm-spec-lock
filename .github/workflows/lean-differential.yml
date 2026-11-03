@@ -21,5 +21,5 @@ jobs:
           curl -fsSL -o "$RUNNER_TEMP/btc-lean-data.tar.gz" \
             https://github.com/Rob1Ham/btc-lean/releases/download/data-2026.10.17/btc-lean-data-2026.10.17.tar.gz
 
-      - name: Verify the digest before use
+      - name: Check the archive digest
         run: cargo run --bin cargo-spec-lock -- lean-differential --archive "$RUNNER_TEMP/btc-lean-data.tar.gz"

@@ -59,6 +59,10 @@ impl EvidenceOverlay {
     pub fn len(&self) -> usize {
         self.by_function.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_function.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +188,11 @@ mod tests {
             covered,
             status: LeanStatus::Formula,
         }
+    }
+
+    #[test]
+    fn empty_overlay_has_no_rows() {
+        assert!(EvidenceOverlay::empty().is_empty());
     }
 
     #[test]

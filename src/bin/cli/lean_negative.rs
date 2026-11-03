@@ -49,7 +49,7 @@ fn run(
                 Err("cited module build exited 1".to_string())
             }
         },
-        &|_, _| defeq,
+        &|_, _| Ok(defeq),
     )
     .map(|_| ())
 }
@@ -134,6 +134,21 @@ fn residual_row_is_not_covered() {
         Defeq::Equal,
     );
     assert!(err.unwrap_err().contains("residual"));
+}
+
+#[test]
+fn covering_link_needs_a_definition() {
+    let mut linked = link("lean_model");
+    linked.definition = None;
+    let err = run(
+        &[linked],
+        &[row("BLK-025", RowClass::Unmapped)],
+        &ok_source(),
+        &["propext"],
+        true,
+        Defeq::Equal,
+    );
+    assert!(err.unwrap_err().contains("definition"));
 }
 
 #[test]

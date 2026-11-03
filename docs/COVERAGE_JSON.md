@@ -8,7 +8,7 @@ Machine-oriented listing of **`#[spec_locked]`** functions: **`total_spec_locked
 
 Formula-related keys: **`formulas_bound_to_rust`** counts Rust **`formula_anchor`** fields; **`constants_bound_to_rust`** counts **`constant_anchor`**. With no **`--spec-path`**, **`formulas_defined`**, **`formulas_parseable_body`**, **`constants_defined`**, and the **`formula_anchor_*`** anchor-resolution counts are **0** (no merged spec / registry load), but rollup fields (**`formulas_verify_rollup`**, **`constants_verify_rollup`**) still parse when **`--rollup-from-verify-json`** is set (counts come only from **`verify`** JSON **`results[]`** rows with the respective **`formula_anchor` / `constant_anchor`** strings).
 
-Optional **`coverage --rollup-from-verify-json PATH`**: **`PATH`** must be **`report_format` 1** **`cargo spec-lock verify`** JSON (**`results`** array required). Rows with a non-empty **`formula_anchor`** or **`constant_anchor`** accumulate **`passed`/`failed`/`partial`/`not_implemented`** into **`formulas_verify_rollup`/`constants_verify_rollup`** (JSON **`null`** when no qualifying rows existed in the file).
+Optional **`coverage --rollup-from-verify-json PATH`**: **`PATH`** is **`cargo spec-lock verify`** JSON at **`report_format` 1 or 2** (**`results`** array required). Rows with a non-empty **`formula_anchor`** or **`constant_anchor`** accumulate **`passed`/`failed`/`partial`/`not_implemented`** into **`formulas_verify_rollup`/`constants_verify_rollup`** (JSON **`null`** when no qualifying rows existed in the file). Evidence fields on a format 2 row are ignored by this rollup.
 
 | Key | Meaning |
 |-----|---------|
@@ -40,5 +40,5 @@ Schemas use **`additionalProperties: true`** on the document root (extra keys re
 
 ## See also
 
-- **[VERIFY_JSON.md](VERIFY_JSON.md)** — **`verify`** **`report_format` 1**
+- **[VERIFY_JSON.md](VERIFY_JSON.md)** — **`verify`** **`report_format` 2** (older files at **1** still roll up)
 - **[LOCKING_MECHANISM.md](LOCKING_MECHANISM.md)** — exit semantics for **`verify`** / strict mode

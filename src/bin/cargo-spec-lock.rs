@@ -322,6 +322,16 @@ enum Commands {
 
     /// Run the pinned btc-lean static gates and cover only links that pass.
     LeanGate,
+
+    /// Hash-check a release archive, then compare vector rows. Agreement is differential evidence.
+    LeanDifferential {
+        /// Release archive to hash before any row is read.
+        #[arg(long)]
+        archive: PathBuf,
+        /// JSON array of `{anchor, rust, lean}` rows. Omitted means no comparison and no differential claim.
+        #[arg(long)]
+        vectors: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -461,6 +471,9 @@ fn main() {
             crate_path: _,
         } => handle_extract_property_tests(resolve_spec_paths(spec_path), bindings_path, output),
         Commands::LeanGate => handle_lean_gate(),
+        Commands::LeanDifferential { archive, vectors } => {
+            handle_lean_differential(archive, vectors)
+        }
     };
 
     std::process::exit(exit_code);
@@ -1062,6 +1075,57 @@ fn handle_lean_gate() -> i32 {
                 1
             }
         },
+    }
+}
+
+fn handle_lean_differential(archive: PathBuf, vectors: Option<PathBuf>) -> i32 {
+    use crate::cli::lean_diff::{self, DATA_ARCHIVE_SHA256};
+    if let Err(err) = lean_diff::read_and_check(&archive, DATA_ARCHIVE_SHA256) {
+        eprintln!("differential: {err}");
+        return 1;
+    }
+    let Some(path) = vectors else {
+        println!(
+            "{}",
+            lean_diff::report_json(&lean_diff::DiffReport {
+                agreements: Vec::new(),
+                disagreements: Vec::new(),
+            })
+        );
+        println!("differential: 0 rows; no anchor received differential");
+        return 0;
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => {
+            eprintln!("differential: could not read the vector file");
+            return 1;
+        }
+    };
+    let rows = match lean_diff::load_vectors(&text) {
+        Ok(rows) => rows,
+        Err(err) => {
+            eprintln!("differential: {err}");
+            return 1;
+        }
+    };
+    let report = lean_diff::compare(&rows);
+    println!("{}", lean_diff::report_json(&report));
+    if report.disagreements.is_empty() && !report.agreements.is_empty() {
+        println!(
+            "differential: {} agreement(s); this is not a proof",
+            report.agreements.len()
+        );
+        0
+    } else if !report.disagreements.is_empty() {
+        eprintln!(
+            "differential: {} disagreement(s); those anchors are not differential evidence",
+            report.disagreements.len()
+        );
+        1
+    } else {
+        println!("differential: 0 rows; no anchor received differential");
+        0
     }
 }
 

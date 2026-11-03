@@ -8,6 +8,7 @@ pub mod filters;
 pub mod formula_checks;
 pub mod formula_dep_graph;
 pub mod lean_census;
+pub mod lean_diff;
 pub mod lean_evidence;
 pub mod lean_gate;
 pub mod output;

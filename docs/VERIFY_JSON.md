@@ -1,4 +1,4 @@
-# Verify JSON report (`report_format` 1)
+# Verify JSON report (`report_format` 2)
 
 Machine-readable output from **`cargo spec-lock verify`**.
 
@@ -17,7 +17,7 @@ Machine-readable output from **`cargo spec-lock verify`**.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `report_format` | `number` | **1** for this schema. Bumped only on **breaking** shape changes (new optional keys are allowed on older numbers until documented otherwise). |
+| `report_format` | `number` | **2** for `verify`. Version 1 keys remain. `verify-formulas` and the nested `formula_registry` stay **1**. Schema: `schemas/verify_report_v2.json`. The v1 schema file remains for readers of older documents. |
 | `command` | `string` | Always **`"verify"`** for this report. |
 | `tool` | object | **`name`**: `"blvm-spec-lock"`; **`version`**: semver of the `cargo-spec-lock` binary (same as `cargo-spec-lock --version`). |
 | `summary` | object | Aggregate counts — see below. |
@@ -54,6 +54,7 @@ jq '.formula_registry.results[]? | select(.z3_sat != null and .z3_sat.status == 
 | `failed` | `number` | Hard failures (`Failed` variant), **excluding** rows counted in `no_contracts`. |
 | `partial` | `number` | Partial / unknown-heavy outcomes. |
 | `no_contracts` | `number` | Failed because no obligations were derived (distinct from Z3/refutation failures). |
+| `evidence` | object | Exclusive slot counts. The keys are `none`, `z3_contract`, `lean_formula`, `lean_model`, `differential`, and `z3_contract+lean_formula`. They sum to `total`. |
 
 ### `results[]`
 
@@ -67,7 +68,13 @@ Common keys:
 | `anchor_kind` | `string` | Always set: **`function`** (normative **CamelCase** / section lock), **`formula`** (**`F_*`** anchor), or **`constant`** (**`C_*`** anchor). Mirrors resolver precedence: **`formula`** if **`formula_anchor`** is present, else **`constant`** if **`constant_anchor`** is set, else **`function`**. |
 | `formula_anchor` | `string` | Present when **`#[spec_locked]`** named **`F_*`** (dual literal, **`§::…`**, or **`function = "F_…"`**). |
 | `constant_anchor` | `string` | Present when the second anchor is **`C_*`** (stable id **`SpecParser::constants_stable_id_map`**) instead of **`F_*`**. |
-| `status` | `string` | One of: `passed`, `failed`, `partial`, `not_implemented`. |
+| `status` | `string` | One of: `passed`, `failed`, `partial`, `not_implemented`. The Z3 verdict. Evidence does not change it. |
+| `evidence` | array of string | Statuses that apply. `z3_contract` means Z3 discharged an ensures clause from the function body. `lean_formula` means a Lean theorem is the same proposition as the Orange Paper formula and the Lean gate passed. `lean_model` means a Lean theorem about the btc-lean model passed the gate; it says nothing about the Rust. `differential` means the Rust and the btc-lean executable agreed on the same inputs. `none` means no status above applies. |
+| `evidence_slot` | string | The one summary bucket for this anchor. `z3_contract+lean_formula` is the pair, counted once. |
+| `lean_row_id` | string or null | Census row id when a verified link exists. |
+| `lean_declaration` | string or null | Lean declaration name for that row. |
+| `lean_classification` | string | `unmapped` when no verified link exists. |
+| `lean_covered` | boolean | True only when every Lean check for that link passed. |
 
 Additional keys by status:
 
@@ -80,7 +87,7 @@ Empty filtered run:
 
 ```json
 {
-  "report_format": 1,
+  "report_format": 2,
   "command": "verify",
   "tool": {
     "name": "blvm-spec-lock",
@@ -140,7 +147,7 @@ jq '[.results[] | select(.status == "failed" and .detail.partial_reason == "z3_t
 
 ## `verify-formulas` JSON (`report_format` 1)
 
-**`cargo spec-lock verify-formulas`** emits a **distinct** **`report_format` 1** document for the merged **`F_*`** **`Formula`** registry — **no** Rust **`#[spec_locked]`** rows. Same numeric **`report_format`** as **`verify`**; discriminate with top-level **`command`**: **`verify-formulas`**.
+**`cargo spec-lock verify-formulas`** emits a **distinct** **`report_format` 1** document for the merged **`F_*`** **`Formula`** registry — **no** Rust **`#[spec_locked]`** rows. Discriminate with top-level **`command`**: **`verify-formulas`**. This command stays at **1** when **`verify`** is **2**.
 
 - **Static gate:** **`formula_latex_parseable_for_verify`**, **`extract_parseable_condition`**, then **`syn::Expr`** (same **`F_*`** path as **`check-formulas`/`verify`/enrich).
 - **Z3 SAT smoke:** per formula unless **`--skip-z3`**; requires **`cargo-spec-lock`** built with **`--features z3`**. Without Z3 (**and** **`F_*`** rows exist **and** static gates pass **and** **`--skip-z3`** omitted), **`verify-formulas` exits **`1`**.

@@ -962,6 +962,8 @@ fn handle_verify(args: VerifyArgs) -> i32 {
         results.push((func.clone(), result));
     }
 
+    let overlay = cli::lean_evidence::EvidenceOverlay::empty();
+
     // Format and output results
     let format_str = match format {
         OutputFormat::Human => "human",
@@ -971,18 +973,20 @@ fn handle_verify(args: VerifyArgs) -> i32 {
     };
 
     let printed = match format {
-        OutputFormat::Json => cli::output::format_verify_json_report(
+        OutputFormat::Json => cli::output::format_verify_json_report_with(
             &results,
             formula_registry_for_json.as_ref().map(|(a, f)| (a, *f)),
+            &overlay,
         ),
-        _ => cli::output::format_results(&results, format_str),
+        _ => cli::output::format_results(&results, format_str, &overlay),
     };
     print!("{printed}");
 
     if let Some(ref path) = json_out {
-        let json = cli::output::format_verify_json_report(
+        let json = cli::output::format_verify_json_report_with(
             &results,
             formula_registry_for_json.as_ref().map(|(a, f)| (a, *f)),
+            &overlay,
         );
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {

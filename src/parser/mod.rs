@@ -7,6 +7,7 @@
 
 pub mod condition;
 pub mod contracts;
+pub mod lean_emit;
 pub mod lexer;
 pub mod orange_paper;
 pub mod spec_expr;

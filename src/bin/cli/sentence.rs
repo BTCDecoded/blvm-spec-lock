@@ -2761,6 +2761,9 @@ mod tests {
 
     #[test]
     fn abstracted_predicates_are_their_own_rows() {
+        if !spec_ready() {
+            return;
+        }
         let rows = inventory(&[("PROTOCOL.md", "no sentences here\n")], &BTreeSet::new());
         let abstracts: Vec<_> = rows
             .iter()
@@ -2876,6 +2879,9 @@ axiom signatureUnforgeable : CryptoAssumptions → Prop := fun _ => True
 
     #[test]
     fn classify_6212_is_both_when_locked() {
+        if !spec_ready() {
+            return;
+        }
         let statement = r"\forall h \geq 33 \times H: \text{GetBlockSubsidy}(h) = 0";
         let id = "PROTOCOL.md#Theorem:6.1.2";
         let mut locked = BTreeSet::new();

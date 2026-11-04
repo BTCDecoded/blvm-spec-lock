@@ -8,18 +8,25 @@ use crate::cli::formula_checks::{
 use crate::cli::verify::{FailureKind, FunctionToVerify, VerificationResult};
 
 /// Format verification results
-pub fn format_results(results: &[(FunctionToVerify, VerificationResult)], format: &str) -> String {
+pub fn format_results(
+    results: &[(FunctionToVerify, VerificationResult)],
+    format: &str,
+    overlay: &crate::cli::lean_evidence::EvidenceOverlay,
+) -> String {
     match format {
-        "human" => format_human(results),
+        "human" => format_human(results, overlay),
         "json" => format_json(results),
         "junit" => format_junit(results),
         "markdown" => format_markdown(results),
-        _ => format_human(results),
+        _ => format_human(results, overlay),
     }
 }
 
 /// Format as human-readable text
-fn format_human(results: &[(FunctionToVerify, VerificationResult)]) -> String {
+fn format_human(
+    results: &[(FunctionToVerify, VerificationResult)],
+    overlay: &crate::cli::lean_evidence::EvidenceOverlay,
+) -> String {
     let mut output = String::new();
     output.push_str("Running BLVM Spec Lock verification...\n\n");
 
@@ -118,19 +125,35 @@ fn format_human(results: &[(FunctionToVerify, VerificationResult)]) -> String {
 
     // Add duration and summary stats
     output.push_str(&format!("  Functions verified: {}\n", results.len()));
+    output.push_str(&crate::cli::lean_evidence::human_line(results, overlay));
 
     output
 }
 
-/// Machine-readable verify report for CI (`report_format` **1**).
+/// Machine-readable verify report for CI (`report_format` **2**).
 ///
-/// When `formula_registry` is set, the same **`verify-formulas`**-shaped document is embedded under **`formula_registry`** (full **`report_format` 1** object with **`command`:** **`verify-formulas`** inside the gate).
+/// Version 1 keys stay on the document. `evidence` is the set for that anchor.
+/// `summary.evidence` counts each anchor in one slot. The nested
+/// `formula_registry` document stays `report_format` 1.
 ///
 /// Same payload printed when `--format json`; also written when using `--json-out` with any `--format`.
 pub fn format_verify_json_report(
     results: &[(FunctionToVerify, VerificationResult)],
     formula_registry: Option<(&FormulaRegistryAnalysis, FormulaVerifyJsonFlags)>,
 ) -> String {
+    format_verify_json_report_with(
+        results,
+        formula_registry,
+        &crate::cli::lean_evidence::EvidenceOverlay::empty(),
+    )
+}
+
+pub fn format_verify_json_report_with(
+    results: &[(FunctionToVerify, VerificationResult)],
+    formula_registry: Option<(&FormulaRegistryAnalysis, FormulaVerifyJsonFlags)>,
+    overlay: &crate::cli::lean_evidence::EvidenceOverlay,
+) -> String {
+    use crate::cli::lean_evidence::{SLOTS, from_verify, tally};
     use serde_json::json;
 
     let passed = results
@@ -147,7 +170,10 @@ pub fn format_verify_json_report(
         .count();
 
     let mut json_results = Vec::new();
+    let mut assigned = Vec::new();
     for (func, result) in results {
+        let evidence = from_verify(func, result, overlay);
+        assigned.push(evidence.clone());
         let mut result_obj = json!({
             "file": func.file_path.to_string_lossy(),
             "function": func.function_name,
@@ -212,6 +238,13 @@ pub fn format_verify_json_report(
             }
         }
 
+        result_obj["evidence"] = json!(evidence.evidence);
+        result_obj["evidence_slot"] = json!(evidence.slot);
+        result_obj["lean_row_id"] = json!(evidence.lean_row_id);
+        result_obj["lean_declaration"] = json!(evidence.lean_declaration);
+        result_obj["lean_classification"] = json!(evidence.lean_classification);
+        result_obj["lean_covered"] = json!(evidence.lean_covered);
+
         json_results.push(result_obj);
     }
 
@@ -220,8 +253,14 @@ pub fn format_verify_json_report(
         .filter(|(_, r)| matches!(r, VerificationResult::NoContracts { .. }))
         .count();
 
+    let evidence_counts = tally(&assigned);
+    let mut evidence_summary = serde_json::Map::new();
+    for slot in SLOTS {
+        evidence_summary.insert((*slot).to_string(), json!(evidence_counts[slot]));
+    }
+
     let mut output_val = json!({
-        "report_format": 1u32,
+        "report_format": 2u32,
         "command": "verify",
         "tool": {
             "name": "blvm-spec-lock",
@@ -233,6 +272,18 @@ pub fn format_verify_json_report(
             "failed": failed,
             "partial": partial,
             "no_contracts": no_contracts,
+            "evidence": evidence_summary,
+            "sentences": {
+                "z3": 0,
+                "spec_model": 0,
+                "spec_model_conditional": 0,
+                "spec_disputed": 0,
+                "both": 0,
+                "none": 0,
+                "unsupported": 0
+            },
+            "definitions_locked": 0,
+            "definitions_unlocked": 0,
         },
         "results": json_results,
     });
@@ -246,6 +297,42 @@ pub fn format_verify_json_report(
     }
 
     serde_json::to_string_pretty(&output_val).unwrap_or_else(|_| "{}".to_string())
+}
+
+pub fn set_sentence_counts(
+    report: &str,
+    counts: &std::collections::BTreeMap<String, usize>,
+) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(report) else {
+        return report.to_string();
+    };
+    if let Some(summary) = value.get_mut("summary").and_then(|v| v.as_object_mut()) {
+        let mut sentences = serde_json::Map::new();
+        for key in [
+            "z3",
+            "spec_model",
+            "spec_model_conditional",
+            "spec_disputed",
+            "both",
+            "none",
+            "unsupported",
+        ] {
+            sentences.insert(
+                key.to_string(),
+                serde_json::json!(counts.get(key).copied().unwrap_or(0)),
+            );
+        }
+        summary.insert("sentences".to_string(), serde_json::Value::Object(sentences));
+        summary.insert(
+            "definitions_locked".to_string(),
+            serde_json::json!(counts.get("definitions_locked").copied().unwrap_or(0)),
+        );
+        summary.insert(
+            "definitions_unlocked".to_string(),
+            serde_json::json!(counts.get("definitions_unlocked").copied().unwrap_or(0)),
+        );
+    }
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| report.to_string())
 }
 
 /// Metadata for **`verify-formulas`** JSON summary (solver/stub flags mirror CLI).
@@ -717,7 +804,9 @@ mod tests {
     fn verify_json_report_includes_report_format_and_tool() {
         let results: Vec<(FunctionToVerify, VerificationResult)> = vec![];
         let s = format_verify_json_report(&results, None);
-        assert!(s.contains("\"report_format\": 1"));
+        assert!(s.contains("\"report_format\": 2"));
+        assert!(s.contains("\"evidence\""));
+        assert!(s.contains("\"none\": 0"));
         assert!(s.contains("\"command\": \"verify\""));
         assert!(s.contains("\"name\": \"blvm-spec-lock\""));
         assert!(s.contains("\"summary\""));
@@ -735,6 +824,7 @@ mod tests {
                 spec_name_override: None,
                 formula_anchor: fa,
                 constant_anchor: ca,
+                formulas: Vec::new(),
                 function_sig: None,
                 parse_gap: false,
             };
@@ -804,6 +894,7 @@ mod tests {
             spec_name_override: None,
             formula_anchor: None,
             constant_anchor: None,
+            formulas: Vec::new(),
             function_sig: None,
             parse_gap: false,
         };
@@ -828,6 +919,7 @@ mod tests {
             spec_name_override: None,
             formula_anchor: None,
             constant_anchor: None,
+            formulas: Vec::new(),
             function_sig: None,
             parse_gap: false,
         };
@@ -854,6 +946,7 @@ mod tests {
             spec_name_override: None,
             formula_anchor: None,
             constant_anchor: None,
+            formulas: Vec::new(),
             function_sig: None,
             parse_gap: false,
         };
@@ -903,6 +996,7 @@ mod tests {
                 spec_name_override: None,
                 formula_anchor: None,
                 constant_anchor: None,
+                formulas: Vec::new(),
                 function_sig: None,
                 parse_gap: false,
             };
@@ -947,6 +1041,7 @@ mod tests {
                 spec_name_override: None,
                 formula_anchor: None,
                 constant_anchor: None,
+                formulas: Vec::new(),
                 function_sig: None,
                 parse_gap: false,
             };
@@ -974,6 +1069,7 @@ mod tests {
             spec_name_override: None,
             formula_anchor: None,
             constant_anchor: None,
+            formulas: Vec::new(),
             function_sig: None,
             parse_gap: false,
         };

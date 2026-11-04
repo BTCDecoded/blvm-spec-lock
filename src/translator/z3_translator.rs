@@ -552,6 +552,15 @@ impl Z3Translator {
                         }
                     }
                 }
+                if matches!(bin.op, syn::BinOp::Shr(_) | syn::BinOp::Shl(_))
+                    && extract_int_literal(&bin.right)
+                        .filter(|shift_val| (0..64).contains(shift_val))
+                        .is_none()
+                {
+                    if let Some(amount) = right.as_int() {
+                        self.record_shift_bound(vars, &amount);
+                    }
+                }
                 // BitAnd (&): model with div/rem for constant masks (Z3 Int has no native bitwise)
                 if matches!(bin.op, syn::BinOp::BitAnd(_)) {
                     let left_int = left
@@ -1480,6 +1489,32 @@ impl Z3Translator {
         debug_assert!(k < 64);
         let shifted = BV::from_int(left, 64).bvshl(&BV::from_u64(ctx, u64::from(k), 64));
         shifted.to_int(false)
+    }
+
+    /// The continuation after `if guard { return ... }` is `¬guard`. A later
+    /// variable shift has to prove its amount is below 64 from that path.
+    fn note_shift_continuation<'a>(&'a self, vars: &mut Z3VarMap<'a>, guard: &Bool<'a>) {
+        let cont = guard.not();
+        let next = match vars.get("__shift_path").and_then(|v| v.as_bool()) {
+            Some(prev) => Bool::and(&self.ctx, &[&prev, &cont]),
+            None => cont,
+        };
+        vars.insert("__shift_path".to_string(), next.into());
+    }
+
+    /// Record `path ⇒ 0 ≤ amount < 64` for a variable shift. `bvlshr` is unchanged.
+    fn record_shift_bound<'a>(&'a self, vars: &mut Z3VarMap<'a>, amount: &Int<'a>) {
+        let width = Int::from_i64(&self.ctx, 64);
+        let in_range = amount.lt(&width);
+        let obligation = match vars.get("__shift_path").and_then(|v| v.as_bool()) {
+            Some(path) => path.implies(&in_range),
+            None => in_range,
+        };
+        let n = vars
+            .keys()
+            .filter(|name| name.starts_with("__shift_bound_"))
+            .count();
+        vars.insert(format!("__shift_bound_{n}"), obligation.into());
     }
 
     /// Variable `<<` / `>>` on the low 64 bits. Literal shifts are handled earlier.
@@ -9761,11 +9796,13 @@ impl Z3Translator {
                         } else if let Some((cond, result_formula)) =
                             self.translate_if_with_early_return(if_expr, vars)?
                         {
+                            self.note_shift_continuation(vars, &cond);
                             early_return_conditions.push((cond, result_formula));
                         } else if let Some(err_cond) =
                             self.translate_if_with_err_return(if_expr, vars)
                         {
                             // `if bad { return Err(...) }` — on the Ok path, bad is false.
+                            self.note_shift_continuation(vars, &err_cond);
                             err_guard_conditions.push(err_cond);
                         }
                     } else if let Expr::Return(ret) = expr {
@@ -9853,10 +9890,12 @@ impl Z3Translator {
                             } else if let Some((cond, result_formula)) =
                                 self.translate_if_with_early_return(if_expr, vars)?
                             {
+                                self.note_shift_continuation(vars, &cond);
                                 early_return_conditions.push((cond, result_formula));
                             } else if let Some(err_cond) =
                                 self.translate_if_with_err_return(if_expr, vars)
                             {
+                                self.note_shift_continuation(vars, &err_cond);
                                 err_guard_conditions.push(err_cond);
                             }
                         }

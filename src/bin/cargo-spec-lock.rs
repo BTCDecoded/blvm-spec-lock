@@ -156,9 +156,35 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         json_out: Option<PathBuf>,
 
+        /// Fail when `blvm-spec/lean` or the Lean toolchain is missing, and when a supported sentence is open.
+        #[arg(long)]
+        require_lean: bool,
+
         // Positional args must be last so `--spec-path` and other flags parse correctly.
         /// Files to verify (default: all files in crate)
         files: Vec<String>,
+    },
+
+    /// Mutate each locked definition body and rebuild the theorem module.
+    MutationRebuild {
+        /// Lean project that holds the proofs.
+        #[arg(long)]
+        lean_dir: PathBuf,
+    },
+
+    /// Classify every sentence in the merged spec files.
+    Inventory {
+        /// Path to Orange Paper (can pass multiple)
+        #[arg(long, num_args = 1.., value_delimiter = ',')]
+        spec_path: Vec<PathBuf>,
+
+        /// Lean project. Defaults to `lean/` beside the first spec file.
+        #[arg(long)]
+        lean_dir: Option<PathBuf>,
+
+        /// Committed unsupported list. The run fails when it grows or a listed id is now supported.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
     },
 
     /// Show coverage report
@@ -319,6 +345,19 @@ enum Commands {
         #[arg(long)]
         crate_path: Option<PathBuf>,
     },
+
+    /// Run the pinned btc-lean static gates and cover only links that pass.
+    LeanGate,
+
+    /// Hash-check a release archive, then compare vector rows. Agreement is differential evidence.
+    LeanDifferential {
+        /// Release archive to hash before any row is read.
+        #[arg(long)]
+        archive: PathBuf,
+        /// JSON array of `{anchor, rust, lean}` rows. Omitted means no comparison and no differential claim.
+        #[arg(long)]
+        vectors: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +380,7 @@ struct VerifyArgs {
     spec_paths: Vec<PathBuf>,
     timeout_secs: u64,
     json_out: Option<PathBuf>,
+    require_lean: bool,
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -376,6 +416,7 @@ fn main() {
             spec_path,
             files,
             json_out,
+            require_lean,
         } => handle_verify(VerifyArgs {
             crate_path: resolve_crate_path(crate_path),
             files,
@@ -387,7 +428,14 @@ fn main() {
             spec_paths: resolve_spec_paths(spec_path),
             timeout_secs: timeout,
             json_out,
+            require_lean,
         }),
+        Commands::MutationRebuild { lean_dir } => handle_mutation_rebuild(lean_dir),
+        Commands::Inventory {
+            spec_path,
+            lean_dir,
+            baseline,
+        } => handle_inventory(resolve_spec_paths(spec_path), lean_dir, baseline),
         Commands::Coverage {
             crate_path,
             spec_path,
@@ -457,6 +505,10 @@ fn main() {
             output,
             crate_path: _,
         } => handle_extract_property_tests(resolve_spec_paths(spec_path), bindings_path, output),
+        Commands::LeanGate => handle_lean_gate(),
+        Commands::LeanDifferential { archive, vectors } => {
+            handle_lean_differential(archive, vectors)
+        }
     };
 
     std::process::exit(exit_code);
@@ -762,6 +814,7 @@ fn handle_verify(args: VerifyArgs) -> i32 {
         spec_paths,
         timeout_secs,
         json_out,
+        require_lean,
     } = args;
     // CI / scripts can force strict mode when using older cargo-spec-lock without `--strict` on the CLI.
     let strict = strict_cli
@@ -851,6 +904,16 @@ fn handle_verify(args: VerifyArgs) -> i32 {
     );
 
     if filtered.is_empty() {
+        if require_lean {
+            eprintln!("no Rust functions to verify; checking the Lean sentences");
+            return match sentence_gate(&spec_paths, true) {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("lean sentences: {err}");
+                    1
+                }
+            };
+        }
         eprintln!("No functions found matching criteria");
         return 1;
     }
@@ -962,6 +1025,15 @@ fn handle_verify(args: VerifyArgs) -> i32 {
         results.push((func.clone(), result));
     }
 
+    let (overlay, lean_failed) = match cli::lean_gate::locate_checkout() {
+        Err(err) => (cli::lean_evidence::EvidenceOverlay::empty(), Some(err)),
+        Ok(None) => (cli::lean_evidence::EvidenceOverlay::empty(), None),
+        Ok(Some(root)) => match cli::lean_gate::run_required(&root) {
+            Ok(overlay) => (overlay, None),
+            Err(err) => (cli::lean_evidence::EvidenceOverlay::empty(), Some(err)),
+        },
+    };
+
     // Format and output results
     let format_str = match format {
         OutputFormat::Human => "human",
@@ -970,19 +1042,28 @@ fn handle_verify(args: VerifyArgs) -> i32 {
         OutputFormat::Markdown => "markdown",
     };
 
+    let sentence_counts = sentence_counts_of(&spec_paths);
     let printed = match format {
-        OutputFormat::Json => cli::output::format_verify_json_report(
-            &results,
-            formula_registry_for_json.as_ref().map(|(a, f)| (a, *f)),
-        ),
-        _ => cli::output::format_results(&results, format_str),
+        OutputFormat::Json => {
+            let raw = cli::output::format_verify_json_report_with(
+                &results,
+                formula_registry_for_json.as_ref().map(|(a, f)| (a, *f)),
+                &overlay,
+            );
+            cli::output::set_sentence_counts(&raw, &sentence_counts)
+        }
+        _ => cli::output::format_results(&results, format_str, &overlay),
     };
     print!("{printed}");
 
     if let Some(ref path) = json_out {
-        let json = cli::output::format_verify_json_report(
-            &results,
-            formula_registry_for_json.as_ref().map(|(a, f)| (a, *f)),
+        let json = cli::output::set_sentence_counts(
+            &cli::output::format_verify_json_report_with(
+                &results,
+                formula_registry_for_json.as_ref().map(|(a, f)| (a, *f)),
+                &overlay,
+            ),
+            &sentence_counts,
         );
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -1013,9 +1094,366 @@ fn handle_verify(args: VerifyArgs) -> i32 {
         .iter()
         .any(|(_, r)| matches!(r, cli::verify::VerificationResult::NoContracts { .. }));
 
-    if has_failures || has_no_contracts {
+    if let Some(ref err) = lean_failed {
+        eprintln!("lean gate: {err}");
+    }
+
+    let sentence_failed = match sentence_gate(&spec_paths, require_lean) {
+        Ok(()) => false,
+        Err(err) => {
+            eprintln!("lean sentences: {err}");
+            true
+        }
+    };
+
+    if has_failures || has_no_contracts || lean_failed.is_some() || sentence_failed {
         1
     } else {
+        0
+    }
+}
+
+fn sentence_counts_of(
+    spec_paths: &[std::path::PathBuf],
+) -> std::collections::BTreeMap<String, usize> {
+    let Ok((rows, locked)) = load_sentence_rows(spec_paths) else {
+        return std::collections::BTreeMap::new();
+    };
+    let mut counts = cli::sentence::status_counts(&rows);
+    let (locked_n, unlocked_n) = cli::sentence::definition_counts(&locked, &rows);
+    counts.insert("definitions_locked".to_string(), locked_n);
+    counts.insert("definitions_unlocked".to_string(), unlocked_n);
+    counts
+}
+
+fn load_sentence_rows(
+    spec_paths: &[std::path::PathBuf],
+) -> Result<(Vec<cli::sentence::Sentence>, std::collections::BTreeSet<String>), String> {
+    if spec_paths.is_empty() {
+        return Ok((Vec::new(), std::collections::BTreeSet::new()));
+    }
+    let Some(spec_dir) = cli::sentence::spec_dir_from_paths(spec_paths) else {
+        return Ok((Vec::new(), std::collections::BTreeSet::new()));
+    };
+    let lean = cli::sentence::lean_dir(&spec_dir);
+    if !lean.join("lakefile.lean").is_file() {
+        return Ok((Vec::new(), std::collections::BTreeSet::new()));
+    }
+    let mut files = Vec::new();
+    for path in spec_paths {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("spec.md")
+            .to_string();
+        files.push((name, text));
+    }
+    let mut locked = std::collections::BTreeSet::new();
+    for entry in walk_lean(&lean) {
+        let src = std::fs::read_to_string(&entry)
+            .map_err(|e| format!("reading {}: {e}", entry.display()))?;
+        cli::sentence::audit_lean(&src)?;
+        locked.extend(cli::sentence::locks_in(&src));
+    }
+    let borrowed: Vec<(&str, &str)> = files.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+    Ok((cli::sentence::inventory(&borrowed, &locked), locked))
+}
+
+fn sentence_gate(spec_paths: &[std::path::PathBuf], require_lean: bool) -> Result<(), String> {
+    if spec_paths.is_empty() {
+        return if require_lean {
+            Err("`--require-lean` needs `--spec-path`".into())
+        } else {
+            Ok(())
+        };
+    }
+    let Some(spec_dir) = cli::sentence::spec_dir_from_paths(spec_paths) else {
+        return Ok(());
+    };
+    let lean = cli::sentence::lean_dir(&spec_dir);
+    let project_here = lean.join("lakefile.lean").is_file();
+    if !project_here {
+        return if require_lean {
+            Err(format!("missing Lean project at {}", lean.display()))
+        } else {
+            Ok(())
+        };
+    }
+    if require_lean && std::process::Command::new("lake").arg("--version").output().is_err() {
+        return Err("`--require-lean` needs the Lean toolchain (`lake`)".into());
+    }
+    let mut files = Vec::new();
+    for path in spec_paths {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("spec.md")
+            .to_string();
+        files.push((name, text));
+    }
+    let borrowed: Vec<(&str, &str)> = files.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+    let mut locked = std::collections::BTreeSet::new();
+    for entry in walk_lean(&lean) {
+        let src = std::fs::read_to_string(&entry)
+            .map_err(|e| format!("reading {}: {e}", entry.display()))?;
+        cli::sentence::audit_lean(&src)?;
+        locked.extend(cli::sentence::locks_in(&src));
+    }
+    let rows = cli::sentence::inventory(&borrowed, &locked);
+    cli::sentence::print_counts(&rows);
+    let mut counts = cli::sentence::status_counts(&rows);
+    let mut theorem_6212_open = false;
+    if require_lean {
+        let closure = cli::sentence::closure_of_elaborated(
+            &lean,
+            "SpecLock.subsidy_zero_from_epoch_33",
+        )?;
+        if cli::sentence::theorem_6212_reported_status(&closure.unlocked) == "none" {
+            theorem_6212_open = true;
+            if counts.get("both").copied().unwrap_or(0) > 0 {
+                *counts.get_mut("both").expect("both") -= 1;
+                *counts.get_mut("none").expect("none") += 1;
+            }
+            eprintln!(
+                "PROTOCOL.md#Theorem:6.1.2 status none; unlocked {}",
+                closure.unlocked.join(" ")
+            );
+        }
+    }
+    eprintln!(
+        "status z3={} spec_model={} spec_model_conditional={} spec_disputed={} both={} none={} unsupported={}",
+        counts["z3"],
+        counts["spec_model"],
+        counts["spec_model_conditional"],
+        counts["spec_disputed"],
+        counts["both"],
+        counts["none"],
+        counts["unsupported"]
+    );
+    if theorem_6212_open {
+        return Err("a supported sentence is open".into());
+    }
+    let open = rows.iter().any(|row| {
+        let status = cli::sentence::status_of(row, &cli::sentence::conditional_ids());
+        status == "none" && row.class != "unsupported"
+    });
+    if open {
+        return Err("a supported sentence is open".into());
+    }
+    Ok(())
+}
+
+fn walk_lean(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk_lean(&path));
+        } else if path.extension().and_then(|s| s.to_str()) == Some("lean") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn handle_mutation_rebuild(lean_dir: std::path::PathBuf) -> i32 {
+    match cli::sentence::mutation_rebuild(&lean_dir) {
+        Ok((dir, report)) => {
+            eprintln!("theorem {}", report.theorem);
+            if report.not_load_bearing.is_empty() {
+                eprintln!("not_load_bearing none");
+            } else {
+                eprintln!(
+                    "not_load_bearing {}",
+                    report.not_load_bearing.join(", ")
+                );
+            }
+            println!("{}", dir.display());
+            0
+        }
+        Err(err) => {
+            eprintln!("mutation rebuild: {err}");
+            1
+        }
+    }
+}
+
+fn handle_inventory(
+    spec_paths: Vec<std::path::PathBuf>,
+    lean_dir: Option<std::path::PathBuf>,
+    baseline: Option<std::path::PathBuf>,
+) -> i32 {
+    if spec_paths.is_empty() {
+        eprintln!("inventory needs --spec-path");
+        return 1;
+    }
+    let mut files = Vec::new();
+    for path in &spec_paths {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("spec.md")
+                    .to_string();
+                files.push((name, text));
+            }
+            Err(e) => {
+                eprintln!("reading {}: {e}", path.display());
+                return 1;
+            }
+        }
+    }
+    let lean = lean_dir.or_else(|| {
+        cli::sentence::spec_dir_from_paths(&spec_paths).map(|d| cli::sentence::lean_dir(&d))
+    });
+    let mut locked = std::collections::BTreeSet::new();
+    if let Some(dir) = lean {
+        for entry in walk_lean(&dir) {
+            if let Ok(src) = std::fs::read_to_string(&entry) {
+                if let Err(err) = cli::sentence::audit_lean(&src) {
+                    eprintln!("{}: {err}", entry.display());
+                    return 1;
+                }
+                locked.extend(cli::sentence::locks_in(&src));
+            }
+        }
+    }
+    let borrowed: Vec<(&str, &str)> = files.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+    let rows = cli::sentence::inventory(&borrowed, &locked);
+    cli::sentence::print_counts(&rows);
+    let counts = cli::sentence::status_counts(&rows);
+    eprintln!(
+        "status z3={} spec_model={} spec_model_conditional={} spec_disputed={} both={} none={} unsupported={}",
+        counts["z3"],
+        counts["spec_model"],
+        counts["spec_model_conditional"],
+        counts["spec_disputed"],
+        counts["both"],
+        counts["none"],
+        counts["unsupported"]
+    );
+    let (locked_n, unlocked_n) = cli::sentence::definition_counts(&locked, &rows);
+    eprintln!("definitions locked={locked_n} unlocked={unlocked_n}");
+    print!("{}", cli::sentence::format_inventory(&rows));
+    if let Some(path) = baseline {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let base = cli::sentence::parse_inventory(&text);
+                if let Err(err) = cli::sentence::baseline_delta(&base, &rows) {
+                    eprintln!("inventory baseline: {err}");
+                    return 1;
+                }
+            }
+            Err(e) => {
+                eprintln!("reading baseline {}: {e}", path.display());
+                return 1;
+            }
+        }
+        let unlocked_path = path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("unlocked-definitions.txt");
+        if unlocked_path.is_file() {
+            match std::fs::read_to_string(&unlocked_path) {
+                Ok(text) => {
+                    let listed = text.lines().filter(|line| !line.is_empty()).map(str::to_string);
+                    let listed: std::collections::BTreeSet<_> = listed.collect();
+                    if let Err(err) = cli::sentence::unlocked_delta(&listed, &rows) {
+                        eprintln!("unlocked definitions: {err}");
+                        return 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("reading {}: {e}", unlocked_path.display());
+                    return 1;
+                }
+            }
+        }
+    }
+    0
+}
+
+fn handle_lean_gate() -> i32 {
+    match cli::lean_gate::locate_checkout() {
+        Err(err) => {
+            eprintln!("lean gate: {err}");
+            1
+        }
+        Ok(None) => {
+            eprintln!("lean gate: btc-lean checkout not found");
+            1
+        }
+        Ok(Some(root)) => match cli::lean_gate::run_required(&root) {
+            Ok(overlay) => {
+                println!(
+                    "lean gate: static gates passed; {} anchor(s) lean-covered",
+                    overlay.len()
+                );
+                0
+            }
+            Err(err) => {
+                eprintln!("lean gate: {err}");
+                1
+            }
+        },
+    }
+}
+
+fn handle_lean_differential(archive: PathBuf, vectors: Option<PathBuf>) -> i32 {
+    use crate::cli::lean_diff::{self, DATA_ARCHIVE_SHA256};
+    if let Err(err) = lean_diff::read_and_check(&archive, DATA_ARCHIVE_SHA256) {
+        eprintln!("differential: {err}");
+        return 1;
+    }
+    let Some(path) = vectors else {
+        println!(
+            "{}",
+            lean_diff::report_json(&lean_diff::DiffReport {
+                agreements: Vec::new(),
+                disagreements: Vec::new(),
+            })
+        );
+        println!("differential: 0 rows; no anchor received differential");
+        return 0;
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => {
+            eprintln!("differential: could not read the vector file");
+            return 1;
+        }
+    };
+    let rows = match lean_diff::load_vectors(&text) {
+        Ok(rows) => rows,
+        Err(err) => {
+            eprintln!("differential: {err}");
+            return 1;
+        }
+    };
+    let report = lean_diff::compare(&rows);
+    println!("{}", lean_diff::report_json(&report));
+    if report.disagreements.is_empty() && !report.agreements.is_empty() {
+        println!(
+            "differential: {} agreement(s); this is not a proof",
+            report.agreements.len()
+        );
+        0
+    } else if !report.disagreements.is_empty() {
+        eprintln!(
+            "differential: {} disagreement(s); those anchors are not differential evidence",
+            report.disagreements.len()
+        );
+        1
+    } else {
+        println!("differential: 0 rows; no anchor received differential");
         0
     }
 }
@@ -1798,4 +2236,42 @@ fn extract_formula_parameters(formula: &str, func_name: &str) -> Vec<String> {
     }
 
     params
+}
+
+#[cfg(test)]
+mod definition_count_tests {
+    use super::*;
+
+    #[test]
+    fn verify_json_uses_the_inventory_definition_counts() {
+        let spec = crate::parser::spec_expr::spec_checkout();
+        assert!(spec.join("lean/lakefile.lean").is_file());
+        let paths = vec![spec.join("PROTOCOL.md"), spec.join("ARCHITECTURE.md")];
+        let (rows, locked) = load_sentence_rows(&paths).expect("inventory");
+        let (locked_n, unlocked_n) = cli::sentence::definition_counts(&locked, &rows);
+        assert!(locked_n > 0, "locked definitions");
+        assert!(unlocked_n > 0, "unlocked definitions");
+        let counts = sentence_counts_of(&paths);
+        assert_eq!(counts["definitions_locked"], locked_n);
+        assert_eq!(counts["definitions_unlocked"], unlocked_n);
+        let report = cli::output::set_sentence_counts(
+            &cli::output::format_verify_json_report(&[], None),
+            &counts,
+        );
+        let value: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(value["summary"]["definitions_locked"], serde_json::json!(locked_n));
+        assert_eq!(
+            value["summary"]["definitions_unlocked"],
+            serde_json::json!(unlocked_n)
+        );
+
+        let absent = sentence_counts_of(&[]);
+        let zeros = cli::output::set_sentence_counts(
+            &cli::output::format_verify_json_report(&[], None),
+            &absent,
+        );
+        let value: serde_json::Value = serde_json::from_str(&zeros).unwrap();
+        assert_eq!(value["summary"]["definitions_locked"], 0);
+        assert_eq!(value["summary"]["definitions_unlocked"], 0);
+    }
 }

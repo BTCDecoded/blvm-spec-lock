@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/BTCDecoded/blvm-spec-lock/schemas/verify_report_v2.json",
+  "title": "blvm-spec-lock verify report v2",
+  "description": "Report emitted by cargo spec-lock verify (report_format 2). Version 1 keys remain. Evidence is an additional set.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["report_format", "command", "tool", "summary", "results"],
+  "properties": {
+    "report_format": { "type": "integer", "const": 2 },
+    "command": { "type": "string", "const": "verify" },
+    "tool": {
+      "type": "object",
+      "required": ["name", "version"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["total", "passed", "failed", "partial", "no_contracts", "evidence"],
+      "additionalProperties": true,
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "partial": { "type": "integer", "minimum": 0 },
+        "no_contracts": { "type": "integer", "minimum": 0 },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 },
+          "required": [
+            "none",
+            "z3_contract",
+            "lean_formula",
+            "lean_model",
+            "differential",
+            "z3_contract+lean_formula"
+          ]
+        },
+        "sentences": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "z3": { "type": "integer", "minimum": 0 },
+            "spec_model": { "type": "integer", "minimum": 0 },
+            "spec_model_conditional": { "type": "integer", "minimum": 0 },
+            "spec_disputed": { "type": "integer", "minimum": 0 },
+            "both": { "type": "integer", "minimum": 0 },
+            "none": { "type": "integer", "minimum": 0 },
+            "unsupported": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "definitions_locked": { "type": "integer", "minimum": 0 },
+        "definitions_unlocked": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "file",
+          "function",
+          "status",
+          "evidence",
+          "evidence_slot",
+          "lean_classification",
+          "lean_covered"
+        ],
+        "additionalProperties": true,
+        "properties": {
+          "file": { "type": "string" },
+          "function": { "type": "string" },
+          "section": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["passed", "failed", "partial", "not_implemented"]
+          },
+          "anchor_kind": {
+            "type": "string",
+            "enum": ["function", "formula", "constant"]
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "z3_contract",
+                "lean_formula",
+                "lean_model",
+                "differential",
+                "none"
+              ]
+            }
+          },
+          "evidence_slot": { "type": "string" },
+          "lean_row_id": { "type": ["string", "null"] },
+          "lean_declaration": { "type": ["string", "null"] },
+          "lean_classification": { "type": "string" },
+          "lean_covered": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

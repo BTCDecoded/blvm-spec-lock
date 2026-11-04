@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Counts **`verify`** rows keyed by **`formula_anchor`** vs **`constant_anchor`** in **`report_format` 1** JSON.
+/// Counts **`verify`** rows keyed by **`formula_anchor`** vs **`constant_anchor`**.
+/// Accepts `report_format` 1 and 2. The rollup reads `results`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WitnessVerifyRollup {
     pub passed: usize,
@@ -977,6 +978,26 @@ mod witness_verify_rollup_tests {
         let cr = c.expect("constant rollup present");
         assert_eq!(cr.total, 1);
         assert_eq!(cr.not_implemented, 1);
+    }
+
+    #[test]
+    fn rollup_accepts_verify_report_format_2() {
+        let json = r#"{
+            "report_format": 2,
+            "results": [
+                {
+                    "status": "passed",
+                    "formula_anchor": "F_A",
+                    "evidence": ["z3_contract"],
+                    "evidence_slot": "z3_contract",
+                    "lean_covered": false
+                }
+            ]
+        }"#;
+        let (f, c) = parse_verify_json_witness_rollups(json).unwrap();
+        let fr = f.expect("formula rollup present");
+        assert_eq!(fr.passed, 1);
+        assert!(c.is_none());
     }
 
     #[test]

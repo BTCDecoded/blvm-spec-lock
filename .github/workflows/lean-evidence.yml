@@ -1,0 +1,43 @@
+name: Lean evidence
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Spec sentences
+    runs-on: [self-hosted, Linux, X64, builds]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/checkout@v6
+        with:
+          repository: BTCDecoded/blvm-spec
+          path: blvm-spec
+
+      - name: Install Rust
+        uses: BTCDecoded/rust-ci/install-rust-toolchain@main
+
+      - name: Install Lean
+        run: |
+          curl -sSf https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Build the spec model
+        working-directory: blvm-spec/lean
+        run: lake build
+
+      - name: Sentence tests
+        run: cargo test --bin cargo-spec-lock -- formula::tests sentence::tests
+
+      - name: Inventory matches the baseline
+        run: cargo run --bin cargo-spec-lock -- inventory --spec-path blvm-spec/PROTOCOL.md blvm-spec/ARCHITECTURE.md --baseline docs/sentence-inventory.tsv
+
+      - name: Require the Lean project
+        run: cargo run --bin cargo-spec-lock -- verify --require-lean --spec-path blvm-spec/PROTOCOL.md blvm-spec/ARCHITECTURE.md --crate-path blvm-spec/lean

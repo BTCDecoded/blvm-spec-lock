@@ -70,7 +70,12 @@ fn golden_path(name: &str) -> PathBuf {
 
 #[test]
 fn protocol_calculate_checksum_contracts() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../blvm-spec/PROTOCOL.md");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let path = ["blvm-spec/PROTOCOL.md", "../blvm-spec/PROTOCOL.md"]
+        .into_iter()
+        .map(|rel| manifest.join(rel))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| manifest.join("../blvm-spec/PROTOCOL.md"));
     if !path.exists() {
         return;
     }

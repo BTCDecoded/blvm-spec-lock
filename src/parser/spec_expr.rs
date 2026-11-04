@@ -6,7 +6,7 @@
 
 use super::orange_paper::SpecParser;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Locked rows whose numeric clause bound is the parsed spec value.
@@ -887,10 +887,38 @@ fn protocol_constants() -> &'static HashMap<String, u64> {
     })
 }
 
+/// Orange Paper checkout.
+///
+/// Actions checks `BTCDecoded/blvm-spec` out at `blvm-spec/` inside this crate.
+/// A local workspace keeps that repo as a sibling. `BLVM_SPEC_DIR` wins when it
+/// points at a tree that contains `PROTOCOL.md`.
+pub fn spec_checkout() -> PathBuf {
+    if let Ok(dir) = std::env::var("BLVM_SPEC_DIR") {
+        let path = PathBuf::from(&dir);
+        if path.join("PROTOCOL.md").is_file() {
+            return path;
+        }
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let inside = manifest.join("blvm-spec");
+    if inside.join("PROTOCOL.md").is_file() {
+        return inside;
+    }
+    let sibling = manifest.join("../blvm-spec");
+    if sibling.join("PROTOCOL.md").is_file() {
+        return sibling;
+    }
+    panic!(
+        "blvm-spec not found at {} or {}",
+        inside.display(),
+        sibling.display()
+    );
+}
+
 fn protocol_text() -> &'static str {
     static TEXT: OnceLock<String> = OnceLock::new();
     TEXT.get_or_init(|| {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../blvm-spec/PROTOCOL.md");
+        let path = spec_checkout().join("PROTOCOL.md");
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     })
     .as_str()

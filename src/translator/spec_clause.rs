@@ -136,7 +136,7 @@ pub fn text_usable(body: &str) -> bool {
 }
 
 fn formula_body(id: &str) -> Option<String> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../blvm-spec/PROTOCOL.md");
+    let path = crate::parser::spec_expr::spec_checkout().join("PROTOCOL.md");
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let mut rest = text.as_str();
     let mut found = None;

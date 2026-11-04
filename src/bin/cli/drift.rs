@@ -182,8 +182,13 @@ pub fn detect_drift(
                 for contract in &func.contracts {
                     let raw = &contract.condition;
                     if condition::extract_parseable_condition(raw).is_none() {
-                        let short = if raw.len() > 80 {
-                            format!("{}...", &raw[..77])
+                        let short = if raw.chars().count() > 80 {
+                            let end = raw
+                                .char_indices()
+                                .nth(77)
+                                .map(|(i, _)| i)
+                                .unwrap_or(raw.len());
+                            format!("{}...", &raw[..end])
                         } else {
                             raw.clone()
                         };

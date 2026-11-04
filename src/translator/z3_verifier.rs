@@ -55,6 +55,23 @@ pub struct Counterexample {
 }
 
 #[cfg(feature = "z3")]
+fn shift_bounds_hold(ctx: &Context, vars: &Z3VarMap<'_>) -> bool {
+    let bounds: Vec<_> = vars
+        .iter()
+        .filter(|(name, _)| name.starts_with("__shift_bound_"))
+        .filter_map(|(_, value)| value.as_bool())
+        .collect();
+    for bound in bounds {
+        let solver = Solver::new(ctx);
+        solver.assert(&bound.not());
+        if solver.check() != SatResult::Unsat {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(feature = "z3")]
 /// Z3 verifier for contracts
 pub struct Z3Verifier {
     translator: Z3Translator,
@@ -159,6 +176,7 @@ impl Z3Verifier {
         // Track whether we successfully translated the function body into solver constraints.
         // A SAT result without body constraints is vacuous (not a real counterexample).
         let mut body_translated = false;
+        let mut shift_bound_open = false;
 
         if matches!(contract.contract_type, ContractType::Ensures) {
             // Add requires constraints — translate with the SAME shared_vars so the
@@ -260,6 +278,7 @@ impl Z3Verifier {
                         }
                     }
                     solver.assert(&impl_formula);
+                    shift_bound_open = !shift_bounds_hold(ctx, &shared_vars);
 
                     // Add non-negativity for any length variable created during body
                     // translation.  The `len` / `is_empty` method handlers produce fresh
@@ -402,6 +421,14 @@ impl Z3Verifier {
                 // Negation is unsatisfiable, so the clause holds under the
                 // constraints that were added. body_translated records whether
                 // that included the production body.
+                // A variable shift still has to prove its amount is below 64
+                // from the guard. The clause check does not use bvlshr's value
+                // at that width, and a failed bound leaves the function open.
+                if body_translated && shift_bound_open {
+                    return VerificationResult::Unknown {
+                        reason: "shift amount is not below 64".to_string(),
+                    };
+                }
                 VerificationResult::Verified { body_translated }
             }
             SatResult::Sat => {

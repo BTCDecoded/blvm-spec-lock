@@ -1,0 +1,40 @@
+name: Lean mutation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  mutate:
+    name: Mutate locked definitions
+    runs-on: [self-hosted, Linux, X64, builds]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/checkout@v6
+        with:
+          repository: BTCDecoded/blvm-spec
+          path: blvm-spec
+
+      - name: Install Rust
+        uses: BTCDecoded/rust-ci/install-rust-toolchain@main
+
+      - name: Install Lean
+        run: |
+          curl -sSf https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Mutation report
+        run: cargo test --bin cargo-spec-lock -- weakened_guard_fails_the_equation clause_6212_holds_and_mutations_flip_it
+
+      - name: Mutate locked definition bodies
+        run: |
+          set -euo pipefail
+          MODULE=$(cargo run --quiet --bin cargo-spec-lock -- mutation-rebuild --lean-dir blvm-spec/lean)
+          cd "$MODULE"
+          # equation proofs are excluded from this module
+          lake build SpecLock

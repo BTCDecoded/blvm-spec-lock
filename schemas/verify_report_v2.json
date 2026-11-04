@@ -39,7 +39,22 @@
             "differential",
             "z3_contract+lean_formula"
           ]
-        }
+        },
+        "sentences": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "z3": { "type": "integer", "minimum": 0 },
+            "spec_model": { "type": "integer", "minimum": 0 },
+            "spec_model_conditional": { "type": "integer", "minimum": 0 },
+            "spec_disputed": { "type": "integer", "minimum": 0 },
+            "both": { "type": "integer", "minimum": 0 },
+            "none": { "type": "integer", "minimum": 0 },
+            "unsupported": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "definitions_locked": { "type": "integer", "minimum": 0 },
+        "definitions_unlocked": { "type": "integer", "minimum": 0 }
       }
     },
     "results": {

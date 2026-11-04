@@ -136,6 +136,8 @@ pub struct FunctionToVerify {
     pub formula_anchor: Option<String>,
     /// When **`Some`**, **`#[spec_locked]`** named a **`C_*`** consensus-constant stable id (**`constants_stable_id_map`**).
     pub constant_anchor: Option<String>,
+    /// Sentences the Z3 contract list does not take (forall, implication, sum).
+    pub formulas: Vec<crate::parser::formula::Formula>,
     pub function_sig: Option<syn::ItemFn>, // Store function signature for type inference
 }
 
@@ -251,6 +253,7 @@ fn parse_file_for_functions(file_path: &std::path::Path) -> Result<Vec<FunctionT
                                 spec_name_override: extract_spec_name_override(&impl_fn.attrs),
                                 formula_anchor: extract_formula_anchor(&impl_fn.attrs),
                                 constant_anchor: extract_constant_anchor(&impl_fn.attrs),
+                                formulas: Vec::new(),
                                 function_sig: Some(item_fn),
                             });
                         }
@@ -280,6 +283,7 @@ fn make_function_to_verify(
         spec_name_override: extract_spec_name_override(attrs),
         formula_anchor: extract_formula_anchor(attrs),
         constant_anchor: extract_constant_anchor(attrs),
+        formulas: Vec::new(),
         function_sig: Some(func.clone()),
     }
 }

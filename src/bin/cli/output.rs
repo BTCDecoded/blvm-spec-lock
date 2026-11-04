@@ -273,6 +273,17 @@ pub fn format_verify_json_report_with(
             "partial": partial,
             "no_contracts": no_contracts,
             "evidence": evidence_summary,
+            "sentences": {
+                "z3": 0,
+                "spec_model": 0,
+                "spec_model_conditional": 0,
+                "spec_disputed": 0,
+                "both": 0,
+                "none": 0,
+                "unsupported": 0
+            },
+            "definitions_locked": 0,
+            "definitions_unlocked": 0,
         },
         "results": json_results,
     });
@@ -286,6 +297,42 @@ pub fn format_verify_json_report_with(
     }
 
     serde_json::to_string_pretty(&output_val).unwrap_or_else(|_| "{}".to_string())
+}
+
+pub fn set_sentence_counts(
+    report: &str,
+    counts: &std::collections::BTreeMap<String, usize>,
+) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(report) else {
+        return report.to_string();
+    };
+    if let Some(summary) = value.get_mut("summary").and_then(|v| v.as_object_mut()) {
+        let mut sentences = serde_json::Map::new();
+        for key in [
+            "z3",
+            "spec_model",
+            "spec_model_conditional",
+            "spec_disputed",
+            "both",
+            "none",
+            "unsupported",
+        ] {
+            sentences.insert(
+                key.to_string(),
+                serde_json::json!(counts.get(key).copied().unwrap_or(0)),
+            );
+        }
+        summary.insert("sentences".to_string(), serde_json::Value::Object(sentences));
+        summary.insert(
+            "definitions_locked".to_string(),
+            serde_json::json!(counts.get("definitions_locked").copied().unwrap_or(0)),
+        );
+        summary.insert(
+            "definitions_unlocked".to_string(),
+            serde_json::json!(counts.get("definitions_unlocked").copied().unwrap_or(0)),
+        );
+    }
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| report.to_string())
 }
 
 /// Metadata for **`verify-formulas`** JSON summary (solver/stub flags mirror CLI).
@@ -777,6 +824,7 @@ mod tests {
                 spec_name_override: None,
                 formula_anchor: fa,
                 constant_anchor: ca,
+                formulas: Vec::new(),
                 function_sig: None,
             };
             let s = format_verify_json_report(
@@ -845,6 +893,7 @@ mod tests {
             spec_name_override: None,
             formula_anchor: None,
             constant_anchor: None,
+            formulas: Vec::new(),
             function_sig: None,
         };
         let results = vec![(
@@ -868,6 +917,7 @@ mod tests {
             spec_name_override: None,
             formula_anchor: None,
             constant_anchor: None,
+            formulas: Vec::new(),
             function_sig: None,
         };
         let results = vec![(
@@ -893,6 +943,7 @@ mod tests {
             spec_name_override: None,
             formula_anchor: None,
             constant_anchor: None,
+            formulas: Vec::new(),
             function_sig: None,
         };
         let results = vec![(
@@ -941,6 +992,7 @@ mod tests {
                 spec_name_override: None,
                 formula_anchor: None,
                 constant_anchor: None,
+                formulas: Vec::new(),
                 function_sig: None,
             };
             let results = vec![(
@@ -984,6 +1036,7 @@ mod tests {
                 spec_name_override: None,
                 formula_anchor: None,
                 constant_anchor: None,
+                formulas: Vec::new(),
                 function_sig: None,
             };
             let results = vec![(
@@ -1010,6 +1063,7 @@ mod tests {
             spec_name_override: None,
             formula_anchor: None,
             constant_anchor: None,
+            formulas: Vec::new(),
             function_sig: None,
         };
 

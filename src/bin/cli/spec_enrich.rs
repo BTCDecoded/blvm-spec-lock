@@ -302,6 +302,9 @@ pub fn enrich_functions_with_spec(
                     .and_then(|s| syn::parse_str::<syn::Expr>(s).ok());
 
                 if expr.is_none() {
+                    if let Some(parsed) = crate::parser::formula::parse_sentence(&condition) {
+                        func.formulas.push(parsed);
+                    }
                     continue;
                 }
 
@@ -333,6 +336,10 @@ pub fn enrich_functions_with_spec(
                             .filter(|tok| tok.chars().next().is_some_and(|c| c.is_alphabetic()))
                             .any(|tok| tok != "result" && !tok.starts_with('\\'));
                         if antecedent_has_non_result_idents {
+                            if let Some(parsed) = crate::parser::formula::parse_sentence(&condition)
+                            {
+                                func.formulas.push(parsed);
+                            }
                             continue; // Cannot inject: antecedent involves inputs.
                         }
                     }
@@ -513,6 +520,7 @@ $$true$$
             spec_name_override: None,
             formula_anchor: Some("F_EnrichSmoke".into()),
             constant_anchor: None,
+            formulas: Vec::new(),
             function_sig: Some(func),
         }];
 
@@ -557,6 +565,7 @@ $SMK = 7$
             spec_name_override: None,
             formula_anchor: None,
             constant_anchor: Some("C_SMK".into()),
+            formulas: Vec::new(),
             function_sig: Some(func),
         }];
 

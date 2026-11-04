@@ -11,24 +11,33 @@ permissions:
 
 jobs:
   gate:
-    name: Pinned btc-lean gates
+    name: Spec sentences
     runs-on: [self-hosted, Linux, X64, builds]
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/checkout@v6
         with:
-          repository: Rob1Ham/btc-lean
-          ref: d390f7932e64a134aec3cca1614bed3276539f2d
-          path: btc-lean
+          repository: BTCDecoded/blvm-spec
+          path: blvm-spec
 
       - name: Install Rust
         uses: BTCDecoded/rust-ci/install-rust-toolchain@main
 
-      - name: Negative tests
-        run: cargo test --bin cargo-spec-lock -- lean_
+      - name: Install Lean
+        run: |
+          curl -sSf https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
-      - name: Static gates at the pin
-        env:
-          BTC_LEAN_ROOT: ${{ github.workspace }}/btc-lean
-        run: cargo run --bin cargo-spec-lock -- lean-gate
+      - name: Build the spec model
+        working-directory: blvm-spec/lean
+        run: lake build
+
+      - name: Sentence tests
+        run: cargo test --bin cargo-spec-lock -- formula::tests sentence::tests
+
+      - name: Inventory matches the baseline
+        run: cargo run --bin cargo-spec-lock -- inventory --spec-path blvm-spec/PROTOCOL.md blvm-spec/ARCHITECTURE.md --baseline docs/sentence-inventory.tsv
+
+      - name: Require the Lean project
+        run: cargo run --bin cargo-spec-lock -- verify --require-lean --spec-path blvm-spec/PROTOCOL.md blvm-spec/ARCHITECTURE.md --crate-path blvm-spec/lean

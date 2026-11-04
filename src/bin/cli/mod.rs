@@ -13,5 +13,6 @@ pub mod lean_evidence;
 pub mod lean_gate;
 pub mod lean_negative;
 pub mod output;
+pub mod sentence;
 pub mod spec_enrich;
 pub mod verify;

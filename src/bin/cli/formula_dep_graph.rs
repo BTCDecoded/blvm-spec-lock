@@ -108,6 +108,7 @@ mod tests {
             section: "1.0".into(),
             latex_body: "true".into(),
             raw_markdown: String::new(),
+            trailing: String::new(),
             depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
         }
     }

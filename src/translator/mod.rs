@@ -6,6 +6,7 @@
 //! - `z3_verifier`: Z3 solving and counterexample extraction
 
 pub mod ast_body;
+pub mod body_edit;
 pub mod sample_eval;
 pub mod static_checker;
 

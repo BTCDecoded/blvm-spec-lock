@@ -7,7 +7,7 @@
 use super::lexer;
 use regex::Regex;
 
-/// Classify noise: parsing fragments, URLs. Returns Some("noise") to accept as "true", None otherwise.
+/// Classify noise: parsing fragments, URLs. `Some("noise")` means there is no contract.
 fn classify_noise(cond: &str) -> Option<&'static str> {
     let c = cond.trim();
     if c.len() < 3 {
@@ -184,9 +184,21 @@ pub fn extract_parseable_condition(condition: &str) -> Option<String> {
         }
     }
 
-    // Noise fragments: accept as "true" so they don't inflate unparseable count
+    // A URL, markdown link, or citation is not a postcondition.
     if let Some("noise") = classify_noise(&cond) {
-        return Some("true".to_string());
+        return None;
+    }
+
+    // Ceiling of weight is the vsize identity. The addend and divisor come
+    // from the spec equation, not from a constant in this prover.
+    if (cond.contains(r"\lceil") || cond.contains('⌈'))
+        && (cond.contains("weight /") || cond.contains("weight/"))
+    {
+        if super::spec_expr::consensus_workspace_present() {
+            let (add, div) = super::spec_expr::vsize_ceiling();
+            return Some(format!("result == (weight + {add}) / {div}"));
+        }
+        return None;
     }
 
     // Universally-quantified expressions (∀ / \forall) are mathematical theorems,
@@ -248,17 +260,10 @@ pub fn extract_parseable_condition(condition: &str) -> Option<String> {
         return Some("(result == true || result == false)".to_string());
     }
 
-    // Result equality (determinism): result(a) == result(b) ⟹ same inputs → same outputs
-    // Mathematical: ∀a,b: a=b → f(a)=f(b). Full determinism verification needs two-run Z3.
-    if is_result_equality(&cond) {
-        return Some("true".to_string()); // Determinism invariant; verifier can extend later
-    }
-    // Non-determinism annotation: result(tx_1,...) \neq result(tx_2,...) "may differ"
-    // These are existential annotations documenting that the function IS input-dependent.
-    // They are NOT universal postconditions and reduce to `result != result` (contradiction)
-    // when both result(...) calls are normalized.  Treat as trivially true.
-    if is_result_inequality(&cond) {
-        return Some("true".to_string());
+    // "Same inputs, same output" and "may differ" name determinism. Neither is
+    // the literal `true`, and neither becomes a contract.
+    if is_result_equality(&cond) || is_result_inequality(&cond) {
+        return None;
     }
 
     // Descriptive text → mathematical form (invariants we accept as axioms)
@@ -316,6 +321,9 @@ pub fn extract_parseable_condition(condition: &str) -> Option<String> {
         ("result is 4 bytes", "result.len() == 4"),
     ];
     for (pattern, rust) in descriptive_patterns {
+        if rust == "true" {
+            continue;
+        }
         if cond.contains(pattern) && cond.len() < 120 {
             return Some(rust.to_string());
         }
@@ -342,14 +350,14 @@ pub fn extract_parseable_condition(condition: &str) -> Option<String> {
     if (cond.contains(r"\in \mathbb{N}") || cond.contains("∈ ℕ")) && cond.contains("result") {
         return Some("result >= 0".to_string());
     }
-    // \in \mathbb{Z} or \in \mathbb{S} → true (any int / script type)
+    // Membership in Z or S names a type. It is not a postcondition.
     if cond.contains(r"\in \mathbb{Z}") || cond.contains(r"\in \mathbb{S}") {
-        return Some("true".to_string());
+        return None;
     }
 
-    // Option type: \in {Some(...), None}
+    // Option membership names a type. It is not a postcondition.
     if Regex::new(r"\\in\s*\{\s*Some[^}]*,\s*None\s*\}").is_ok_and(|re| re.is_match(&cond)) {
-        return Some("true".to_string()); // Option is always Some or None
+        return None;
     }
 
     // "requires(expr)" → expr   (e.g. \text{requires}(bits > 0) after \text{} stripping)
@@ -590,9 +598,9 @@ pub fn extract_parseable_condition(condition: &str) -> Option<String> {
     if let Some(disj) = parse_enum_membership(&core) {
         return Some(disj);
     }
-    // Fallback: SighashType etc. - treat as true when explicit mapping fails
+    // An enum the membership parser did not map is not a postcondition.
     if core.contains(r"\in {") && (core.contains("AllLegacy") || core.contains("AnyoneC")) {
-        return Some("true".to_string());
+        return None;
     }
     // Fallback: result(...) \in {true, false} with nested parens - use simpler match
     if core.contains("result")
@@ -924,6 +932,53 @@ mod tests {
         assert!(
             s.contains(">=") && s.contains("result") && s.contains("0"),
             "extracted: {s:?}"
+        );
+    }
+
+    #[test]
+    fn weight_ceiling_is_the_spec_identity() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let (add, div) = crate::parser::spec_expr::vsize_ceiling();
+        let got =
+            extract_parseable_condition(r"result = \lceil weight / 4 \rceil = (weight + 3) / 4")
+                .expect("ceiling");
+        assert_eq!(got, format!("result == (weight + {add}) / {div}"));
+        assert_ne!(got, "true");
+    }
+
+    #[test]
+    fn literal_true_stays() {
+        assert_eq!(
+            extract_parseable_condition("true"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn prose_and_noise_are_not_true() {
+        assert_eq!(
+            extract_parseable_condition("enforces strict DER encoding"),
+            None
+        );
+        assert_eq!(
+            extract_parseable_condition("Same inputs yield same hash"),
+            None
+        );
+        assert_eq!(extract_parseable_condition("result(a) == result(b)"), None);
+        assert_eq!(
+            extract_parseable_condition("https://example.com/spec"),
+            None
+        );
+        assert_eq!(extract_parseable_condition(r"result \in \mathbb{Z}"), None);
+    }
+
+    #[test]
+    fn byte_length_phrase_still_parses() {
+        assert_eq!(
+            extract_parseable_condition("|result| = 4"),
+            Some("result.len() == 4".to_string())
         );
     }
 }

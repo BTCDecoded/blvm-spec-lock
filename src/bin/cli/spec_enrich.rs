@@ -196,6 +196,21 @@ pub fn enrich_functions_with_spec(
                         .iter()
                         .filter(|c| c.is_spec_derived && c.contract_type == ContractType::Ensures)
                         .all(|c| c.condition.trim() == "true");
+                    for assumption in crate::parser::spec_expr::when_assumptions(&fspec.trailing) {
+                        if func.contracts.iter().any(|c| c.condition == assumption) {
+                            continue;
+                        }
+                        let Ok(expr) = syn::parse_str::<syn::Expr>(&assumption) else {
+                            continue;
+                        };
+                        func.contracts.push(Contract {
+                            contract_type: ContractType::Requires,
+                            condition: assumption,
+                            expr: Some(expr),
+                            is_spec_derived: true,
+                        });
+                    }
+
                     if (!spec_formula_pushed || spec_trivially_true) && !manual_ensures.is_empty() {
                         // Dedup: skip manual contracts whose condition is already present.
                         for m in manual_ensures {
@@ -203,6 +218,9 @@ pub fn enrich_functions_with_spec(
                                 func.contracts.push(m);
                             }
                         }
+                    } else if !spec_formula_pushed && manual_ensures.is_empty() {
+                        // The formula was found and nothing in it parsed.
+                        func.parse_gap = true;
                     }
 
                     continue;
@@ -237,10 +255,8 @@ pub fn enrich_functions_with_spec(
         let spec_func = spec_func.map(|f| {
             if f.contracts.is_empty() {
                 // Prefer a wildcard catch-all entry if the section has one.
-                // Fall back to the originally found function so that the
-                // "spec section exists, no formal properties" path in the
-                // block below can inject a trivially-true contract rather
-                // than silently dropping this function from enrichment.
+                // Fall back to the originally found function so a section
+                // with no formal properties stays a gap rather than a drop.
                 parser.find_function(section_ref, Some("*")).unwrap_or(f)
             } else {
                 f
@@ -249,17 +265,15 @@ pub fn enrich_functions_with_spec(
 
         if let Some(spec_func) = spec_func {
             if spec_func.contracts.is_empty() {
-                // Spec section exists but has no formal Properties. Inject a
-                // trivially-true contract so check-drift and verify do not flag
-                // the function as missing from the Orange Paper.
-                let expr: syn::Expr = syn::parse_str("true").expect("'true' is valid Rust");
-                func.contracts.push(Contract {
-                    contract_type: ContractType::Ensures,
-                    condition: "true".to_string(),
-                    expr: Some(expr),
-                    is_spec_derived: true,
-                });
-                enriched_count += 1;
+                // The section exists and has no formal Properties. A manual
+                // ensures stays. Otherwise this is a gap: no `ensures(true)`.
+                let has_manual_ensures = func
+                    .contracts
+                    .iter()
+                    .any(|c| c.contract_type == ContractType::Ensures && !c.is_spec_derived);
+                if !has_manual_ensures {
+                    func.parse_gap = true;
+                }
                 continue;
             }
 
@@ -406,19 +420,8 @@ pub fn enrich_functions_with_spec(
                     }
                 }
             } else if !added_any && manual_ensures.is_empty() {
-                // The section has properties, but none were parseable. Inject
-                // `true` so check-drift does not report the function as missing
-                // and verify records PASSED rather than PARTIAL.
-                let expr: syn::Expr = syn::parse_str("true").expect("'true' is valid Rust");
-                if !func.contracts.iter().any(|c| c.condition == "true") {
-                    func.contracts.push(Contract {
-                        contract_type: ContractType::Ensures,
-                        condition: "true".to_string(),
-                        expr: Some(expr),
-                        is_spec_derived: true,
-                    });
-                    enriched_count += 1;
-                }
+                // Properties were found and none parsed. Partial, not `ensures(true)`.
+                func.parse_gap = true;
             }
         }
 
@@ -514,6 +517,7 @@ $$true$$
             formula_anchor: Some("F_EnrichSmoke".into()),
             constant_anchor: None,
             function_sig: Some(func),
+            parse_gap: false,
         }];
 
         let n =
@@ -558,6 +562,7 @@ $SMK = 7$
             formula_anchor: None,
             constant_anchor: Some("C_SMK".into()),
             function_sig: Some(func),
+            parse_gap: false,
         }];
 
         let n =
@@ -570,6 +575,118 @@ $SMK = 7$
             ContractType::Ensures
         );
         assert!(functions[0].contracts[0].expr.is_some());
+    }
+
+    fn gap_fn(name: &str, section: &str) -> FunctionToVerify {
+        let func: syn::ItemFn = parse_quote! {
+            fn gap() -> i64 { 0 }
+        };
+        FunctionToVerify {
+            file_path: PathBuf::from("witness.rs"),
+            function_name: name.into(),
+            contracts: vec![],
+            section: Some(section.into()),
+            spec_name_override: Some(name.into()),
+            formula_anchor: None,
+            constant_anchor: None,
+            function_sig: Some(func),
+            parse_gap: false,
+        }
+    }
+
+    #[test]
+    fn empty_section_is_a_gap_not_true() {
+        let dir = std::env::temp_dir().join(format!(
+            "spec_lock_empty_section_{}_{}",
+            std::process::id(),
+            rand_unique()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let md_path = dir.join("empty.md");
+        std::fs::write(&md_path, "## 99.92 Gap\n\n**GapFunc**: $h \\to r$\n")
+            .expect("write fixture");
+        let _cleanup_dir = TmpDirCleanup(dir);
+        let mut functions = vec![gap_fn("GapFunc", "99.92")];
+        let n = enrich_functions_with_spec(&mut functions, &[md_path]).expect("enrich");
+        assert_eq!(n, 0);
+        assert!(functions[0].parse_gap);
+        assert!(functions[0].contracts.is_empty());
+    }
+
+    #[test]
+    fn unparsed_property_is_a_gap_not_true() {
+        let dir = std::env::temp_dir().join(format!(
+            "spec_lock_prose_section_{}_{}",
+            std::process::id(),
+            rand_unique()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let md_path = dir.join("prose.md");
+        std::fs::write(
+            &md_path,
+            "## 99.93 Prose\n\n**ProseFunc**: $h \\to r$\n\n**Properties**:\n- DER: enforces strict DER encoding\n",
+        )
+        .expect("write fixture");
+        let _cleanup_dir = TmpDirCleanup(dir);
+        let mut functions = vec![gap_fn("ProseFunc", "99.93")];
+        let n = enrich_functions_with_spec(&mut functions, &[md_path]).expect("enrich");
+        assert_eq!(n, 0);
+        assert!(functions[0].parse_gap);
+        assert!(
+            functions[0]
+                .contracts
+                .iter()
+                .all(|c| c.condition.trim() != "true")
+        );
+    }
+
+    #[test]
+    fn literal_true_property_stays_a_contract() {
+        let dir = std::env::temp_dir().join(format!(
+            "spec_lock_literal_true_{}_{}",
+            std::process::id(),
+            rand_unique()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let md_path = dir.join("literal.md");
+        std::fs::write(
+            &md_path,
+            "## 99.94 Literal\n\n**TrueFunc**: $h \\to r$\n\n**Properties**:\n- Holds: $true$\n",
+        )
+        .expect("write fixture");
+        let _cleanup_dir = TmpDirCleanup(dir);
+        let mut functions = vec![gap_fn("TrueFunc", "99.94")];
+        let n = enrich_functions_with_spec(&mut functions, &[md_path]).expect("enrich");
+        assert_eq!(n, 1);
+        assert!(!functions[0].parse_gap);
+        assert_eq!(functions[0].contracts[0].condition.trim(), "true");
+    }
+
+    #[test]
+    fn empty_section_keeps_manual_ensures() {
+        let dir = std::env::temp_dir().join(format!(
+            "spec_lock_manual_keep_{}_{}",
+            std::process::id(),
+            rand_unique()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let md_path = dir.join("manual.md");
+        std::fs::write(&md_path, "## 99.95 Manual\n\n**ManualFunc**: $h \\to r$\n")
+            .expect("write fixture");
+        let _cleanup_dir = TmpDirCleanup(dir);
+        let mut function = gap_fn("ManualFunc", "99.95");
+        function.contracts.push(Contract {
+            contract_type: ContractType::Ensures,
+            condition: "result >= 0".into(),
+            expr: syn::parse_str("result >= 0").ok(),
+            is_spec_derived: false,
+        });
+        let mut functions = vec![function];
+        let n = enrich_functions_with_spec(&mut functions, &[md_path]).expect("enrich");
+        assert_eq!(n, 0);
+        assert!(!functions[0].parse_gap);
+        assert_eq!(functions[0].contracts.len(), 1);
+        assert_eq!(functions[0].contracts[0].condition, "result >= 0");
     }
 
     fn rand_unique() -> u64 {

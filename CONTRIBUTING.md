@@ -1,11 +1,11 @@
 # Contributing to blvm-spec-lock
 
-Thank you for your interest in contributing! For comprehensive guidelines, see the [BLVM Documentation](https://docs.thebitcoincommons.org/development/contributing.html).
+Thank you for your interest in contributing! For comprehensive guidelines, see the [BLVM Documentation](https://docs.btcdecoded.org/blvm/development/contributing.html).
 
 ## Quick Links
 
-- **[Complete Contributing Guide](https://docs.thebitcoincommons.org/development/contributing.html)**
-- **[PR Process](https://docs.thebitcoincommons.org/development/pr-process.html)**
+- **[Complete Contributing Guide](https://docs.btcdecoded.org/blvm/development/contributing.html)**
+- **[PR Process](https://docs.btcdecoded.org/blvm/development/pr-process.html)**
 
 ## Development Setup
 

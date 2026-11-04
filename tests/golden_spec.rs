@@ -2,6 +2,7 @@
 //!
 //! Run with `INSTA_UPDATE=always cargo test golden_` after intentional parser changes.
 
+#[allow(dead_code)]
 #[path = "../src/parser/mod.rs"]
 mod parser;
 

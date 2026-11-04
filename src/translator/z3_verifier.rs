@@ -425,7 +425,21 @@ impl Z3Verifier {
                                 .strip_prefix("r1_")
                                 .or_else(|| k.strip_prefix("r2_"))
                                 .unwrap_or(k.as_str());
-                            !known_names.contains(bare)
+                            if known_names.contains(bare) {
+                                return false;
+                            }
+                            // The scan index is a quantifier bound, not an untranslated local.
+                            if self.translator.is_quantifier_bound(bare) {
+                                return false;
+                            }
+                            // A field of a parameter is an input, as is its length.
+                            if self.translator.is_input_name(bare) {
+                                return false;
+                            }
+                            // `program.len()` is the input the clause names, not an internal.
+                            !param_types
+                                .keys()
+                                .any(|param| bare == format!("{param}_len"))
                         })
                     });
                 if is_vacuous {
@@ -986,6 +1000,39 @@ mod translation_holes {
     }
 
     #[test]
+    fn subsidy_call_uses_the_proved_ensures_without_a_table_entry() {
+        let func: syn::ItemFn =
+            syn::parse_str("fn wrap(height: u64) -> i64 { get_block_subsidy(height) }").unwrap();
+        let condition: syn::Expr = syn::parse_str("result >= 0").unwrap();
+        let contract = Contract {
+            contract_type: ContractType::Ensures,
+            condition,
+            comment: None,
+        };
+        let mut verifier = Z3Verifier::new(10_000);
+        let without = verifier.verify_contract_with_context(&contract, Some(&func), &[], &[]);
+        assert!(
+            !matches!(without, VerificationResult::Verified { .. }),
+            "an unaxiomatized call is not the bound, got {without:?}"
+        );
+        let with = verifier.verify_contract_with_context(
+            &contract,
+            Some(&func),
+            &[],
+            &[("get_block_subsidy", "result >= 0")],
+        );
+        assert!(
+            matches!(
+                with,
+                VerificationResult::Verified {
+                    body_translated: false
+                }
+            ),
+            "the proved ensures is the axiom, not a second body, got {with:?}"
+        );
+    }
+
+    #[test]
     fn subsidy_calls_depend_on_their_arguments() {
         let result = prove(
             "fn f(a: u64, b: u64) -> i64 { get_block_subsidy(a) - get_block_subsidy(b) }",
@@ -1275,6 +1322,37 @@ fn extract_parameter_types(func: &syn::ItemFn) -> std::collections::HashMap<Stri
             if let syn::Pat::Ident(ident) = &*pat_type.pat {
                 types.insert(ident.ident.to_string(), *pat_type.ty.clone());
             }
+        }
+    }
+    // `let (a, b) = pair` names the elements of a tuple parameter. The clause
+    // and the body both use those names, and a model may assign them.
+    for stmt in &func.block.stmts {
+        let syn::Stmt::Local(local) = stmt else {
+            continue;
+        };
+        let syn::Pat::Tuple(tuple) = &local.pat else {
+            continue;
+        };
+        let Some(init) = &local.init else {
+            continue;
+        };
+        let syn::Expr::Path(path) = &*init.expr else {
+            continue;
+        };
+        let Some(name) = path.path.get_ident() else {
+            continue;
+        };
+        let Some(syn::Type::Tuple(elems)) = types.get(&name.to_string()).cloned() else {
+            continue;
+        };
+        if elems.elems.len() != tuple.elems.len() {
+            continue;
+        }
+        for (pat, elem) in tuple.elems.iter().zip(elems.elems.iter()) {
+            let syn::Pat::Ident(ident) = pat else {
+                continue;
+            };
+            types.insert(ident.ident.to_string(), elem.clone());
         }
     }
     types

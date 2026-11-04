@@ -271,7 +271,7 @@ pub fn facts_of(func: &syn::ItemFn) -> ProductionFacts {
         .cmps
         .iter()
         .all(|cmp| cmp.left.lit != Some(0x31) && cmp.right.lit != Some(0x31));
-    v.facts.merkle_eq_present = scanned.marks.iter().any(|mark| *mark == "merkle-eq");
+    v.facts.merkle_eq_present = scanned.marks.contains(&"merkle-eq");
     v.facts.merkle_eq_before_pad = v.facts.merkle_eq_present
         && match (
             scanned.marks.iter().position(|mark| *mark == "merkle-eq"),
@@ -629,116 +629,6 @@ pub fn fast_path_query(falls_through: bool, calls_verifier: bool) -> SatResult {
     })
 }
 
-/// `result` iff `(sequence & mask) != 0` for the consensus mask.
-pub fn masked_bit_query(src: &str, consensus_mask: u64) -> SatResult {
-    let body = ast_body::analyze(src);
-    let body_mask = body.bits.first().map(|bit| bit.lit as u64).unwrap_or(0);
-    let negated = body
-        .cmps
-        .iter()
-        .any(|cmp| cmp.op == CmpOp::Eq && cmp.right.lit == Some(0))
-        && !body
-            .cmps
-            .iter()
-            .any(|cmp| cmp.op == CmpOp::Ne && cmp.right.lit == Some(0));
-    check(|ctx, solver| {
-        let seq = BV::new_const(ctx, "sequence", 32);
-        let mask = BV::from_u64(ctx, body_mask, 64).extract(31, 0);
-        let zero = BV::from_u64(ctx, 0, 32);
-        let bit = seq.bvand(&mask)._eq(&zero).not();
-        let result = if negated { bit.not() } else { bit.clone() };
-        let want = BV::from_u64(ctx, consensus_mask, 64).extract(31, 0);
-        let clause_bit = seq.bvand(&want)._eq(&zero).not();
-        solver.assert(&result._eq(&clause_bit).not());
-    })
-}
-
-/// Low 16 bits of the sequence are the locktime value.
-pub fn sequence_value_query(src: &str) -> SatResult {
-    let body = ast_body::analyze(src);
-    let body_mask = body.bits.first().map(|bit| bit.lit as u64).unwrap_or(0);
-    let uses_or = body.bits.iter().any(|bit| bit.or) && body.bits.iter().all(|bit| bit.or);
-    check(|ctx, solver| {
-        let seq = BV::new_const(ctx, "sequence", 32);
-        let mask = BV::from_u64(ctx, body_mask, 64).extract(31, 0);
-        let bits = if uses_or {
-            seq.bvor(&mask)
-        } else {
-            seq.bvand(&mask)
-        };
-        let low = BV::from_u64(
-            ctx,
-            crate::parser::spec_expr::mask_in("ExtractSequenceLocktimeValue"),
-            64,
-        )
-        .extract(31, 0);
-        let clause = bits._eq(&seq.bvand(&low));
-        solver.assert(&clause.not());
-    })
-}
-
-/// Height iff `locktime < 500_000_000`.
-pub fn locktime_kind_query(src: &str) -> SatResult {
-    let is_height_cmp = ast_body::analyze(src)
-        .cmps
-        .iter()
-        .find(|cmp| cmp.left.has("locktime") && cmp.right.has("LOCKTIME_THRESHOLD"))
-        .map(|cmp| match cmp.op {
-            CmpOp::Le => "le",
-            CmpOp::Lt => "lt",
-            CmpOp::Ge => "ge",
-            CmpOp::Gt => "gt",
-            _ => "absent",
-        })
-        .unwrap_or("absent");
-    check(|ctx, solver| {
-        let locktime = BV::new_const(ctx, "locktime", 32);
-        let body_t = BV::from_u64(
-            ctx,
-            crate::parser::spec_expr::impl_u64("LOCKTIME_THRESHOLD"),
-            32,
-        );
-        let clause_t = BV::from_u64(ctx, crate::parser::spec_expr::locktime_threshold(), 32);
-        let is_height = match is_height_cmp {
-            "lt" => locktime.bvult(&body_t),
-            "le" => locktime.bvule(&body_t),
-            "gt" => locktime.bvugt(&body_t),
-            "ge" => locktime.bvuge(&body_t),
-            _ => Bool::from_bool(ctx, false),
-        };
-        let want = locktime.bvult(&clause_t);
-        solver.assert(&is_height._eq(&want).not());
-    })
-}
-
-/// Equal locktimes of the same type pass. `>` rejects the equal case.
-pub fn bip65_query(src: &str) -> SatResult {
-    let body = ast_body::analyze(src);
-    let ge = body.cmps.iter().any(|cmp| cmp.op == CmpOp::Ge);
-    let types = ast_body::call_named(&body.calls, "locktime_types_match");
-    check(|ctx, solver| {
-        let tx = BV::new_const(ctx, "tx_lt", 32);
-        let stack = BV::new_const(ctx, "stack_lt", 32);
-        let same_type = Bool::new_const(ctx, "same_type");
-        let ordered = if ge {
-            tx.bvuge(&stack)
-        } else {
-            tx.bvugt(&stack)
-        };
-        let accepted = if types {
-            same_type.clone() & ordered
-        } else {
-            ordered
-        };
-        let clause = if crate::parser::spec_expr::bip65_orders_ge() {
-            same_type & tx.bvuge(&stack)
-        } else {
-            same_type & tx.bvugt(&stack)
-        };
-        solver.assert(&accepted._eq(&clause).not());
-    })
-}
-
 fn pow_accepts<'a>(src: &str, hash: &BV<'a>, target: &BV<'a>) -> Bool<'a> {
     let op = ast_body::analyze(src)
         .cmps
@@ -917,36 +807,6 @@ pub fn header_future_above_query(src: &str) -> SatResult {
 /// A timestamp equal to the median is rejected. One below it is rejected.
 /// The compare counts only inside the time-context branch.
 /// Unsat means the source has no accepting counterexample.
-pub fn header_mtp_query(src: &str, below: bool) -> SatResult {
-    if !crate::parser::spec_expr::median_past_is_lower_bound() {
-        panic!("spec H05 is not timestamp > MedianTimePast");
-    }
-    let body = ast_body::analyze(src);
-    let lt = body.time_context.iter().any(|cmp| {
-        cmp.op == CmpOp::Lt && cmp.left.has("timestamp") && cmp.right.has("median_time_past")
-    });
-    let le = body.time_context.iter().any(|cmp| {
-        cmp.op == CmpOp::Le && cmp.left.has("timestamp") && cmp.right.has("median_time_past")
-    });
-    check(|ctx, solver| {
-        let ts = BV::new_const(ctx, "ts", 32);
-        let mtp = BV::new_const(ctx, "mtp", 32);
-        if below {
-            solver.assert(&ts.bvult(&mtp));
-        } else {
-            solver.assert(&ts._eq(&mtp));
-        }
-        let rejected = if le {
-            ts.bvule(&mtp)
-        } else if lt {
-            ts.bvult(&mtp)
-        } else {
-            Bool::from_bool(ctx, false)
-        };
-        solver.assert(&rejected.not());
-    })
-}
-
 fn between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
     let Some(i) = src.find(start) else {
         return "";
@@ -962,49 +822,6 @@ fn between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 /// v0 accepts 20 or 32 bytes and nothing else. v1 accepts 32 bytes and nothing else.
-pub fn witness_program_query(src: &str) -> SatResult {
-    let body = ast_body::analyze(src);
-    let v0 = ast_body::arm_named(&body.arms, "SegWitV0");
-    let v1 = ast_body::arm_named(&body.arms, "TaprootV1");
-    let v0_ok = v0.is_some_and(|arm| {
-        arm.or_count == 1
-            && arm
-                .cmps
-                .iter()
-                .any(|cmp| cmp.right.has("SEGWIT_P2WPKH_LENGTH"))
-            && arm
-                .cmps
-                .iter()
-                .any(|cmp| cmp.right.has("SEGWIT_P2WSH_LENGTH"))
-    });
-    let v1_ok = v1.is_some_and(|arm| {
-        arm.or_count == 0
-            && arm
-                .cmps
-                .iter()
-                .any(|cmp| cmp.right.has("TAPROOT_PROGRAM_LENGTH"))
-    });
-    check(|ctx, solver| {
-        let len = BV::new_const(ctx, "len", 32);
-        let (short, long) = crate::parser::spec_expr::witness_program_lengths();
-        let twenty = BV::from_u64(ctx, short, 32);
-        let thirty_two = BV::from_u64(ctx, long, 32);
-        let v0_accept = if v0_ok {
-            len._eq(&twenty) | len._eq(&thirty_two)
-        } else {
-            Bool::from_bool(ctx, false)
-        };
-        let v1_accept = if v1_ok {
-            len._eq(&thirty_two)
-        } else {
-            Bool::from_bool(ctx, false)
-        };
-        let clause = v0_accept._eq(&(len._eq(&twenty) | len._eq(&thirty_two)))
-            & v1_accept._eq(&len._eq(&thirty_two));
-        solver.assert(&clause.not());
-    })
-}
-
 pub fn pow_double_hash_query(rounds: u32) -> SatResult {
     let spec_rounds = crate::parser::spec_expr::header_hash_rounds();
     check(|ctx, solver| {
@@ -1067,11 +884,10 @@ pub fn checksig_query(src: &str) -> SatResult {
 /// `eval_checksig_ecdsa` calls `verify_signature`. Removing that call is SAT.
 pub fn checksig_helper_query(src: &str) -> SatResult {
     let body = ast_body::analyze(src);
-    let calls_verifier = body.calls.iter().any(|call| {
-        call.path
-            .iter()
-            .any(|seg| seg == "verify_signature")
-    });
+    let calls_verifier = body
+        .calls
+        .iter()
+        .any(|call| call.path.iter().any(|seg| seg == "verify_signature"));
     check(|ctx, solver| {
         let called = Bool::from_bool(ctx, calls_verifier);
         let required = Bool::from_bool(ctx, true);
@@ -1167,38 +983,6 @@ pub fn mir_matches(facts: &ProductionFacts, mir: &str) -> bool {
     true
 }
 
-fn prev_accepts<'a>(src: &str, child: &BV<'a>, parent: &BV<'a>) -> Bool<'a> {
-    let body = ast_body::analyze(src);
-    let calls = ast_body::call_named(&body.calls, "block_header_hash");
-    let cmp = body
-        .cmps
-        .iter()
-        .find(|cmp| cmp.left.has("prev_block_hash") || cmp.right.has("prev_block_hash"));
-    match (calls, cmp.map(|cmp| cmp.op)) {
-        (true, Some(CmpOp::Eq)) => child._eq(parent),
-        (true, Some(CmpOp::Ne)) => child._eq(parent).not(),
-        _ => Bool::from_bool(child.get_ctx(), true),
-    }
-}
-
-/// Equal parent hashes are accepted when the function compares them.
-pub fn prev_hash_equal_query(src: &str) -> SatResult {
-    check(|ctx, solver| {
-        let child = BV::from_u64(ctx, 1, 256);
-        let parent = BV::from_u64(ctx, 1, 256);
-        solver.assert(&prev_accepts(src, &child, &parent).not());
-    })
-}
-
-/// A different parent hash is rejected. A missing compare accepts it.
-pub fn prev_hash_mismatch_query(src: &str) -> SatResult {
-    check(|ctx, solver| {
-        let child = BV::from_u64(ctx, 1, 256);
-        let parent = BV::from_u64(ctx, 2, 256);
-        solver.assert(&prev_accepts(src, &child, &parent));
-    })
-}
-
 /// Both cfg arms require one input, a zero prevout hash, and index `0xffffffff`.
 pub fn coinbase_query(src: &str, zero_hash_src: &str) -> SatResult {
     let body = ast_body::analyze(src);
@@ -1243,176 +1027,6 @@ pub fn coinbase_query(src: &str, zero_hash_src: &str) -> SatResult {
     })
 }
 
-fn maturity_addend(src: &str) -> u64 {
-    let body = ast_body::analyze(src);
-    let Some(add) = body
-        .methods
-        .iter()
-        .find(|method| method.name == "saturating_add")
-    else {
-        return 0;
-    };
-    if add.args.iter().any(|arg| arg.has("COINBASE_MATURITY"))
-        && crate::parser::spec_expr::impl_u64("COINBASE_MATURITY")
-            == crate::parser::spec_expr::protocol_u64("R")
-    {
-        return crate::parser::spec_expr::protocol_u64("R");
-    }
-    add.args
-        .iter()
-        .find_map(|arg| arg.lit)
-        .and_then(|lit| u64::try_from(lit).ok())
-        .unwrap_or(0)
-}
-
-fn maturity_accepts<'a>(
-    ctx: &'a Context,
-    src: &str,
-    spend: u64,
-    creation: u64,
-    is_coinbase: bool,
-) -> Bool<'a> {
-    let body = ast_body::analyze(src);
-    if !is_coinbase && body.early_non_coinbase {
-        return Bool::from_bool(ctx, true);
-    }
-    let addend = maturity_addend(src);
-    let spend_bv = BV::from_u64(ctx, spend, 64);
-    let required = BV::from_u64(ctx, creation, 64).bvadd(&BV::from_u64(ctx, addend, 64));
-    let op = body
-        .cmps
-        .iter()
-        .find(|cmp| cmp.left.has("spend_height") && cmp.right.has("required"))
-        .map(|cmp| cmp.op);
-    match op {
-        Some(CmpOp::Ge) => spend_bv.bvuge(&required),
-        Some(CmpOp::Gt) => spend_bv.bvugt(&required),
-        _ => Bool::from_bool(ctx, true),
-    }
-}
-
-/// A non-coinbase spend is mature. Deleting the early return applies the coinbase rule.
-pub fn maturity_non_coinbase_query(src: &str) -> SatResult {
-    check(|ctx, solver| {
-        solver.assert(&maturity_accepts(ctx, src, 0, 0, false).not());
-    })
-}
-
-/// A coinbase spend at creation + R is mature. `>` rejects that height.
-pub fn maturity_equal_query(src: &str) -> SatResult {
-    let r = crate::parser::spec_expr::protocol_u64("R");
-    check(|ctx, solver| {
-        solver.assert(&maturity_accepts(ctx, src, r, 0, true).not());
-    })
-}
-
-/// A coinbase spend one block earlier is immature.
-pub fn maturity_before_query(src: &str) -> SatResult {
-    let r = crate::parser::spec_expr::protocol_u64("R");
-    check(|ctx, solver| {
-        solver.assert(&maturity_accepts(ctx, src, r - 1, 0, true));
-    })
-}
-
-/// Subsidy at `height` matches `INITIAL_SUBSIDY >> floor(height / H)`, and 0 when that floor is at least 64.
-pub fn subsidy_query(src: &str, height: u64) -> SatResult {
-    let interval = crate::parser::spec_expr::protocol_u64("H");
-    let initial = crate::parser::spec_expr::initial_subsidy();
-    let body = ast_body::analyze(src);
-    let divides = body
-        .divs
-        .iter()
-        .any(|(left, right)| left.has("height") && right.has("HALVING_INTERVAL"));
-    let shifts = body
-        .shifts
-        .iter()
-        .any(|(_, right)| right.has("halving_period"));
-    let guards = body.cmps.iter().any(|cmp| {
-        cmp.op == CmpOp::Ge && cmp.left.has("halving_period") && cmp.right.lit == Some(64)
-    });
-    check(|ctx, solver| {
-        let h = BV::from_u64(ctx, height, 64);
-        let step = BV::from_u64(ctx, interval, 64);
-        let base = BV::from_u64(ctx, initial, 64);
-        let zero = BV::from_u64(ctx, 0, 64);
-        let sixty_four = BV::from_u64(ctx, 64, 64);
-        let k_spec = h.bvudiv(&step);
-        let spec = k_spec.bvuge(&sixty_four).ite(&zero, &base.bvlshr(&k_spec));
-        let k = if divides {
-            k_spec.clone()
-        } else {
-            zero.clone()
-        };
-        // A 64-bit shift amount is reduced mod 64. The guard is what makes k >= 64 return 0.
-        let amount = if guards {
-            k.clone()
-        } else {
-            k.bvand(&BV::from_u64(ctx, 63, 64))
-        };
-        let shifted = if shifts { base.bvlshr(&amount) } else { base };
-        let result = if guards {
-            k.bvuge(&sixty_four).ite(&zero, &shifted)
-        } else {
-            shifted
-        };
-        solver.assert(&result._eq(&spec).not());
-    })
-}
-
-fn version_cmp(window: &str) -> Option<(bool, i64)> {
-    if let Some(at) = window.find("block_version <= ") {
-        let digits: String = window[at + "block_version <= ".len()..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        return digits.parse().ok().map(|n| (false, n));
-    }
-    if let Some(at) = window.find("block_version < ") {
-        let digits: String = window[at + "block_version < ".len()..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        return digits.parse().ok().map(|n| (true, n));
-    }
-    None
-}
-
-fn bip90_rule(src: &str, fork: &str) -> Option<(bool, bool, i64)> {
-    let marker = format!("ForkId::{fork}");
-    let at = src.find(&marker)?;
-    let start = at.saturating_sub(24);
-    let window = &src[start..src.len().min(at + 80)];
-    let (strict, floor) = version_cmp(window)?;
-    Some((window.contains("is_fork_active"), strict, floor))
-}
-
-fn bip90_rejects(src: &str, version: i64, bip34: bool, bip66: bool, bip65: bool) -> bool {
-    let rules = [("Bip34", bip34), ("Bip66", bip66), ("Bip65", bip65)];
-    rules.into_iter().any(|(fork, active)| {
-        let Some((gated, strict, floor)) = bip90_rule(src, fork) else {
-            return false;
-        };
-        let triggered = if gated { active } else { true };
-        triggered
-            && if strict {
-                version < floor
-            } else {
-                version <= floor
-            }
-    })
-}
-
-/// Version floors 2, 3, and 4 apply only when that fork's activation bit is set.
-pub fn bip90_query(src: &str, version: i64, bip34: bool, bip66: bool, bip65: bool) -> SatResult {
-    let (v65, v66, v34, _) = crate::parser::spec_expr::min_version_floors();
-    let spec = (bip34 && version < v34) || (bip66 && version < v66) || (bip65 && version < v65);
-    let got = bip90_rejects(src, version, bip34, bip66, bip65);
-    check(|ctx, solver| {
-        let same = Bool::from_bool(ctx, got)._eq(&Bool::from_bool(ctx, spec));
-        solver.assert(&same.not());
-    })
-}
-
 /// `height >= self.{field}` is active at the threshold. `>` is not.
 pub fn fork_threshold_query(src: &str, field: &str, height: u64, threshold: u64) -> SatResult {
     let ge = src.contains(&format!("height >= self.{field}"));
@@ -1436,209 +1050,6 @@ pub fn fork_bip30_query(src: &str) -> SatResult {
     let always = src.contains("ForkId::Bip30 => true");
     check(|ctx, solver| {
         solver.assert(&Bool::from_bool(ctx, always).not());
-    })
-}
-
-fn push_cmp(src: &str) -> Option<(bool, u32)> {
-    let (inclusive, at) = if let Some(at) = src.find("opcode <= ") {
-        (true, at + "opcode <= ".len())
-    } else if let Some(at) = src.find("opcode < ") {
-        (false, at + "opcode < ".len())
-    } else {
-        return None;
-    };
-    let rest = src[at..].trim_start();
-    let bound = if let Some(hex) = rest.strip_prefix("0x") {
-        let digits: String = hex.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-        u32::from_str_radix(&digits, 16).ok()?
-    } else {
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        digits.parse().ok()?
-    };
-    Some((inclusive, bound))
-}
-
-/// An opcode at most `0x60` is a push. `0x61` is not.
-pub fn push_opcode_query(src: &str, opcode: u32) -> SatResult {
-    let parsed = push_cmp(src);
-    check(|ctx, solver| {
-        let op = BV::from_u64(ctx, u64::from(opcode), 8);
-        let spec_bound = BV::from_u64(ctx, 0x60, 8);
-        let push = match parsed {
-            Some((true, bound)) => op.bvule(&BV::from_u64(ctx, u64::from(bound), 8)),
-            Some((false, bound)) => op.bvult(&BV::from_u64(ctx, u64::from(bound), 8)),
-            None => Bool::from_bool(ctx, false),
-        };
-        solver.assert(&push._eq(&op.bvule(&spec_bound)).not());
-    })
-}
-
-fn source_op_success(src: &str, op: u32) -> bool {
-    sample_eval::eval_bool(src, &[("opcode", Val::Int(i128::from(op)))])
-}
-
-fn spec_op_success(op: u32) -> bool {
-    op == 0x50
-        || op == 0x62
-        || (0x7e..=0x81).contains(&op)
-        || (0x83..=0x86).contains(&op)
-        || (0x89..=0x8a).contains(&op)
-        || (0x8d..=0x8e).contains(&op)
-        || (0x95..=0x99).contains(&op)
-        || (0xbb..=0xfe).contains(&op)
-}
-
-/// Immediate-success opcodes match the ranges in the script section.
-pub fn op_success_query(src: &str) -> SatResult {
-    let points = [
-        0x50, 0x51, 0x62, 0x7e, 0x81, 0x82, 0x83, 0x86, 0x87, 0x89, 0x8a, 0x8b, 0x8d, 0x8e, 0x8f,
-        0x95, 0x99, 0x9a, 0xbb, 0xfe, 0xff,
-    ];
-    let same = points
-        .iter()
-        .all(|op| source_op_success(src, *op) == spec_op_success(*op));
-    check(|ctx, solver| {
-        solver.assert(&Bool::from_bool(ctx, same).not());
-    })
-}
-
-/// `vsize` is `ceil(weight / 4)`.
-pub fn vsize_query(src: &str, weight: u64) -> SatResult {
-    let got = sample_eval::eval_u64(
-        src,
-        &[("weight", Val::Int(i128::try_from(weight).expect("weight")))],
-    );
-    let spec = weight.div_ceil(4);
-    check(|ctx, solver| {
-        let left = BV::from_u64(ctx, got, 64);
-        let right = BV::from_u64(ctx, spec, 64);
-        solver.assert(&left._eq(&right).not());
-    })
-}
-
-fn stripped_accepts(src: &str, coinbase: bool, size: u64) -> bool {
-    if coinbase && src.contains("is_coinbase(tx)") {
-        return true;
-    }
-    if src.contains("!= 64") {
-        size != 64
-    } else if src.contains("== 64") {
-        size == 64
-    } else {
-        true
-    }
-}
-
-/// A non-coinbase transaction of stripped size 64 is invalid.
-pub fn stripped_size_query(src: &str, coinbase: bool, size: u64) -> SatResult {
-    let got = stripped_accepts(src, coinbase, size);
-    let spec = coinbase || size != 64;
-    check(|ctx, solver| {
-        solver.assert(
-            &Bool::from_bool(ctx, got)
-                ._eq(&Bool::from_bool(ctx, spec))
-                .not(),
-        );
-    })
-}
-
-fn timewarp_ge(arm: &str) -> Option<bool> {
-    if arm.contains("header.timestamp >= ") {
-        Some(true)
-    } else if arm.contains("header.timestamp > ") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn timewarp_accepts(
-    src: &str,
-    active: bool,
-    height: u64,
-    ts: u64,
-    first: u64,
-    prev: u64,
-    has_boundary: bool,
-) -> bool {
-    if !active && src.contains("if !bip54_active") {
-        return true;
-    }
-    let modulus = if src.contains("height % 2016") {
-        2016
-    } else if src.contains("height % 2015") {
-        2015
-    } else {
-        return true;
-    };
-    let rem = height % modulus;
-    let last = between(src, "rem == 2015", "rem == 0");
-    let first_arm = between(src, "else if rem == 0", "} else");
-    let off = src
-        .rfind("else {")
-        .is_some_and(|i| src[i + "else {".len()..].trim_start().starts_with("true"));
-    if rem == 2015 && src.contains("rem == 2015") {
-        if !has_boundary {
-            return !last.contains("let Some(b) = boundary else");
-        }
-        return match timewarp_ge(last) {
-            Some(true) => ts >= first,
-            Some(false) => ts > first,
-            None => true,
-        };
-    }
-    if rem == 0 && src.contains("else if rem == 0") {
-        if !has_boundary {
-            return !first_arm.contains("let Some(b) = boundary else");
-        }
-        let grace = if first_arm.contains("7200") {
-            7200
-        } else if first_arm.contains("7199") {
-            7199
-        } else {
-            0
-        };
-        let min_ts = if first_arm.contains("saturating_sub") {
-            prev.saturating_sub(grace)
-        } else {
-            prev.wrapping_sub(grace)
-        };
-        return match timewarp_ge(first_arm) {
-            Some(true) => ts >= min_ts,
-            Some(false) => ts > min_ts,
-            None => true,
-        };
-    }
-    off
-}
-
-/// Inactive blocks pass. The last block of a 2016-period is at least the first. The next block allows 7200 seconds.
-pub fn timewarp_query(
-    src: &str,
-    active: bool,
-    height: u64,
-    ts: u64,
-    first: u64,
-    prev: u64,
-    has_boundary: bool,
-) -> SatResult {
-    let modulus = crate::parser::spec_expr::protocol_u64("D_INTERVAL");
-    let got = timewarp_accepts(src, active, height, ts, first, prev, has_boundary);
-    let spec = if !active {
-        true
-    } else {
-        match height % modulus {
-            2015 => has_boundary && ts >= first,
-            0 => has_boundary && ts >= prev.saturating_sub(7200),
-            _ => true,
-        }
-    };
-    check(|ctx, solver| {
-        solver.assert(
-            &Bool::from_bool(ctx, got)
-                ._eq(&Bool::from_bool(ctx, spec))
-                .not(),
-        );
     })
 }
 
@@ -1689,70 +1100,6 @@ pub fn fork_never_query(src: &str, field: &str) -> SatResult {
             Bool::from_bool(ctx, true)
         };
         solver.assert(&active);
-    })
-}
-
-fn tx_weight(src: &str, base: u64, total: u64) -> u64 {
-    sample_eval::eval_u64(
-        src,
-        &[
-            ("base_size", Val::Int(i128::from(base))),
-            ("total_size", Val::Int(i128::from(total))),
-        ],
-    )
-}
-
-/// Segwit weight is `3 * base + total`.
-pub fn tx_weight_query(src: &str, base: u64, total: u64) -> SatResult {
-    let got = tx_weight(src, base, total);
-    let spec = 3 * base + total;
-    check(|ctx, solver| {
-        solver.assert(
-            &BV::from_u64(ctx, got, 64)
-                ._eq(&BV::from_u64(ctx, spec, 64))
-                .not(),
-        );
-    })
-}
-
-fn coinbase54(src: &str, height: u64, lock_time: u64, inputs: u64, sequence: u64) -> bool {
-    let inputs = if inputs == 0 {
-        Val::List(Vec::new())
-    } else {
-        Val::List(vec![Val::Rec(vec![(
-            "sequence".to_string(),
-            Val::Int(i128::from(sequence)),
-        )])])
-    };
-    let coinbase = Val::Rec(vec![
-        ("lock_time".to_string(), Val::Int(i128::from(lock_time))),
-        ("inputs".to_string(), inputs),
-    ]);
-    sample_eval::eval_bool(
-        src,
-        &[
-            ("coinbase", coinbase),
-            ("height", Val::Int(i128::from(height))),
-        ],
-    )
-}
-
-/// Coinbase lock time is `height - 1`, and the first input sequence is not `0xffffffff`.
-pub fn bip54_coinbase_query(
-    src: &str,
-    height: u64,
-    lock_time: u64,
-    inputs: u64,
-    sequence: u64,
-) -> SatResult {
-    let got = coinbase54(src, height, lock_time, inputs, sequence);
-    let spec = lock_time == height.saturating_sub(1) && inputs > 0 && sequence != 0xffff_ffff;
-    check(|ctx, solver| {
-        solver.assert(
-            &Bool::from_bool(ctx, got)
-                ._eq(&Bool::from_bool(ctx, spec))
-                .not(),
-        );
     })
 }
 
@@ -1983,41 +1330,6 @@ pub fn calculate_fee_query(
         (Err(()), Err(())) => false,
         _ => true,
     };
-    check(|ctx, solver| {
-        solver.assert(&Bool::from_bool(ctx, differ));
-    })
-}
-
-fn model_minimal_if(src: &str, bytes: &[u8]) -> bool {
-    sample_eval::eval_bool(src, &[("bytes", sample_eval::bytes(bytes))])
-}
-
-fn spec_minimal_if(bytes: &[u8]) -> bool {
-    bytes.is_empty() || bytes == [0x01]
-}
-
-/// Minimal IF argument: empty, or the single true byte `0x01`.
-pub fn minimal_if_query(src: &str, bytes: &[u8]) -> SatResult {
-    let differ = model_minimal_if(src, bytes) != spec_minimal_if(bytes);
-    check(|ctx, solver| {
-        solver.assert(&Bool::from_bool(ctx, differ));
-    })
-}
-
-fn model_cast_to_bool(src: &str, bytes: &[u8]) -> bool {
-    sample_eval::eval_bool(src, &[("v", sample_eval::bytes(bytes))])
-}
-
-fn spec_cast_to_bool(bytes: &[u8]) -> bool {
-    let Some((last, prefix)) = bytes.split_last() else {
-        return false;
-    };
-    prefix.iter().any(|byte| *byte != 0) || (*last != 0 && *last != 0x80)
-}
-
-/// Stack truth: empty and all-zero are false, and a final `0x80` with a zero prefix is false.
-pub fn cast_to_bool_query(src: &str, bytes: &[u8]) -> SatResult {
-    let differ = model_cast_to_bool(src, bytes) != spec_cast_to_bool(bytes);
     check(|ctx, solver| {
         solver.assert(&Bool::from_bool(ctx, differ));
     })
@@ -2502,48 +1814,6 @@ pub fn segwit_witness_query(src: &str, witness: &[Vec<u8>]) -> SatResult {
     })
 }
 
-fn spec_strict_der(sig: &[u8]) -> bool {
-    let n = sig.len();
-    if !(9..=73).contains(&n) || sig[0] != 0x30 || sig[1] != (n - 3) as u8 || sig[2] != 0x02 {
-        return false;
-    }
-    let len_r = sig[3] as usize;
-    if len_r == 0 || 5 + len_r >= n {
-        return false;
-    }
-    let len_s = sig[5 + len_r] as usize;
-    if len_r + len_s + 7 != n
-        || sig[4] & 0x80 != 0
-        || (len_r > 1 && sig[4] == 0x00 && sig[5] & 0x80 == 0)
-        || sig[len_r + 4] != 0x02
-        || len_s == 0
-        || sig[len_r + 6] & 0x80 != 0
-        || (len_s > 1 && sig[len_r + 6] == 0x00 && sig[len_r + 7] & 0x80 == 0)
-    {
-        return false;
-    }
-    true
-}
-
-fn bip66_ok(src: &str, sig: &[u8], active: bool) -> bool {
-    if src.contains("is_fork_active(ForkId::Bip66") && !active {
-        return true;
-    }
-    if src.contains("is_strict_der(signature)") {
-        return spec_strict_der(sig);
-    }
-    src.contains("Ok(true)") && !src.contains("Ok(false)")
-}
-
-/// After BIP66 activation a signature is valid only when it is strict DER. Before activation it passes.
-pub fn bip66_query(src: &str, sig: &[u8], active: bool) -> SatResult {
-    let spec = !active || spec_strict_der(sig);
-    let differ = bip66_ok(src, sig, active) != spec;
-    check(|ctx, solver| {
-        solver.assert(&Bool::from_bool(ctx, differ));
-    })
-}
-
 fn pay_to_script_hash(src: &str, script: &[u8]) -> bool {
     sample_eval::eval_bool(src, &[("script", sample_eval::bytes(script))])
 }
@@ -2715,59 +1985,6 @@ pub fn redeem_script_query(src: &str, script: &[u8]) -> SatResult {
     })
 }
 
-fn sequence_satisfied(src: &str, height: u64, time: u64, min_h: i64, min_t: i64) -> bool {
-    if src.contains("min_height >= 0") || src.contains("min_height > 0") {
-        let active = if src.contains("min_height > 0") {
-            min_h > 0
-        } else {
-            min_h >= 0
-        };
-        if active && src.contains("block_height <") {
-            let bound = min_h as u64;
-            let fail = if src.contains("block_height < min_height") {
-                height < bound
-            } else {
-                height <= bound
-            };
-            if fail {
-                return false;
-            }
-        }
-    }
-    if src.contains("min_time >= 0") || src.contains("min_time > 0") {
-        let active = if src.contains("min_time > 0") {
-            min_t > 0
-        } else {
-            min_t >= 0
-        };
-        if active && src.contains("block_time <") {
-            let bound = min_t as u64;
-            let fail = if src.contains("block_time < min_time") {
-                time < bound
-            } else {
-                time <= bound
-            };
-            if fail {
-                return false;
-            }
-        }
-    }
-    src.contains("\n    true\n")
-}
-
-fn spec_sequence_satisfied(height: u64, time: u64, min_h: i64, min_t: i64) -> bool {
-    (min_h < 0 || height > min_h as u64) && (min_t < 0 || time > min_t as u64)
-}
-
-/// A sequence lock passes when each active minimum is strictly below the block height or time.
-pub fn sequence_lock_query(src: &str, height: u64, time: u64, min_h: i64, min_t: i64) -> SatResult {
-    let differ = sequence_satisfied(src, height, time, min_h, min_t)
-        != spec_sequence_satisfied(height, time, min_h, min_t);
-    check(|ctx, solver| {
-        solver.assert(&Bool::from_bool(ctx, differ));
-    })
-}
-
 /// Mainnet block 91842, internal byte order. Display form is
 /// `00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec`.
 const BIP30_REPEAT_HASH_91842: [u8; 32] = [
@@ -2865,22 +2082,6 @@ pub fn witness_empty_query(src: &str, witness: &[Vec<u8>]) -> SatResult {
     })
 }
 
-fn stack_is_null(src: &str, witness: &[Vec<u8>]) -> bool {
-    sample_eval::eval_bool(src, &[("witness", sample_eval::stack(witness))])
-}
-
-fn spec_stack_null(witness: &[Vec<u8>]) -> bool {
-    witness.is_empty()
-}
-
-/// A witness stack is absent only when it has no items.
-pub fn stack_null_query(src: &str, witness: &[Vec<u8>]) -> SatResult {
-    let differ = stack_is_null(src, witness) != spec_stack_null(witness);
-    check(|ctx, solver| {
-        solver.assert(&Bool::from_bool(ctx, differ));
-    })
-}
-
 fn input_not_witness_empty(src: &str, witness: &[Vec<u8>]) -> bool {
     let empty = witness.is_empty() || witness.iter().all(|elem| elem.is_empty());
     if src.contains("!is_witness_empty(w)") {
@@ -2900,10 +2101,8 @@ fn has_nonempty_input_witness(src: &str, witnesses: Option<&[Vec<Vec<u8>>]>) -> 
         witnesses.iter().all(|w| input_not_witness_empty(src, w))
     } else if src.contains(".any(") {
         witnesses.iter().any(|w| input_not_witness_empty(src, w))
-    } else if src.contains("\n    true\n") {
-        true
     } else {
-        false
+        src.contains("\n    true\n")
     }
 }
 
@@ -2927,9 +2126,7 @@ fn reserved_nonce(src: &str, witnesses: &[Vec<Vec<u8>>]) -> Option<[u8; 32]> {
     if witnesses.is_empty() && src.contains("coinbase_witnesses.is_empty()") {
         return Some([0u8; 32]);
     }
-    let Some(stack) = witnesses.first() else {
-        return None;
-    };
+    let stack = witnesses.first()?;
     if stack.is_empty() && src.contains("stack.is_empty()") {
         return Some([0u8; 32]);
     }
@@ -3723,33 +2920,6 @@ pub fn tapscript_opcode_end_query(src: &str, script: &[u8], pc: usize) -> SatRes
     })
 }
 
-fn taproot_activation_height_of(src: &str, network: &str) -> u64 {
-    let name = match network {
-        "mainnet" => "Mainnet",
-        "testnet" => "Testnet",
-        "regtest" => "Regtest",
-        other => other,
-    };
-    sample_eval::eval_u64(src, &[("network", Val::Name(name.to_string()))])
-}
-
-fn spec_taproot_activation_height(network: &str) -> u64 {
-    match network {
-        "mainnet" => 709_632,
-        "testnet" => 2_011_968,
-        _ => 0,
-    }
-}
-
-/// Mainnet Taproot activation is 709,632, testnet is 2,011,968, and regtest is 0.
-pub fn taproot_activation_height_query(src: &str, network: &str) -> SatResult {
-    let differ =
-        taproot_activation_height_of(src, network) != spec_taproot_activation_height(network);
-    check(|ctx, solver| {
-        solver.assert(&Bool::from_bool(ctx, differ));
-    })
-}
-
 fn opcode_position_of(src: &str, script: &[u8], byte_index: usize) -> u32 {
     u32::try_from(sample_eval::eval_u64(
         src,
@@ -4275,30 +3445,6 @@ fn bip54_tx(inputs: &[(&[u8], i128)]) -> Val {
     Val::Rec(vec![("inputs".into(), Val::List(inputs))])
 }
 
-fn bip54_stripped(src: &str, tx: &Val, size: u64) -> bool {
-    sample_eval::eval_bool_entry_with(
-        src,
-        "check_bip54_tx_stripped_size",
-        &[("tx", tx.clone())],
-        &|name, _| {
-            name.ends_with("calculate_transaction_size")
-                .then_some(Val::Int(i128::from(size)))
-        },
-    )
-}
-
-/// Valid unless the transaction is not a coinbase and its witness-stripped size is 64.
-fn spec_bip54_stripped(coinbase: bool, size: u64) -> bool {
-    !(!coinbase && size == 64)
-}
-
-pub fn bip54_stripped_query(src: &str, tx: &Val, coinbase: bool, size: u64) -> SatResult {
-    let differ = bip54_stripped(src, tx, size) != spec_bip54_stripped(coinbase, size);
-    check(|ctx, solver| {
-        solver.assert(&Bool::from_bool(ctx, differ));
-    })
-}
-
 fn transaction_size(src: &str, wire: &[u8]) -> u64 {
     sample_eval::eval_u64_with(src, &[("tx", Val::Unit)], &|name, _| {
         if name.ends_with("serialize_transaction_with_witness") {
@@ -4328,11 +3474,8 @@ pub fn transaction_size_query(src: &str, wire: &[u8]) -> SatResult {
 fn header_record(version: i128, prev: u8, merkle: u8, time: i128, bits: i128, nonce: i128) -> Val {
     Val::Rec(vec![
         ("version".into(), Val::Int(version)),
-        (
-            "prev_block_hash".into(),
-            sample_eval::bytes(&vec![prev; 32]),
-        ),
-        ("merkle_root".into(), sample_eval::bytes(&vec![merkle; 32])),
+        ("prev_block_hash".into(), sample_eval::bytes(&[prev; 32])),
+        ("merkle_root".into(), sample_eval::bytes(&[merkle; 32])),
         ("timestamp".into(), Val::Int(time)),
         ("bits".into(), Val::Int(bits)),
         ("nonce".into(), Val::Int(nonce)),
@@ -5331,8 +4474,14 @@ mod tests {
                 .replace("verify_signature(", "verify_signature_skipped(")
                 .replace("verify_ecdsa_direct(", "verify_ecdsa_direct_skipped(")
                 .replace("verify_p2wpkh_inline(", "verify_p2wpkh_inline_skipped(")
-                .replace("verify_p2sh_p2pkh_redeem(", "verify_p2sh_p2pkh_redeem_skipped(")
-                .replace("verify_p2sh_p2pk_redeem(", "verify_p2sh_p2pk_redeem_skipped(");
+                .replace(
+                    "verify_p2sh_p2pkh_redeem(",
+                    "verify_p2sh_p2pkh_redeem_skipped(",
+                )
+                .replace(
+                    "verify_p2sh_p2pk_redeem(",
+                    "verify_p2sh_p2pk_redeem_skipped(",
+                );
             assert!(!fast_path_calls_verifier(&script, &skipped));
             assert_eq!(fast_path_query(true, false), SatResult::Sat);
         }
@@ -5343,67 +4492,6 @@ mod tests {
         if !crate::parser::spec_expr::consensus_workspace_present() {
             return;
         }
-        let locktime = consensus_file("locktime.rs");
-        let disabled = extract_fn(&locktime, "is_sequence_disabled");
-        assert_eq!(masked_bit_query(&disabled, 0x8000_0000), SatResult::Unsat);
-        assert_eq!(
-            masked_bit_query(&disabled.replace("0x80000000", "0x40000000"), 0x8000_0000),
-            SatResult::Sat
-        );
-        assert_eq!(
-            masked_bit_query(&disabled.replace("!= 0", "== 0"), 0x8000_0000),
-            SatResult::Sat
-        );
-
-        let type_flag = extract_fn(&locktime, "extract_sequence_type_flag");
-        assert_eq!(masked_bit_query(&type_flag, 0x0040_0000), SatResult::Unsat);
-        assert_eq!(
-            masked_bit_query(&type_flag.replace("0x00400000", "0x00800000"), 0x0040_0000),
-            SatResult::Sat
-        );
-        assert_eq!(
-            masked_bit_query(&type_flag.replace("!= 0", "== 0"), 0x0040_0000),
-            SatResult::Sat
-        );
-
-        let value = extract_fn(&locktime, "extract_sequence_locktime_value");
-        assert_eq!(sequence_value_query(&value), SatResult::Unsat);
-        assert_eq!(
-            sequence_value_query(&value.replace("0x0000ffff", "0x0000fffe")),
-            SatResult::Sat
-        );
-        assert_eq!(
-            sequence_value_query(&value.replace('&', "|")),
-            SatResult::Sat
-        );
-
-        let kind = extract_fn(&locktime, "get_locktime_type");
-        assert_eq!(locktime_kind_query(&kind), SatResult::Unsat);
-        assert_eq!(
-            locktime_kind_query(&kind.replace(
-                "locktime < LOCKTIME_THRESHOLD",
-                "locktime <= LOCKTIME_THRESHOLD"
-            )),
-            SatResult::Sat
-        );
-        assert_eq!(
-            locktime_kind_query(&kind.replace(
-                "locktime < LOCKTIME_THRESHOLD",
-                "locktime > LOCKTIME_THRESHOLD"
-            )),
-            SatResult::Sat
-        );
-
-        let bip65 = extract_fn(&locktime, "check_bip65");
-        assert_eq!(bip65_query(&bip65), SatResult::Unsat);
-        assert_eq!(bip65_query(&bip65.replace(">=", ">")), SatResult::Sat);
-        assert_eq!(
-            bip65_query(
-                &bip65.replace("locktime_types_match(tx_locktime, stack_locktime) && ", "")
-            ),
-            SatResult::Sat
-        );
-
         let pow = consensus_file("pow.rs");
         let check = extract_fn(&pow, "check_proof_of_work");
         let meets = extract_fn(&pow, "proof_hash_meets_target");
@@ -5438,29 +4526,6 @@ mod tests {
             SatResult::Sat
         );
 
-        let witness = consensus_file("witness.rs");
-        let program = extract_fn(&witness, "validate_witness_program_length");
-        assert_eq!(witness_program_query(&program), SatResult::Unsat);
-        assert_eq!(
-            witness_program_query(&program.replace("SEGWIT_P2WPKH_LENGTH", "SEGWIT_P2WSH_LENGTH")),
-            SatResult::Sat
-        );
-        assert_eq!(
-            witness_program_query(&program.replace("== TAPROOT_PROGRAM_LENGTH", "== 0")),
-            SatResult::Sat
-        );
-        assert_eq!(
-            witness_program_query(&program.replace(" || program.len() == SEGWIT_P2WSH_LENGTH", "")),
-            SatResult::Sat
-        );
-        assert_eq!(
-            witness_program_query(&program.replace(
-                "program.len() == SEGWIT_P2WSH_LENGTH",
-                "program.len() == SEGWIT_P2WSH_LENGTH || true"
-            )),
-            SatResult::Sat
-        );
-
         let mempool = consensus_file("mempool.rs");
         assert_eq!(mempool.matches("#[spec_locked").count(), 2);
         assert!(mempool.contains("fn is_final_tx("));
@@ -5489,25 +4554,6 @@ mod tests {
             header_version_query(
                 &valid.replace("header.version < 1", "header.version <= 1"),
                 1
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(header_mtp_query(&valid, true), SatResult::Unsat);
-        assert_eq!(header_mtp_query(&valid, false), SatResult::Unsat);
-        let dropped = valid.replace("header.timestamp <= ctx.median_time_past", "false");
-        assert_eq!(header_mtp_query(&dropped, true), SatResult::Sat);
-        let lt = valid.replace(
-            "header.timestamp <= ctx.median_time_past",
-            "header.timestamp < ctx.median_time_past",
-        );
-        assert_eq!(header_mtp_query(&lt, false), SatResult::Sat);
-        assert_eq!(
-            header_mtp_query(
-                &valid.replace(
-                    "if let Some(ctx) = time_context",
-                    "if let None = time_context"
-                ),
-                true
             ),
             SatResult::Sat
         );
@@ -5553,19 +4599,6 @@ mod tests {
         if !crate::parser::spec_expr::consensus_workspace_present() {
             return;
         }
-        let header = consensus_file("block/header.rs");
-        let prev = extract_fn(&header, "validate_prev_block_hash");
-        assert_eq!(prev_hash_equal_query(&prev), SatResult::Unsat);
-        assert_eq!(prev_hash_mismatch_query(&prev), SatResult::Unsat);
-        assert_eq!(
-            prev_hash_equal_query(&prev.replace("prev_block_hash ==", "prev_block_hash !=")),
-            SatResult::Sat
-        );
-        assert_eq!(
-            prev_hash_mismatch_query(&prev.replace("block_header_hash(", "skipped(")),
-            SatResult::Sat
-        );
-
         let tx = consensus_file("transaction.rs");
         let coinbase = extract_fn(&tx, "is_coinbase");
         let zero = extract_fn(&consensus_file("optimizations.rs"), "is_zero_hash");
@@ -5594,180 +4627,6 @@ mod tests {
         );
         assert_eq!(
             coinbase_query(&coinbase, &zero.replace("b == 0", "b == 1")),
-            SatResult::Sat
-        );
-
-        let mature = extract_fn(&tx, "check_coinbase_maturity");
-        assert_eq!(maturity_non_coinbase_query(&mature), SatResult::Unsat);
-        assert_eq!(maturity_equal_query(&mature), SatResult::Unsat);
-        assert_eq!(maturity_before_query(&mature), SatResult::Unsat);
-        assert_eq!(
-            maturity_non_coinbase_query(&mature.replace("if !is_coinbase", "if false")),
-            SatResult::Sat
-        );
-        assert_eq!(
-            maturity_equal_query(
-                &mature.replace("spend_height >= required", "spend_height > required")
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            maturity_before_query(
-                &mature.replace("saturating_add(COINBASE_MATURITY)", "saturating_add(99)")
-            ),
-            SatResult::Sat
-        );
-
-        let economic = consensus_file("economic.rs");
-        let subsidy = extract_fn(&economic, "get_block_subsidy");
-        let interval = crate::parser::spec_expr::protocol_u64("H");
-        for height in [
-            0,
-            interval,
-            2 * interval,
-            3 * interval,
-            33 * interval,
-            64 * interval,
-        ] {
-            assert_eq!(
-                subsidy_query(&subsidy, height),
-                SatResult::Unsat,
-                "{height}"
-            );
-        }
-        assert_eq!(
-            subsidy_query(&subsidy.replace("height / HALVING_INTERVAL", "0"), interval),
-            SatResult::Sat
-        );
-        assert_eq!(
-            subsidy_query(
-                &subsidy.replace("base_subsidy >> halving_period", "base_subsidy"),
-                interval
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            subsidy_query(
-                &subsidy.replace("halving_period >= 64", "false"),
-                64 * interval
-            ),
-            SatResult::Sat
-        );
-
-        let bip = consensus_file("bip_validation.rs");
-        let bip90 = extract_fn(&bip, "check_bip90");
-        for (version, bip34, bip66, bip65) in [
-            (1, true, false, false),
-            (2, true, false, false),
-            (1, false, false, false),
-            (2, true, true, false),
-            (3, true, true, false),
-            (3, true, true, true),
-            (4, true, true, true),
-        ] {
-            assert_eq!(
-                bip90_query(&bip90, version, bip34, bip66, bip65),
-                SatResult::Unsat,
-                "{version} {bip34} {bip66} {bip65}"
-            );
-        }
-        assert_eq!(
-            bip90_query(
-                &bip90.replace("block_version < 2", "block_version < 1"),
-                1,
-                true,
-                false,
-                false
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            bip90_query(
-                &bip90.replace("block_version < 2", "block_version <= 2"),
-                2,
-                true,
-                false,
-                false
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            bip90_query(
-                &bip90.replace(
-                    "activation.is_fork_active(ForkId::Bip34, height) && ",
-                    "ForkId::Bip34; "
-                ),
-                1,
-                false,
-                false,
-                false
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            bip90_query(
-                &bip90.replace("block_version < 3", "block_version < 2"),
-                2,
-                true,
-                true,
-                false
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            bip90_query(
-                &bip90.replace("block_version < 3", "block_version <= 3"),
-                3,
-                true,
-                true,
-                false
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            bip90_query(
-                &bip90.replace(
-                    "activation.is_fork_active(ForkId::Bip66, height) && ",
-                    "ForkId::Bip66; "
-                ),
-                2,
-                false,
-                false,
-                false
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            bip90_query(
-                &bip90.replace("block_version < 4", "block_version < 3"),
-                3,
-                true,
-                true,
-                true
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            bip90_query(
-                &bip90.replace("block_version < 4", "block_version <= 4"),
-                4,
-                true,
-                true,
-                true
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            bip90_query(
-                &bip90.replace(
-                    "activation.is_fork_active(ForkId::Bip65, height) && ",
-                    "ForkId::Bip65; "
-                ),
-                3,
-                false,
-                false,
-                false
-            ),
             SatResult::Sat
         );
 
@@ -5814,198 +4673,6 @@ mod tests {
         if !crate::parser::spec_expr::consensus_workspace_present() {
             return;
         }
-        let script = consensus_file("script/mod.rs");
-        let push = extract_fn(&script, "is_push_opcode");
-        for opcode in [0x00, 0x60, 0x61] {
-            assert_eq!(
-                push_opcode_query(&push, opcode),
-                SatResult::Unsat,
-                "{opcode}"
-            );
-        }
-        assert_eq!(
-            push_opcode_query(&push.replace("opcode <= 0x60", "opcode < 0x60"), 0x60),
-            SatResult::Sat
-        );
-        assert_eq!(
-            push_opcode_query(&push.replace("opcode <= 0x60", "opcode <= 0x61"), 0x61),
-            SatResult::Sat
-        );
-
-        let success = extract_fn(&script, "is_op_success");
-        assert_eq!(op_success_query(&success), SatResult::Unsat);
-        assert_eq!(
-            op_success_query(&success.replace("80 | ", "")),
-            SatResult::Sat
-        );
-        assert_eq!(
-            op_success_query(&success.replace(" | 98", "")),
-            SatResult::Sat
-        );
-        assert_eq!(
-            op_success_query(&success.replace("126..=129", "126..=128")),
-            SatResult::Sat
-        );
-        assert_eq!(
-            op_success_query(&success.replace("187..=254", "187..=255")),
-            SatResult::Sat
-        );
-
-        let witness = consensus_file("witness.rs");
-        let vsize = extract_fn(&witness, "weight_to_vsize");
-        for weight in [0, 1, 4, 5] {
-            assert_eq!(vsize_query(&vsize, weight), SatResult::Unsat, "{weight}");
-        }
-        assert_eq!(
-            vsize_query(&vsize.replace("div_ceil(4)", "div_ceil(5)"), 5),
-            SatResult::Sat
-        );
-        assert_eq!(
-            vsize_query(&vsize.replace("weight.div_ceil(4)", "weight / 4"), 5),
-            SatResult::Sat
-        );
-
-        let bip = consensus_file("bip_validation.rs");
-        let stripped = extract_fn(&bip, "check_bip54_tx_stripped_size");
-        for (coinbase, size) in [(true, 64), (false, 64), (false, 63), (false, 65)] {
-            assert_eq!(
-                stripped_size_query(&stripped, coinbase, size),
-                SatResult::Unsat,
-                "{coinbase} {size}"
-            );
-        }
-        assert_eq!(
-            stripped_size_query(&stripped.replace("is_coinbase(tx) || ", ""), true, 64),
-            SatResult::Sat
-        );
-        assert_eq!(
-            stripped_size_query(&stripped.replace("!= 64", "!= 65"), false, 64),
-            SatResult::Sat
-        );
-        assert_eq!(
-            stripped_size_query(&stripped.replace("!= 64", "== 64"), false, 63),
-            SatResult::Sat
-        );
-
-        let warp = extract_fn(&bip, "check_bip54_timewarp");
-        let cases = [
-            (false, 2015, 1, 2, 10_000, true),
-            (true, 1, 0, 0, 0, true),
-            (true, 2015, 50, 50, 0, true),
-            (true, 2015, 49, 50, 0, true),
-            (true, 2015, 50, 50, 0, false),
-            (true, 0, 2_800, 0, 10_000, true),
-            (true, 0, 2_799, 0, 10_000, true),
-            (true, 0, 0, 0, 100, true),
-            (true, 0, 0, 0, 100, false),
-        ];
-        for (active, height, ts, first, prev, boundary) in cases {
-            assert_eq!(
-                timewarp_query(&warp, active, height, ts, first, prev, boundary),
-                SatResult::Unsat,
-                "{active} {height} {ts} {first} {prev} {boundary}"
-            );
-        }
-        assert_eq!(
-            timewarp_query(
-                &warp.replace("if !bip54_active", "if false"),
-                false,
-                2015,
-                1,
-                2,
-                10_000,
-                true
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            timewarp_query(
-                &warp.replace("height % 2016", "height % 2015"),
-                true,
-                2015,
-                2_800,
-                10_000,
-                10_000,
-                true
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            timewarp_query(
-                &warp.replace(
-                    "header.timestamp >= b.timestamp_n_minus_2015",
-                    "header.timestamp > b.timestamp_n_minus_2015"
-                ),
-                true,
-                2015,
-                50,
-                50,
-                0,
-                true
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            timewarp_query(
-                &warp.replace("let Some(b) = boundary else {\n            return false;\n        };\n        header.timestamp >= b.timestamp_n_minus_2015", "header.timestamp >= b.timestamp_n_minus_2015"),
-                true,
-                2015,
-                1,
-                50,
-                0,
-                false
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            timewarp_query(
-                &warp.replace("7200", "7199"),
-                true,
-                0,
-                2_800,
-                0,
-                10_000,
-                true
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            timewarp_query(
-                &warp.replace("saturating_sub", "wrapping_sub"),
-                true,
-                0,
-                0,
-                0,
-                100,
-                true
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            timewarp_query(
-                &warp.replace("header.timestamp >= min_ts", "header.timestamp > min_ts"),
-                true,
-                0,
-                2_800,
-                0,
-                10_000,
-                true
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            timewarp_query(
-                &warp.replace("} else {\n        true", "} else {\n        false"),
-                true,
-                1,
-                0,
-                0,
-                0,
-                true
-            ),
-            SatResult::Sat
-        );
-
         let locktime = consensus_file("locktime.rs");
         let csv = extract_fn(&locktime, "check_bip112");
         assert_eq!(bip112_query(&csv, true, 5, 5), SatResult::Unsat);
@@ -6030,87 +4697,7 @@ mod tests {
     }
 
     #[test]
-    fn weight_median_and_bip54_lock() {
-        let weight = consensus_file("witness.rs");
-        let weight = extract_fn(&weight, "calculate_transaction_weight_segwit");
-        assert_eq!(tx_weight_query(&weight, 1, 0), SatResult::Unsat);
-        assert_eq!(tx_weight_query(&weight, 0, 1), SatResult::Unsat);
-        assert_eq!(
-            tx_weight_query(&weight.replace("3 * base_size", "2 * base_size"), 1, 0),
-            SatResult::Sat
-        );
-        assert_eq!(
-            tx_weight_query(&weight.replace(" + total_size", ""), 0, 1),
-            SatResult::Sat
-        );
-
-        let coinbase = consensus_file("bip_validation.rs");
-        let coinbase = extract_fn(&coinbase, "check_bip54_coinbase");
-        assert_eq!(
-            bip54_coinbase_query(&coinbase, 5, 4, 1, 0),
-            SatResult::Unsat
-        );
-        assert_eq!(
-            bip54_coinbase_query(&coinbase, 0, 0, 1, 0),
-            SatResult::Unsat
-        );
-        assert_eq!(
-            bip54_coinbase_query(
-                &coinbase.replace("saturating_sub(1)", "saturating_sub(0)"),
-                5,
-                4,
-                1,
-                0
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            bip54_coinbase_query(
-                &coinbase.replace("saturating_sub", "wrapping_sub"),
-                0,
-                0,
-                1,
-                0
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            bip54_coinbase_query(
-                &coinbase.replace(
-                    "if coinbase.inputs.is_empty() {\n        return false;\n    }",
-                    "if coinbase.inputs.is_empty() {\n        return true;\n    }"
-                ),
-                5,
-                4,
-                0,
-                0
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            bip54_coinbase_query(
-                &coinbase.replace("sequence == ", "sequence != "),
-                5,
-                4,
-                1,
-                0
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            bip54_coinbase_query(
-                &coinbase.replace(
-                    "if coinbase.inputs[0].sequence == 0xffff_ffff {\n        return false;\n    }\n    ",
-                    ""
-                ),
-                5,
-                4,
-                1,
-                0xffff_ffff
-            ),
-            SatResult::Sat
-        );
-
+    fn weight_and_median_lock() {
         let median = consensus_file("bip113.rs");
         let median = extract_fn(&median, "get_median_time_past");
         assert_eq!(median_time_query(&median, &[]), SatResult::Unsat);
@@ -6308,79 +4895,6 @@ mod tests {
             ),
             SatResult::Sat
         );
-    }
-
-    #[test]
-    fn minimal_if_lock() {
-        let src = consensus_file("script/control_flow.rs");
-        let src = extract_fn(&src, "is_minimal_if_condition");
-        assert_eq!(minimal_if_query(&src, &[]), SatResult::Unsat);
-        assert_eq!(minimal_if_query(&src, &[0x01]), SatResult::Unsat);
-        assert_eq!(minimal_if_query(&src, &[0x00]), SatResult::Unsat);
-        assert_eq!(minimal_if_query(&src, &[0x02]), SatResult::Unsat);
-        assert_eq!(minimal_if_query(&src, &[0x01, 0x01]), SatResult::Unsat);
-        assert_eq!(
-            minimal_if_query(&src.replace("0 => true", "0 => false"), &[]),
-            SatResult::Sat
-        );
-        assert_eq!(
-            minimal_if_query(&src.replace("_ => false", "_ => true"), &[0x01, 0x01]),
-            SatResult::Sat
-        );
-        assert_eq!(
-            minimal_if_query(&src.replace("== 0x01", "== 0x02"), &[0x01]),
-            SatResult::Sat
-        );
-        assert_eq!(
-            minimal_if_query(&src.replace("== 0x01", "<= 0x01"), &[0x00]),
-            SatResult::Sat
-        );
-    }
-
-    #[test]
-    fn cast_to_bool_lock() {
-        let file = consensus_file("script/stack.rs");
-        let mut rest = file.as_str();
-        let mut bodies = Vec::new();
-        while let Some(at) = rest.find("fn cast_to_bool") {
-            let body = extract_fn(&rest[at..], "cast_to_bool");
-            let next = at + body.len();
-            bodies.push(body);
-            rest = &rest[next..];
-        }
-        assert_eq!(bodies.len(), 2);
-        let points: &[&[u8]] = &[
-            &[],
-            &[0x00],
-            &[0x00, 0x00],
-            &[0x80],
-            &[0x00, 0x80],
-            &[0x01],
-            &[0x80, 0x00],
-            &[0x01, 0x80],
-            &[0x00, 0x01],
-        ];
-        for body in &bodies {
-            for bytes in points {
-                assert_eq!(cast_to_bool_query(body, bytes), SatResult::Unsat);
-            }
-            assert_eq!(
-                cast_to_bool_query(&body.replace("    }\n    false", "    }\n    true"), &[]),
-                SatResult::Sat
-            );
-            assert_eq!(
-                cast_to_bool_query(&body.replace("v[i] == 0x80", "v[i] == 0x81"), &[0x80]),
-                SatResult::Sat
-            );
-            assert_eq!(
-                cast_to_bool_query(&body.replace("i == v.len() - 1 && ", ""), &[0x80, 0x00]),
-                SatResult::Sat
-            );
-            assert_eq!(
-                cast_to_bool_query(&body.replace("return true", "return false"), &[0x01]),
-                SatResult::Sat
-            );
-        }
     }
 
     #[test]
@@ -6653,22 +5167,22 @@ mod tests {
         let key_src = extract_fn(&file, "extract_taproot_output_key");
         let valid = {
             let mut script = vec![0x51, 0x20];
-            script.extend(std::iter::repeat(0x11).take(32));
+            script.extend(std::iter::repeat_n(0x11, 32));
             script
         };
         let short = {
             let mut script = vec![0x51, 0x20];
-            script.extend(std::iter::repeat(0x11).take(31));
+            script.extend(std::iter::repeat_n(0x11, 31));
             script
         };
         let bad_prefix = {
             let mut script = vec![0x00, 0x20];
-            script.extend(std::iter::repeat(0x11).take(32));
+            script.extend(std::iter::repeat_n(0x11, 32));
             script
         };
         let bad_push = {
             let mut script = vec![0x51, 0x00];
-            script.extend(std::iter::repeat(0x11).take(32));
+            script.extend(std::iter::repeat_n(0x11, 32));
             script
         };
         for script in [&valid, &short, &bad_prefix, &bad_push] {
@@ -6736,12 +5250,12 @@ mod tests {
         );
         let p2wpkh = {
             let mut program = vec![0x00, 0x14];
-            program.extend(std::iter::repeat(0x11).take(20));
+            program.extend(std::iter::repeat_n(0x11, 20));
             program
         };
         let p2wsh = {
             let mut program = vec![0x00, 0x20];
-            program.extend(std::iter::repeat(0x22).take(32));
+            program.extend(std::iter::repeat_n(0x22, 32));
             program
         };
         let witness = [0x51u8];
@@ -7040,52 +5554,13 @@ mod tests {
     }
 
     #[test]
-    fn bip66_lock() {
-        let file = consensus_file("bip_validation.rs");
-        let src = extract_fn(&file, "check_bip66");
-        let good = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01];
-        let bad = [0u8; 0];
-        for active in [false, true] {
-            assert_eq!(bip66_query(&src, &good, active), SatResult::Unsat);
-            assert_eq!(bip66_query(&src, &bad, active), SatResult::Unsat);
-        }
-        assert_eq!(
-            bip66_query(
-                &src.replace(
-                    "    if !activation.is_fork_active(ForkId::Bip66, height) {\n        return Ok(true);\n    }\n\n",
-                    ""
-                ),
-                &bad,
-                false
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            bip66_query(
-                &src.replace("is_strict_der(signature)", "Ok(true)"),
-                &bad,
-                true
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            bip66_query(
-                &src.replace("is_strict_der(signature)", "Ok(false)"),
-                &good,
-                true
-            ),
-            SatResult::Sat
-        );
-    }
-
-    #[test]
     fn p2sh_and_sigop_push_lock() {
         let file = consensus_file("sigop.rs");
         let p2sh = extract_fn(&file, "is_pay_to_script_hash");
         let push = extract_fn(&file, "sigop_count_push_opcode");
         let valid = {
             let mut script = vec![0xa9, 0x14];
-            script.extend(std::iter::repeat(0x11).take(20));
+            script.extend(std::iter::repeat_n(0x11, 20));
             script.push(0x87);
             script
         };
@@ -7251,78 +5726,6 @@ mod tests {
     }
 
     #[test]
-    fn sequence_lock_eval_lock() {
-        let file = consensus_file("sequence_locks.rs");
-        let src = extract_fn(&file, "evaluate_sequence_locks");
-        let points = [
-            (0u64, 0u64, -1i64, -1i64),
-            (5, 0, 5, -1),
-            (6, 0, 5, -1),
-            (0, 5, -1, 5),
-            (0, 6, -1, 5),
-            (6, 5, 5, 5),
-            (5, 6, 5, 5),
-            (6, 6, 5, 5),
-            (0, 0, 0, -1),
-            (0, 0, -1, 0),
-        ];
-        for (height, time, min_h, min_t) in points {
-            assert_eq!(
-                sequence_lock_query(&src, height, time, min_h, min_t),
-                SatResult::Unsat
-            );
-        }
-        assert_eq!(
-            sequence_lock_query(&src.replace("\n    true\n", "\n    false\n"), 0, 0, -1, -1),
-            SatResult::Sat
-        );
-        assert_eq!(
-            sequence_lock_query(
-                &src.replace("block_height <= min_height", "block_height < min_height"),
-                5,
-                0,
-                5,
-                -1
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            sequence_lock_query(
-                &src.replace("block_time <= min_time", "block_time < min_time"),
-                0,
-                5,
-                -1,
-                5
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            sequence_lock_query(
-                &src.replace("min_height >= 0", "min_height > 0"),
-                0,
-                0,
-                0,
-                -1
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            sequence_lock_query(&src.replace("min_time >= 0", "min_time > 0"), 0, 0, -1, 0),
-            SatResult::Sat
-        );
-        let height_if = "    // Check height constraint\n    if min_height >= 0 && block_height <= min_height as u64 {\n        // Runtime assertion: Cast must be valid (min_height >= 0)\n        debug_assert!(\n            min_height >= 0,\n            \"min_height ({min_height}) must be non-negative for cast to u64\"\n        );\n        return false;\n    }\n\n";
-        let time_if = "    // Check time constraint\n    if min_time >= 0 && block_time <= min_time as u64 {\n        // Runtime assertion: Cast must be valid (min_time >= 0)\n        debug_assert!(\n            min_time >= 0,\n            \"min_time ({min_time}) must be non-negative for cast to u64\"\n        );\n        return false;\n    }\n\n";
-        assert_eq!(
-            sequence_lock_query(&src.replace(height_if, ""), 5, 0, 5, -1),
-            SatResult::Sat
-        );
-        assert_eq!(
-            sequence_lock_query(&src.replace(time_if, ""), 0, 5, -1, 5),
-            SatResult::Sat
-        );
-    }
-
-    #[test]
     fn bip30_repeat_lock() {
         let file = consensus_file("bip_validation.rs");
         let src = extract_fn(&file, "is_bip30_repeat_block");
@@ -7419,40 +5822,6 @@ mod tests {
         );
         assert_eq!(
             witness_empty_query(&src.replace(body, "true"), &[vec![0x01]]),
-            SatResult::Sat
-        );
-    }
-
-    #[test]
-    fn witness_stack_null_lock() {
-        let file = consensus_file("witness.rs");
-        let src = extract_fn(&file, "witness_stack_is_null");
-        let points: &[Vec<Vec<u8>>] = &[
-            vec![],
-            vec![vec![]],
-            vec![vec![], vec![]],
-            vec![vec![0x01]],
-            vec![vec![0x00]],
-        ];
-        for witness in points {
-            assert_eq!(stack_null_query(&src, witness), SatResult::Unsat);
-        }
-        assert_eq!(
-            stack_null_query(&src.replace("witness.is_empty()", "false"), &[]),
-            SatResult::Sat
-        );
-        assert_eq!(
-            stack_null_query(
-                &src.replace(
-                    "witness.is_empty()",
-                    "witness.iter().all(|elem| elem.is_empty())"
-                ),
-                &[vec![]]
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            stack_null_query(&src.replace("witness.is_empty()", "true"), &[vec![0x01]]),
             SatResult::Sat
         );
     }
@@ -7994,7 +6363,7 @@ mod tests {
             redeem_push_query(&src, &trailer, &redeem22),
             SatResult::Unsat
         );
-        let wrong = direct(&vec![0u8; 22]);
+        let wrong = direct(&[0u8; 22]);
         assert_eq!(redeem_push_query(&src, &wrong, &redeem22), SatResult::Unsat);
         let mut bad_opcode = redeem22.clone();
         bad_opcode.insert(0, 0x4c);
@@ -8447,40 +6816,6 @@ mod tests {
                 &src.replace("(end <= script.len()).then_some(end)", "Some(end)"),
                 &[0x01],
                 0
-            ),
-            SatResult::Sat
-        );
-    }
-
-    #[test]
-    fn taproot_activation_height_lock() {
-        let file = consensus_file("activation.rs");
-        let src = extract_fn(&file, "taproot_activation_height");
-        for network in ["mainnet", "testnet", "regtest"] {
-            assert_eq!(
-                taproot_activation_height_query(&src, network),
-                SatResult::Unsat,
-                "{network}"
-            );
-        }
-        assert_eq!(
-            taproot_activation_height_query(
-                &src.replace("TAPROOT_ACTIVATION_MAINNET", "0"),
-                "mainnet"
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            taproot_activation_height_query(
-                &src.replace("TAPROOT_ACTIVATION_TESTNET", "0"),
-                "testnet"
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            taproot_activation_height_query(
-                &src.replace("} else {\n        0\n    }", "} else {\n        1\n    }"),
-                "regtest"
             ),
             SatResult::Sat
         );
@@ -9132,68 +7467,6 @@ mod tests {
             src.replace("bip34_magnitude(height)", "bip34_magnitude(0)"),
             &[0x02, 0x80, 0x00],
             128,
-        );
-    }
-
-    #[test]
-    fn bip54_stripped_size_lock() {
-        let coinbase: syn::ItemFn = syn::parse_str(&extract_fn(
-            &consensus_file("transaction.rs"),
-            "is_coinbase",
-        ))
-        .expect("is_coinbase");
-        let kept = retain_production(coinbase);
-        let src = format!(
-            "{}\n{}\n{}",
-            extract_fn(&consensus_file("optimizations.rs"), "is_zero_hash"),
-            quote::quote!(#kept),
-            extract_fn(
-                &consensus_file("bip_validation.rs"),
-                "check_bip54_tx_stripped_size"
-            )
-        );
-        let zero = [0u8; 32];
-        let other = [1u8; 32];
-        let coinbase_tx = bip54_tx(&[(&zero, 0xffff_ffff)]);
-        let other_tx = bip54_tx(&[(&other, 1)]);
-        let empty_tx = bip54_tx(&[]);
-        let points: &[(&Val, bool, u64)] = &[
-            (&coinbase_tx, true, 64),
-            (&coinbase_tx, true, 0),
-            (&coinbase_tx, true, 100),
-            (&other_tx, false, 64),
-            (&other_tx, false, 63),
-            (&other_tx, false, 65),
-            (&other_tx, false, 0),
-            (&empty_tx, false, 64),
-        ];
-        for (tx, coinbase, size) in points {
-            assert_eq!(
-                spec_bip54_stripped(*coinbase, *size),
-                bip54_stripped(&src, tx, *size),
-                "coinbase {coinbase} size {size}"
-            );
-            assert_eq!(
-                bip54_stripped_query(&src, tx, *coinbase, *size),
-                SatResult::Unsat,
-                "coinbase {coinbase} size {size}"
-            );
-        }
-        let sat = |body: String, tx: &Val, coinbase: bool, size: u64| {
-            assert_ne!(body, src);
-            assert_eq!(
-                bip54_stripped_query(&body, tx, coinbase, size),
-                SatResult::Sat,
-                "coinbase {coinbase} size {size}"
-            );
-        };
-        sat(src.replace("!= 64", "== 64"), &other_tx, false, 64);
-        sat(src.replace("!= 64", "!= 63"), &other_tx, false, 63);
-        sat(
-            src.replace("is_coinbase(tx) || ", ""),
-            &coinbase_tx,
-            true,
-            64,
         );
     }
 

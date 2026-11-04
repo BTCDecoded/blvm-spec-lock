@@ -154,6 +154,8 @@ pub struct FormulaSpec {
     pub depends_on: Vec<String>,
     /// Raw markdown spanning header through closing **`$$`** (drift diagnostics).
     pub raw_markdown: String,
+    /// First paragraph after the formula. Domain bounds in that paragraph are read from here.
+    pub trailing: String,
 }
 
 /// True when **`#[spec_locked]`** § (**`lock_section`**) equals or strictly prefixes **`formula_section`**
@@ -418,13 +420,16 @@ impl SpecParser {
                 .find(rest)
                 .map(|m| m.start())
                 .unwrap_or_else(|| rest.len());
-            let depends_on = Self::parse_depends_on_ids(&rest[..window_end]);
+            let window = &rest[..window_end];
+            let depends_on = Self::parse_depends_on_ids(window);
+            let trailing = window.trim().split("\n\n").next().unwrap_or("").to_string();
             out.push(FormulaSpec {
                 id,
                 section: section_id.to_string(),
                 latex_body,
                 depends_on,
                 raw_markdown,
+                trailing,
             });
         }
         Ok(out)

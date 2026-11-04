@@ -736,6 +736,7 @@ mod tests {
                 formula_anchor: fa,
                 constant_anchor: ca,
                 function_sig: None,
+                parse_gap: false,
             };
             let s = format_verify_json_report(
                 &[(
@@ -804,6 +805,7 @@ mod tests {
             formula_anchor: None,
             constant_anchor: None,
             function_sig: None,
+            parse_gap: false,
         };
         let results = vec![(
             f,
@@ -827,6 +829,7 @@ mod tests {
             formula_anchor: None,
             constant_anchor: None,
             function_sig: None,
+            parse_gap: false,
         };
         let results = vec![(
             f,
@@ -852,6 +855,7 @@ mod tests {
             formula_anchor: None,
             constant_anchor: None,
             function_sig: None,
+            parse_gap: false,
         };
         let results = vec![(
             f,
@@ -900,6 +904,7 @@ mod tests {
                 formula_anchor: None,
                 constant_anchor: None,
                 function_sig: None,
+                parse_gap: false,
             };
             let results = vec![(
                 f,
@@ -943,6 +948,7 @@ mod tests {
                 formula_anchor: None,
                 constant_anchor: None,
                 function_sig: None,
+                parse_gap: false,
             };
             let results = vec![(
                 f,
@@ -969,6 +975,7 @@ mod tests {
             formula_anchor: None,
             constant_anchor: None,
             function_sig: None,
+            parse_gap: false,
         };
 
         let timeout_row = failed_verification(

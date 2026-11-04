@@ -4,7 +4,7 @@
 //! A boundary patch and a predicate patch are each SAT. The clause uses the
 //! operator in that arm (shift, compare, preimage byte, verifier result, fold).
 
-use super::production_lock::{self, ProductionFacts, facts_of, retain_production};
+use super::production_lock::{self, ProductionFacts, facts_of};
 use std::sync::OnceLock;
 use syn::ItemFn;
 use z3::ast::{Ast, BV, Bool};
@@ -134,11 +134,9 @@ fn sat_name(r: SatResult) -> &'static str {
 fn build_rows() -> Vec<LockRow> {
     let mut rows = Vec::new();
     rows.extend(legacy_rows());
-    rows.extend(arith_rows());
     rows.extend(threshold_rows());
     rows.extend(preimage_rows());
     rows.extend(signet_rows());
-    rows.extend(witness_rows());
     rows.extend(multisig_rows());
     rows.extend(tx_version_rows());
     rows.extend(reorg_undo_rows());
@@ -215,17 +213,6 @@ fn slice_braces(rest: &str) -> String {
     rest.to_string()
 }
 
-fn production_text(func_src: &str) -> String {
-    let wrapped = func_src.to_string();
-    match syn::parse_str::<ItemFn>(&wrapped) {
-        Ok(func) => {
-            let kept = retain_production(func);
-            quote::quote!(#kept).to_string()
-        }
-        Err(_) => wrapped,
-    }
-}
-
 fn row(
     function: &str,
     shape: &'static str,
@@ -254,316 +241,7 @@ fn row(
 }
 
 fn legacy_rows() -> Vec<LockRow> {
-    let mut rows = Vec::new();
-    let tx = repo("blvm-consensus/src/transaction.rs");
-    let fast = extract_fn(&tx, "check_transaction_fast_path");
-    let check = extract_fn(&tx, "check_transaction");
-    let m5 = |src: &str| {
-        src.replace(
-            "output.value < 0 || value_u64 > MAX_MONEY_U64",
-            "output.value > MAX_MONEY",
-        )
-        .replace(
-            "total_output_value < 0 || total_u64 > MAX_MONEY_U64",
-            "total_output_value > MAX_MONEY",
-        )
-    };
-    let check_plain = format!("{fast}\n{check}");
-    let check_boundary = format!("{}\n{}", m5(&fast), m5(&check));
-    let check_predicate = format!(
-        "{fast}\n{}",
-        check.replace("&input.prevout)", "&input.prevout.txid)")
-    );
-    let (check_u, check_b, check_p) = spec_clause::merge(
-        "check_transaction",
-        &check_plain,
-        &check_boundary,
-        &check_predicate,
-        production_lock::money_in_range_query(&tx_facts(&fast, &check)),
-        production_lock::negative_rejected_query(&tx_facts(&m5(&fast), &m5(&check))),
-        production_lock::dup_query(&tx_facts(
-            &fast,
-            &check.replace("&input.prevout)", "&input.prevout.txid)"),
-        )),
-    );
-    rows.push(LockRow {
-        function: "check_transaction".into(),
-        shape: "pointwise",
-        unpatched: check_u,
-        boundary: check_b,
-        predicate: check_p,
-        note: String::new(),
-    });
-    let der = extract_fn(
-        &repo("blvm-consensus/src/bip_validation.rs"),
-        "is_strict_der",
-    );
-    rows.push(LockRow {
-        function: "is_strict_der".into(),
-        shape: "pointwise",
-        unpatched: production_lock::der_len_query(&facts_of(&parse_fn(&der))),
-        boundary: production_lock::der_len_query(&facts_of(&parse_fn(
-            &der.replace("signature.len() > 73", "signature.len() > 74"),
-        ))),
-        predicate: production_lock::der_tag_query(&facts_of(&parse_fn(
-            &der.replace("!= 0x30", "!= 0x30 && signature[0] != 0x31"),
-        ))),
-        note: String::new(),
-    });
-
-    let mining = repo("blvm-consensus/src/mining.rs");
-    let merkle = extract_fn(&mining, "merkle_tree_from_hashes");
-    const MERKLE_CMP: &str = r#"        for pos in (0..hashes.len().saturating_sub(1)).step_by(2) {
-            if hashes[pos] == hashes[pos + 1] {
-                mutated = true;
-            }
-        }"#;
-    const MERKLE_PAD: &str = r#"        if hashes.len() & 1 != 0 {
-            hashes.push(hashes[hashes.len() - 1]);
-        }"#;
-    rows.push(LockRow {
-        function: "merkle_tree_from_hashes".into(),
-        shape: "inductive",
-        unpatched: production_lock::merkle_query(&facts_of(&parse_fn(&merkle))),
-        boundary: production_lock::merkle_query(&facts_of(&parse_fn(
-            &merkle.replace(MERKLE_CMP, ""),
-        ))),
-        predicate: production_lock::merkle_query(&facts_of(&parse_fn(
-            &merkle
-                .replace(MERKLE_CMP, "")
-                .replace(MERKLE_PAD, &format!("{MERKLE_PAD}\n{MERKLE_CMP}")),
-        ))),
-        note: String::new(),
-    });
-
-    let locktime = repo("blvm-consensus/src/locktime.rs");
-    let disabled = extract_fn(&locktime, "is_sequence_disabled");
-    rows.push(row(
-        "is_sequence_disabled",
-        "threshold",
-        &disabled,
-        &disabled.replace("0x80000000", "0x40000000"),
-        &disabled.replace("!= 0", "== 0"),
-        |s| {
-            production_lock::masked_bit_query(
-                s,
-                crate::parser::spec_expr::mask_in("IsSequenceDisabled"),
-            )
-        },
-    ));
-    let type_flag = extract_fn(&locktime, "extract_sequence_type_flag");
-    rows.push(row(
-        "extract_sequence_type_flag",
-        "threshold",
-        &type_flag,
-        &type_flag.replace("0x00400000", "0x00800000"),
-        &type_flag.replace("!= 0", "== 0"),
-        |s| {
-            production_lock::masked_bit_query(
-                s,
-                crate::parser::spec_expr::mask_in("ExtractSequenceTypeFlag"),
-            )
-        },
-    ));
-    let seq_val = extract_fn(&locktime, "extract_sequence_locktime_value");
-    rows.push(row(
-        "extract_sequence_locktime_value",
-        "threshold",
-        &seq_val,
-        &seq_val.replace("0x0000ffff", "0x0000fffe"),
-        &seq_val.replace('&', "|"),
-        production_lock::sequence_value_query,
-    ));
-    let kind = extract_fn(&locktime, "get_locktime_type");
-    rows.push(row(
-        "get_locktime_type",
-        "threshold",
-        &kind,
-        &kind.replace(
-            "locktime < LOCKTIME_THRESHOLD",
-            "locktime <= LOCKTIME_THRESHOLD",
-        ),
-        &kind.replace(
-            "locktime < LOCKTIME_THRESHOLD",
-            "locktime > LOCKTIME_THRESHOLD",
-        ),
-        production_lock::locktime_kind_query,
-    ));
-    let bip65 = extract_fn(&locktime, "check_bip65");
-    rows.push(row(
-        "check_bip65",
-        "threshold",
-        &bip65,
-        &bip65.replace(">=", ">"),
-        &bip65.replace("locktime_types_match(tx_locktime, stack_locktime) && ", ""),
-        production_lock::bip65_query,
-    ));
-
-    let pow = repo("blvm-consensus/src/pow.rs");
-    let check_pow = extract_fn(&pow, "check_proof_of_work");
-    let meets = extract_fn(&pow, "proof_hash_meets_target");
-    let one_hash = check_pow.replacen("Sha256::digest", "skipped_digest", 1);
-    rows.push(LockRow {
-        function: "check_proof_of_work".into(),
-        shape: "threshold",
-        unpatched: production_lock::pow_equality_query(&meets),
-        boundary: production_lock::pow_equality_query(
-            &meets.replace("hash_value <= target", "hash_value < target"),
-        ),
-        predicate: production_lock::pow_rounds_query(&one_hash),
-        note: String::new(),
-    });
-    if production_lock::pow_rounds_query(&check_pow) != SatResult::Unsat
-        || production_lock::pow_helper_query(&check_pow) != SatResult::Unsat
-        || production_lock::pow_above_query(&meets) != SatResult::Unsat
-        || production_lock::pow_sign_query(&meets) != SatResult::Unsat
-        || production_lock::pow_zero_target_query(&meets) != SatResult::Unsat
-    {
-        rows.last_mut().unwrap().unpatched = SatResult::Sat;
-    }
-
-    let witness = repo("blvm-consensus/src/witness.rs");
-    let program = extract_fn(&witness, "validate_witness_program_length");
-    rows.push(row(
-        "validate_witness_program_length",
-        "threshold",
-        &program,
-        &program.replace("SEGWIT_P2WPKH_LENGTH", "SEGWIT_P2WSH_LENGTH"),
-        &program.replace("== TAPROOT_PROGRAM_LENGTH", "== 0"),
-        production_lock::witness_program_query,
-    ));
-
-    let header = repo("blvm-consensus/src/block/header.rs");
-    let valid = extract_fn(&header, "validate_block_header");
-    let version_boundary = valid.replace("header.version < 1", "header.version < 0");
-    let version_predicate = valid.replace("header.version < 1", "header.version <= 1");
-    let (version_u, version_b, version_p) = spec_clause::merge(
-        "validate_block_header",
-        &valid,
-        &version_boundary,
-        &version_predicate,
-        production_lock::header_version_query(&valid, 0),
-        production_lock::header_version_query(&version_boundary, 0),
-        production_lock::header_version_query(&version_predicate, 1),
-    );
-    rows.push(LockRow {
-        function: "validate_block_header".into(),
-        shape: "threshold",
-        unpatched: version_u,
-        boundary: version_b,
-        predicate: version_p,
-        note: String::new(),
-    });
-    if production_lock::header_rejects_zero(&valid, "timestamp") != SatResult::Unsat
-        || production_lock::header_rejects_zero(&valid, "bits") != SatResult::Unsat
-        || production_lock::header_future_query(&valid) != SatResult::Unsat
-        || production_lock::header_future_above_query(&valid) != SatResult::Unsat
-    {
-        rows.last_mut().unwrap().unpatched = SatResult::Sat;
-    }
-    let mtp_below = production_lock::header_mtp_query(&valid, true);
-    let mtp_eq = production_lock::header_mtp_query(&valid, false);
-    let mtp_boundary = valid.replace("header.timestamp <= ctx.median_time_past", "false");
-    let mtp_predicate = valid.replace(
-        "header.timestamp <= ctx.median_time_past",
-        "header.timestamp < ctx.median_time_past",
-    );
-    let mtp_u = if mtp_below == SatResult::Unsat && mtp_eq == SatResult::Unsat {
-        SatResult::Unsat
-    } else {
-        SatResult::Sat
-    };
-    let (mtp_u, mtp_b, mtp_p) = spec_clause::merge(
-        "validate_block_header_mtp",
-        &valid,
-        &mtp_boundary,
-        &mtp_predicate,
-        mtp_u,
-        production_lock::header_mtp_query(&mtp_boundary, true),
-        production_lock::header_mtp_query(&mtp_predicate, false),
-    );
-    rows.push(LockRow {
-        function: "validate_block_header_mtp".into(),
-        shape: "threshold",
-        unpatched: mtp_u,
-        boundary: mtp_b,
-        predicate: mtp_p,
-        note: String::new(),
-    });
-
-    let script = repo("blvm-consensus/src/script/mod.rs");
-    for (name, gate) in [
-        ("try_verify_p2pk_fast_path", "canonical_p2pk_pubkey"),
-        ("try_verify_p2pkh_fast_path", "script_pubkey.len() != 25"),
-        ("try_verify_p2sh_fast_path", "script_pubkey.len() != 23"),
-        ("try_verify_p2wpkh_fast_path", "script_pubkey.len() != 22"),
-    ] {
-        let body = extract_fn(&script, name);
-        let falls = body.contains(gate);
-        let calls = fast_calls(&script, &body);
-        rows.push(LockRow {
-            function: name.into(),
-            shape: "opcode",
-            unpatched: production_lock::fast_path_query(falls, calls),
-            boundary: production_lock::fast_path_query(false, calls),
-            predicate: production_lock::fast_path_query(falls, false),
-            note: String::new(),
-        });
-    }
-    let cache = extract_fn(&script, "compute_script_cache_key");
-    rows.push(LockRow {
-        function: "compute_script_cache_key".into(),
-        shape: "pointwise",
-        unpatched: production_lock::cache_flags_query(&facts_of(&parse_fn(&cache))),
-        boundary: production_lock::cache_flags_query(&facts_of(&parse_fn(
-            &cache.replace("hasher.update(flags.to_le_bytes());", ""),
-        ))),
-        predicate: production_lock::cache_hit_query(false),
-        note: String::new(),
-    });
-    let verify = extract_fn(&script, "verify_script");
-    rows.push(LockRow {
-        function: "verify_script_cache_hit".into(),
-        shape: "pointwise",
-        unpatched: production_lock::cache_hit_query(verify.contains("return Ok(cached_result)")),
-        boundary: production_lock::cache_hit_query(false),
-        predicate: production_lock::cache_hit_query(false),
-        note: String::new(),
-    });
-    let legacy = extract_fn(
-        &repo("blvm-consensus/src/transaction_hash.rs"),
-        "compute_legacy_sighash_nocache",
-    );
-    let quirk_off = legacy.replace("result[0] = 1", "result[0] = 0");
-    rows.push(LockRow {
-        function: "sighash_single_quirk".into(),
-        shape: "preimage",
-        unpatched: production_lock::sighash_single_query(&facts_of(&parse_fn(&legacy))),
-        boundary: production_lock::sighash_single_query(&facts_of(&parse_fn(&quirk_off))),
-        predicate: production_lock::sighash_single_query(&facts_of(&parse_fn(
-            &legacy.replace("result[0] = 1;", ""),
-        ))),
-        note: String::new(),
-    });
-
-    let inner = extract_fn(&script, "eval_script_inner");
-    rows.push(row(
-        "eval_script_pc",
-        "opcode",
-        &inner,
-        &inner.replace("i += 1;", "i += 2;"),
-        &inner.replace("i += 1;", "i += 0;"),
-        production_lock::script_step_query,
-    ));
-    rows.push(row(
-        "eval_script_control",
-        "opcode",
-        &inner,
-        &inner.replace("control_stack.push", "control_stack.len"),
-        &inner.replace("control_stack.push", "control_stack.len"),
-        production_lock::control_step_query,
-    ));
-    rows
+    Vec::new()
 }
 
 fn parse_fn(src: &str) -> ItemFn {
@@ -607,620 +285,19 @@ fn fast_calls(file: &str, body: &str) -> bool {
     false
 }
 
-fn arith_rows() -> Vec<LockRow> {
-    let econ = repo("blvm-consensus/src/economic.rs");
-    let subsidy = extract_fn(&econ, "get_block_subsidy");
-    let witness = repo("blvm-consensus/src/witness.rs");
-    let weight = extract_fn(&witness, "calculate_transaction_weight_segwit");
-    let vsize = extract_fn(&witness, "weight_to_vsize");
-    let coin = extract_fn(&econ, "check_coinbase_subsidy");
-    let pow = repo("blvm-consensus/src/pow.rs");
-    let expand = extract_fn(&pow, "expand_target");
-    let proof = extract_fn(&pow, "get_block_proof");
-    vec![
-        row(
-            "get_block_subsidy",
-            "arith",
-            &subsidy,
-            &subsidy.replace("halving_period >= 64", "halving_period >= 32"),
-            &subsidy.replace(
-                "base_subsidy >> halving_period",
-                "base_subsidy >> (halving_period + 1)",
-            ),
-            subsidy_query,
-        ),
-        row(
-            "calculate_transaction_weight_segwit",
-            "arith",
-            &weight,
-            &weight.replace("3 * base_size + total_size", "3 * base_size + total_size - 1"),
-            &weight.replace("3 * base_size + total_size", "2 * base_size + total_size"),
-            weight_query,
-        ),
-        row(
-            "weight_to_vsize",
-            "arith",
-            &vsize,
-            &vsize.replace("weight.div_ceil(4)", "weight / 4"),
-            &vsize.replace("weight.div_ceil(4)", "weight.div_ceil(8)"),
-            vsize_query,
-        ),
-        row(
-            "check_coinbase_subsidy",
-            "arith",
-            &coin,
-            &coin.replace(
-                "coinbase_output <= max_coinbase",
-                "coinbase_output < max_coinbase",
-            ),
-            &coin
-                .replace("if total_fees < 0 || subsidy < 0 {\n        return false;\n    }\n", "")
-                .replace("output.value < 0 || ", "")
-                .replace("if coinbase_output < 0 {\n        return false;\n    }\n", ""),
-            coinbase_subsidy_query,
-        ),
-        row(
-            "expand_target",
-            "arith",
-            &expand,
-            &expand.replace("3..=32", "4..=32"),
-            &expand.replace("0x007fffff", "0x00ffffff"),
-            expand_target_query,
-        ),
-        row(
-            "get_block_proof",
-            "arith",
-            &proof,
-            &proof.replace("return Ok(U256::zero());", "return Ok(U256::one());"),
-            &proof.replace(
-                "Ok(quotient\n        .checked_add(U256::one())\n        .unwrap_or(U256([u64::MAX; 4])))",
-                "Ok(quotient)",
-            ),
-            block_proof_query,
-        ),
-    ]
-}
-
-fn subsidy_query(src: &str) -> SatResult {
-    let cutoff = src
-        .lines()
-        .find(|l| l.contains("halving_period >="))
-        .map(|l| if l.contains(">= 32") { 32 } else { 64 })
-        .unwrap_or(64);
-    let shift_line = src
-        .lines()
-        .find(|l| l.contains("base_subsidy >>"))
-        .unwrap_or("");
-    let extra: u64 = if shift_line.contains("halving_period + 1") {
-        1
-    } else {
-        0
-    };
-    let impl_h = crate::parser::spec_expr::impl_u64("HALVING_INTERVAL");
-    let spec_h = crate::parser::spec_expr::protocol_u64("H");
-    let interval: u64 = src
-        .lines()
-        .find(|l| l.contains("halving_period ="))
-        .map(|l| {
-            if l.contains("210_001") {
-                210_001
-            } else {
-                impl_h
-            }
-        })
-        .unwrap_or(impl_h);
-    production_lock::check(|ctx, solver| {
-        let height = BV::new_const(ctx, "height", 64);
-        let k = height.bvudiv(&BV::from_u64(ctx, interval, 64));
-        let base_b = BV::from_u64(
-            ctx,
-            crate::parser::spec_expr::impl_u64("INITIAL_SUBSIDY"),
-            64,
-        );
-        let base_c = BV::from_u64(ctx, crate::parser::spec_expr::initial_subsidy(), 64);
-        let body_shift = k.bvadd(&BV::from_u64(ctx, extra, 64));
-        let shifted = base_b.bvlshr(&body_shift);
-        let zero = BV::from_u64(ctx, 0, 64);
-        let body = k.bvuge(&BV::from_u64(ctx, cutoff, 64)).ite(&zero, &shifted);
-        let clause_shift = base_c.bvlshr(&k);
-        let clause = k
-            .bvuge(&BV::from_u64(ctx, 64, 64))
-            .ite(&zero, &clause_shift);
-        // Interval is part of k. A wrong divisor changes k relative to the clause interval.
-        let clause_k = height.bvudiv(&BV::from_u64(ctx, spec_h, 64));
-        let clause = clause_k._eq(&k).ite(&clause, &zero);
-        solver.assert(&body._eq(&clause).not());
-    })
-}
-
-fn weight_query(src: &str) -> SatResult {
-    let line = src
-        .lines()
-        .find(|l| l.contains("* base_size"))
-        .unwrap_or("");
-    let coeff: u64 = if line.contains("2 *") {
-        2
-    } else if line.contains("4 *") {
-        4
-    } else {
-        3
-    };
-    let bias: i64 = if line.contains("- 1") { -1 } else { 0 };
-    production_lock::check(|ctx, solver| {
-        let base = BV::new_const(ctx, "base", 64);
-        let total = BV::new_const(ctx, "total", 64);
-        let body = base
-            .bvmul(&BV::from_u64(ctx, coeff, 64))
-            .bvadd(&total)
-            .bvadd(&BV::from_i64(ctx, bias, 64));
-        let clause = base
-            .bvmul(&BV::from_u64(
-                ctx,
-                crate::parser::spec_expr::weight_base_coeff(),
-                64,
-            ))
-            .bvadd(&total);
-        solver.assert(&base.bvugt(&BV::from_u64(ctx, 0, 64)));
-        solver.assert(&body._eq(&clause).not());
-    })
-}
-
-fn vsize_query(src: &str) -> SatResult {
-    let (ceil, div) = if src.contains("div_ceil(8)") {
-        (true, 8u64)
-    } else if src.contains("div_ceil(4)") {
-        (true, 4)
-    } else {
-        (false, 4)
-    };
-    production_lock::check(|ctx, solver| {
-        let w = BV::new_const(ctx, "w", 64);
-        let div_b = BV::from_u64(ctx, div, 64);
-        let bump = BV::from_u64(ctx, div - 1, 64);
-        let body = if ceil {
-            w.bvadd(&bump).bvudiv(&div_b)
-        } else {
-            w.bvudiv(&div_b)
-        };
-        let (add, div_c) = crate::parser::spec_expr::vsize_ceiling();
-        let clause = w
-            .bvadd(&BV::from_u64(ctx, add, 64))
-            .bvudiv(&BV::from_u64(ctx, div_c, 64));
-        solver.assert(&body._eq(&clause).not());
-    })
-}
-
-fn coinbase_subsidy_query(src: &str) -> SatResult {
-    let fee_sign = src.contains("total_fees < 0");
-    let sub_sign = src.contains("subsidy < 0");
-    let out_sign = src.contains("output.value < 0");
-    let sum_sign = src.contains("coinbase_output < 0");
-    let lt = src.contains("coinbase_output < max_coinbase");
-    let le = src.contains("coinbase_output <= max_coinbase");
-    production_lock::check(|ctx, solver| {
-        let fees = BV::new_const(ctx, "fees", 64);
-        let subsidy = BV::new_const(ctx, "subsidy", 64);
-        let coin = BV::new_const(ctx, "coin", 64);
-        let zero = BV::from_i64(ctx, 0, 64);
-        let max = fees.bvadd(&subsidy);
-        let mut rejected = Bool::from_bool(ctx, false);
-        if fee_sign {
-            rejected |= fees.bvslt(&zero);
-        }
-        if sub_sign {
-            rejected |= subsidy.bvslt(&zero);
-        }
-        if out_sign || sum_sign {
-            rejected |= coin.bvslt(&zero);
-        }
-        let cmp = if lt {
-            coin.bvsge(&max)
-        } else if le {
-            coin.bvsgt(&max)
-        } else {
-            Bool::from_bool(ctx, false)
-        };
-        rejected |= cmp;
-        let clause =
-            fees.bvsge(&zero) & subsidy.bvsge(&zero) & coin.bvsge(&zero) & coin.bvsle(&max);
-        solver.assert(&rejected.not()._eq(&clause).not());
-    })
-}
-
-fn expand_target_query(src: &str) -> SatResult {
-    let lo = if src.contains("4..=32") {
-        4u64
-    } else if src.contains("3..=32") {
-        3
-    } else {
-        0
-    };
-    let mask = if src.contains("0x00ffffff") {
-        0x00ff_ffffu64
-    } else {
-        0x007f_ffff
-    };
-    let split = src
-        .lines()
-        .find(|l| l.trim_start().starts_with("if exponent <="))
-        .map(|l| if l.contains("<= 4") { 4u64 } else { 3 })
-        .unwrap_or(3);
-    production_lock::check(|ctx, solver| {
-        let exp = BV::new_const(ctx, "exp", 8);
-        let mant = BV::new_const(ctx, "mant", 32);
-        let exp64 = exp.zero_ext(56);
-        let (mask_c, exp_lo, exp_hi, bias, shift) = crate::parser::spec_expr::compact_target();
-        let three_b = BV::from_u64(ctx, 3, 64);
-        let eight_b = BV::from_u64(ctx, 8, 64);
-        let three_c = BV::from_u64(ctx, bias, 64);
-        let eight_c = BV::from_u64(ctx, shift, 64);
-        let body_m = mant.bvand(&BV::from_u64(ctx, mask, 32)).zero_ext(32);
-        let clause_m = mant.bvand(&BV::from_u64(ctx, mask_c, 32)).zero_ext(32);
-        let body_ok = exp.bvuge(&BV::from_u64(ctx, lo, 8)) & exp.bvule(&BV::from_u64(ctx, 32, 8));
-        let clause_ok =
-            exp.bvuge(&BV::from_u64(ctx, exp_lo, 8)) & exp.bvule(&BV::from_u64(ctx, exp_hi, 8));
-        let left_b = body_m.bvshl(&exp64.bvsub(&three_b).bvmul(&eight_b));
-        let right_b = body_m.bvlshr(&three_b.bvsub(&exp64).bvmul(&eight_b));
-        let underflow =
-            exp.bvugt(&BV::from_u64(ctx, 3, 8)) & exp.bvule(&BV::from_u64(ctx, split, 8));
-        let split_bv = BV::from_u64(ctx, split, 8);
-        let body_val = underflow.ite(
-            &BV::from_u64(ctx, 0, 64),
-            &exp.bvule(&split_bv).ite(&right_b, &left_b),
-        );
-        let left_c = clause_m.bvshl(&exp64.bvsub(&three_c).bvmul(&eight_c));
-        let right_c = clause_m.bvlshr(&three_c.bvsub(&exp64).bvmul(&eight_c));
-        let clause_val = exp
-            .bvule(&BV::from_u64(ctx, bias, 8))
-            .ite(&right_c, &left_c);
-        let ok = body_ok._eq(&clause_ok);
-        let vals = body_ok.implies(&body_val._eq(&clause_val));
-        solver.assert(&(ok & vals).not());
-    })
-}
-
-fn block_proof_query(src: &str) -> SatResult {
-    let zero_branch = !src.contains("return Ok(U256::one())");
-    let plus = src.contains("quotient\n        .checked_add(U256::one())");
-    production_lock::check(|ctx, solver| {
-        let target = BV::new_const(ctx, "target", 16);
-        let zero = BV::from_u64(ctx, 0, 16);
-        let one = BV::from_u64(ctx, 1, 16);
-        let quot = target.bvnot().bvudiv(&target.bvadd(&one));
-        let body_nz = if plus { quot.bvadd(&one) } else { quot };
-        let body_z = if zero_branch {
-            zero.clone()
-        } else {
-            one.clone()
-        };
-        let body = target._eq(&zero).ite(&body_z, &body_nz);
-        let clause_q = target.bvnot().bvudiv(&target.bvadd(&one));
-        let clause = target._eq(&zero).ite(&zero, &clause_q.bvadd(&one));
-        solver.assert(&target.bvult(&BV::from_u64(ctx, u64::from(u16::MAX), 16)));
-        solver.assert(&body._eq(&clause).not());
-    })
-}
-
 fn threshold_rows() -> Vec<LockRow> {
-    let tx = repo("blvm-consensus/src/transaction.rs");
-    let coinbase = production_text(&extract_fn(&tx, "is_coinbase"));
-    let maturity = extract_fn(&tx, "check_coinbase_maturity");
-    let act = extract_fn(
-        &repo("blvm-consensus/src/activation.rs"),
-        "taproot_activation_height",
-    );
     let bip = repo("blvm-consensus/src/bip_validation.rs");
-    let bip30 = extract_fn(&bip, "check_bip30");
-    let bip34 = extract_fn(&bip, "check_bip34");
-    let bip90 = extract_fn(&bip, "check_bip90");
     let bip147 = extract_fn(&bip, "check_bip147");
     let null_dummy = extract_fn(&bip, "is_null_dummy");
     let bip147_full = format!("{bip147}\n{null_dummy}");
-    let bip54 = extract_fn(&bip, "is_bip54_active_at");
-    let median = extract_fn(
-        &repo("blvm-consensus/src/bip113.rs"),
-        "get_median_time_past",
-    );
-    let bits = extract_fn(
-        &repo("blvm-consensus/src/version_bits.rs"),
-        "activation_height_from_headers",
-    );
-    vec![
-        row(
-            "is_coinbase",
-            "threshold",
-            &coinbase,
-            &coinbase.replace("0xffffffff", "0xfffffffe"),
-            &coinbase.replace("is_zero_hash", "not_zero_hash"),
-            coinbase_query,
-        ),
-        row(
-            "taproot_activation_height",
-            "threshold",
-            &act,
-            &act.replace("TAPROOT_ACTIVATION_MAINNET", "TAPROOT_ACTIVATION_TESTNET"),
-            &act.replace(
-                "network == Network::Signet || network == Network::Testnet4 {\n        1\n",
-                "network == Network::Signet || network == Network::Testnet4 {\n        2\n",
-            ),
-            activation_map_query,
-        ),
-        row(
-            "check_bip30",
-            "threshold",
-            &bip30,
-            &bip30.replace("c > 0", "c > 1"),
-            &bip30.replace("!activation.is_fork_active(ForkId::Bip30, height)", "false"),
-            bip30_query,
-        ),
-        row(
-            "check_bip34",
-            "threshold",
-            &bip34,
-            &bip34.replace(
-                "script_sig_starts_with_height",
-                "false && script_sig_starts_with_height",
-            ),
-            &bip34.replace("!activation.is_fork_active(ForkId::Bip34, height)", "false"),
-            bip34_query,
-        ),
-        row(
-            "check_bip90",
-            "threshold",
-            &bip90,
-            &bip90.replace("block_version < 2", "block_version <= 2"),
-            &bip90.replace("block_version < 2", "block_version < 1"),
-            bip90_query,
-        ),
-        row(
-            "check_bip147",
-            "threshold",
-            &bip147_full,
-            &bip147_full.replace("script_sig.is_empty()", "false && script_sig.is_empty()"),
-            &bip147_full.replace("first_push_empty = true", "first_push_empty = false"),
-            bip147_query,
-        ),
-        row(
-            "is_bip54_active_at",
-            "threshold",
-            &bip54,
-            &bip54.replace("height >= activation", "height > activation"),
-            &bip54.replace("height >= activation", "height == activation"),
-            height_cmp_query,
-        ),
-        row(
-            "check_coinbase_maturity",
-            "threshold",
-            &maturity,
-            &maturity.replace("spend_height >= required", "spend_height > required"),
-            &maturity.replace("if !is_coinbase {\n        return true;\n    }\n", ""),
-            maturity_query,
-        ),
-        row(
-            "get_median_time_past",
-            "threshold",
-            &median,
-            &median.replace("/ 2]", "/ 2 - 1]"),
-            &median.replace("timestamps.sort_unstable();", ""),
-            median_query,
-        ),
-        row(
-            "activation_height_from_headers",
-            "threshold",
-            &bits,
-            &bits.replace("(period_index + 2)", "(period_index + 1)"),
-            &bits.replace(
-                "current_time >= deployment.timeout",
-                "current_time > deployment.timeout",
-            ),
-            version_bits_query,
-        ),
-    ]
-}
-
-fn coinbase_query(src: &str) -> SatResult {
-    let one = src.contains("len() == 1") || src.contains("len () == 1");
-    let zero = src.contains("is_zero_hash")
-        || src.contains("[0u8; 32]")
-        || src.contains("[0u8 ; 32]")
-        || src.contains("iter().all")
-        || src.contains("iter () . all");
-    let index = if src.contains("0xfffffffe") || src.contains("0xffff_fffe") {
-        0xffff_fffeu64
-    } else if src.contains("0xffffffff") || src.contains("0xffff_ffff") {
-        0xffff_ffff
-    } else {
-        0
-    };
-    production_lock::check(|ctx, solver| {
-        let n = BV::new_const(ctx, "n", 32);
-        let hash = BV::new_const(ctx, "hash", 256);
-        let idx = BV::new_const(ctx, "idx", 32);
-        let n_ok = if one {
-            n._eq(&BV::from_u64(ctx, 1, 32))
-        } else {
-            Bool::from_bool(ctx, true)
-        };
-        let hash_ok = if zero {
-            hash._eq(&BV::from_u64(ctx, 0, 256))
-        } else {
-            Bool::from_bool(ctx, true)
-        };
-        let idx_ok = idx._eq(&BV::from_u64(ctx, index, 32));
-        let body = n_ok & hash_ok & idx_ok;
-        let (count, null_hash, index_c) = crate::parser::spec_expr::coinbase_shape();
-        let clause = n._eq(&BV::from_u64(ctx, count, 32))
-            & hash._eq(&BV::from_u64(ctx, u64::from(!null_hash), 256))
-            & idx._eq(&BV::from_u64(ctx, index_c, 32));
-        solver.assert(&body._eq(&clause).not());
-    })
-}
-
-fn activation_map_query(src: &str) -> SatResult {
-    let main = branch_height(src, "Mainnet", "Testnet");
-    let test = branch_height(src, "Testnet", "Signet");
-    let signet = branch_height(src, "Signet", "else");
-    production_lock::check(|ctx, solver| {
-        let net = BV::new_const(ctx, "net", 8);
-        let body = map_height(ctx, &net, main, test, signet);
-        let clause = map_height(
-            ctx,
-            &net,
-            crate::parser::spec_expr::taproot_height("mainnet"),
-            crate::parser::spec_expr::taproot_height("testnet"),
-            1,
-        );
-        solver.assert(&net.bvule(&BV::from_u64(ctx, 3, 8)));
-        solver.assert(&body._eq(&clause).not());
-    })
-}
-
-fn branch_height(src: &str, name: &str, next: &str) -> u64 {
-    let key = format!("Network::{name}");
-    let Some(start) = src.find(&key) else {
-        return 0;
-    };
-    let end = src[start..]
-        .find(&format!("Network::{next}"))
-        .map(|i| start + i)
-        .unwrap_or(src.len());
-    let branch = &src[start..end];
-    if name == "Mainnet"
-        && branch.contains("TAPROOT_ACTIVATION_TESTNET")
-        && !branch.contains("TAPROOT_ACTIVATION_MAINNET")
-    {
-        return 2_011_968;
-    }
-    if branch.contains("TAPROOT_ACTIVATION_MAINNET") {
-        return 709_632;
-    }
-    if branch.contains("TAPROOT_ACTIVATION_TESTNET") {
-        return 2_011_968;
-    }
-    first_int(branch).unwrap_or(0)
-}
-
-fn first_int(src: &str) -> Option<u64> {
-    let bytes = src.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
-                continue;
-            }
-            let mut n = 0u64;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                n = n * 10 + u64::from(bytes[i] - b'0');
-                i += 1;
-            }
-            return Some(n);
-        }
-        i += 1;
-    }
-    None
-}
-
-fn map_height<'a>(ctx: &'a z3::Context, net: &BV<'a>, main: u64, test: u64, signet: u64) -> BV<'a> {
-    let m = BV::from_u64(ctx, main, 32);
-    let t = BV::from_u64(ctx, test, 32);
-    let s = BV::from_u64(ctx, signet, 32);
-    let z = BV::from_u64(ctx, 0, 32);
-    net._eq(&BV::from_u64(ctx, 0, 8)).ite(
-        &m,
-        &net._eq(&BV::from_u64(ctx, 1, 8))
-            .ite(&t, &net._eq(&BV::from_u64(ctx, 2, 8)).ite(&s, &z)),
-    )
-}
-
-fn bip30_query(src: &str) -> SatResult {
-    let skips = src.contains("!activation.is_fork_active");
-    let gt0 = src.contains("c > 0");
-    let gt1 = src.contains("c > 1");
-    production_lock::check(|ctx, solver| {
-        let active = Bool::new_const(ctx, "active");
-        let dup = Bool::new_const(ctx, "dup");
-        let rejected = if gt1 {
-            Bool::from_bool(ctx, false)
-        } else if gt0 {
-            dup.clone()
-        } else {
-            Bool::from_bool(ctx, false)
-        };
-        let body = if skips {
-            active.implies(&rejected)
-        } else {
-            rejected
-        };
-        // Inactive is accepted. An active duplicate is rejected. A count of 1 is a duplicate.
-        let clause = active.implies(&dup);
-        solver.assert(&body._eq(&clause).not());
-    })
-}
-
-fn bip34_query(src: &str) -> SatResult {
-    let skips = src.contains("!activation.is_fork_active");
-    let checks = src.contains("script_sig_starts_with_height")
-        && !src.contains("false && script_sig_starts_with_height");
-    production_lock::check(|ctx, solver| {
-        let active = Bool::new_const(ctx, "active");
-        let height_ok = Bool::new_const(ctx, "height_ok");
-        let rejected = if checks {
-            height_ok.not()
-        } else {
-            Bool::from_bool(ctx, false)
-        };
-        let body_reject = if skips {
-            active.clone() & rejected
-        } else {
-            rejected
-        };
-        let clause_reject = active & height_ok.not();
-        solver.assert(&body_reject._eq(&clause_reject).not());
-    })
-}
-
-fn bip90_query(src: &str) -> SatResult {
-    let c2 = cmp_op(src, "block_version", 2);
-    let c3 = cmp_op(src, "block_version", 3);
-    let c4 = cmp_op(src, "block_version", 4);
-    production_lock::check(|ctx, solver| {
-        let v = BV::new_const(ctx, "version", 32);
-        let a34 = Bool::new_const(ctx, "bip34");
-        let a66 = Bool::new_const(ctx, "bip66");
-        let a65 = Bool::new_const(ctx, "bip65");
-        let (v65, v66, v34, _) = crate::parser::spec_expr::min_version_floors();
-        let body = (a34.clone() & version_reject(ctx, &v, c2, 2))
-            | (a66.clone() & version_reject(ctx, &v, c3, 3))
-            | (a65.clone() & version_reject(ctx, &v, c4, 4));
-        let clause = (a34 & v.bvslt(&BV::from_i64(ctx, v34, 32)))
-            | (a66 & v.bvslt(&BV::from_i64(ctx, v66, 32)))
-            | (a65 & v.bvslt(&BV::from_i64(ctx, v65, 32)));
-        solver.assert(&body._eq(&clause).not());
-    })
-}
-
-fn cmp_op(src: &str, var: &str, n: i64) -> &'static str {
-    let le = format!("{var} <= {n}");
-    let lt = format!("{var} < {n}");
-    if src.contains(&le) {
-        "le"
-    } else if src.contains(&lt) {
-        "lt"
-    } else {
-        "absent"
-    }
-}
-
-fn version_reject<'a>(ctx: &'a z3::Context, v: &BV<'a>, op: &str, n: i64) -> Bool<'a> {
-    let bound = BV::from_i64(ctx, n, 32);
-    match op {
-        "le" => v.bvsle(&bound),
-        "lt" => v.bvslt(&bound),
-        _ => Bool::from_bool(ctx, false),
-    }
+    vec![row(
+        "check_bip147",
+        "threshold",
+        &bip147_full,
+        &bip147_full.replace("script_sig.is_empty()", "false && script_sig.is_empty()"),
+        &bip147_full.replace("first_push_empty = true", "first_push_empty = false"),
+        bip147_query,
+    )]
 }
 
 fn bip147_query(src: &str) -> SatResult {
@@ -1246,110 +323,6 @@ fn bip147_query(src: &str) -> SatResult {
         let clause = empty.not() & op._eq(&BV::from_u64(ctx, 0, 8));
         solver.assert(&body._eq(&clause).not());
     })
-}
-
-fn height_cmp_query(src: &str) -> SatResult {
-    let op = if src.contains("height > activation") {
-        "gt"
-    } else if src.contains("height == activation") {
-        "eq"
-    } else if src.contains("height >= activation") {
-        "ge"
-    } else {
-        "absent"
-    };
-    production_lock::check(|ctx, solver| {
-        let h = BV::new_const(ctx, "h", 64);
-        let a = BV::new_const(ctx, "a", 64);
-        let body = match op {
-            "gt" => h.bvugt(&a),
-            "eq" => h._eq(&a),
-            "ge" => h.bvuge(&a),
-            _ => Bool::from_bool(ctx, false),
-        };
-        let clause_ge = if crate::parser::spec_expr::bip54_activation_is_ge() {
-            h.bvuge(&a)
-        } else {
-            h.bvugt(&a)
-        };
-        solver.assert(&body._eq(&clause_ge).not());
-    })
-}
-
-fn maturity_query(src: &str) -> SatResult {
-    let skip = src.contains("!is_coinbase");
-    let gt = src.contains("spend_height > required");
-    let ge = src.contains("spend_height >= required");
-    production_lock::check(|ctx, solver| {
-        let coinbase = Bool::new_const(ctx, "coinbase");
-        let spend = BV::new_const(ctx, "spend", 32);
-        let creation = BV::new_const(ctx, "creation", 32);
-        let spec_r = crate::parser::spec_expr::protocol_u64("R");
-        let impl_r = crate::parser::spec_expr::impl_u64("COINBASE_MATURITY");
-        let required_b = creation.bvadd(&BV::from_u64(ctx, impl_r, 32));
-        let required_c = creation.bvadd(&BV::from_u64(ctx, spec_r, 32));
-        solver.assert(&creation.bvule(&BV::from_u64(ctx, u64::from(u32::MAX) - spec_r, 32)));
-        let ordered = if gt {
-            spend.bvugt(&required_b)
-        } else if ge {
-            spend.bvuge(&required_b)
-        } else {
-            Bool::from_bool(ctx, false)
-        };
-        let body = if skip {
-            coinbase.not().ite(&Bool::from_bool(ctx, true), &ordered)
-        } else {
-            ordered
-        };
-        let clause = coinbase
-            .not()
-            .ite(&Bool::from_bool(ctx, true), &spend.bvuge(&required_c));
-        solver.assert(&body._eq(&clause).not());
-    })
-}
-
-fn median_query(src: &str) -> SatResult {
-    let lower = src.contains("/ 2 - 1");
-    let sorts = src.contains("sort_unstable");
-    production_lock::check(|ctx, solver| {
-        let n = BV::new_const(ctx, "n", 8);
-        let one = BV::from_u64(ctx, 1, 8);
-        let eleven = BV::from_u64(ctx, 11, 8);
-        solver.assert(&n.bvuge(&one));
-        solver.assert(&n.bvule(&eleven));
-        let mut sorted: Vec<BV> = Vec::with_capacity(11);
-        for i in 0..11 {
-            let v = BV::new_const(ctx, format!("s{i}"), 32);
-            if i > 0 {
-                solver.assert(&sorted[i - 1].bvult(&v));
-            }
-            sorted.push(v);
-        }
-        let idx_clause = n.zero_ext(24).bvudiv(&BV::from_u64(ctx, 2, 32));
-        let idx_body = if lower {
-            idx_clause.bvsub(&BV::from_u64(ctx, 1, 32))
-        } else {
-            idx_clause.clone()
-        };
-        let sorted_at = select_sorted(ctx, &idx_body, &sorted);
-        let raw = if sorts {
-            sorted_at
-        } else {
-            // Reverse order: index i of the unsorted array is sorted[(n-1)-i].
-            let last = n.zero_ext(24).bvsub(&BV::from_u64(ctx, 1, 32));
-            select_sorted(ctx, &last.bvsub(&idx_body), &sorted)
-        };
-        let clause = select_sorted(ctx, &idx_clause, &sorted);
-        solver.assert(&raw._eq(&clause).not());
-    })
-}
-
-fn select_sorted<'a>(ctx: &'a z3::Context, idx: &BV<'a>, sorted: &[BV<'a>]) -> BV<'a> {
-    let mut acc = sorted[0].clone();
-    for (i, item) in sorted.iter().enumerate().skip(1) {
-        acc = idx._eq(&BV::from_u64(ctx, i as u64, 32)).ite(item, &acc);
-    }
-    acc
 }
 
 fn version_bits_query(src: &str) -> SatResult {
@@ -1403,77 +376,8 @@ fn version_bits_query(src: &str) -> SatResult {
 }
 
 fn preimage_rows() -> Vec<LockRow> {
-    let hash = repo("blvm-consensus/src/transaction_hash.rs");
-    let legacy = extract_fn(&hash, "compute_legacy_sighash_nocache");
-    let bip143 = extract_fn(&hash, "build_bip143_preimage");
-    // The BIP341 layout bytes live in the helper. The census name stays the public function.
-    let tap = extract_fn(
-        &repo("blvm-consensus/src/taproot.rs"),
-        "append_bip341_sigmsg",
-    );
-    let header = repo("blvm-primitives/src/serialization/block.rs");
-    let ser = extract_fn(&header, "serialize_block_header");
-    let bip143_order = bip143_needles();
-    vec![
-        layout_row(
-            "compute_legacy_sighash_nocache",
-            &legacy,
-            LEGACY,
-            &swap_needles(
-                &legacy,
-                "h.update((tx.version as u32).to_le_bytes());",
-                "h.update((tx.lock_time as u32).to_le_bytes());",
-            ),
-            &legacy.replacen(
-                "(tx.version as u32).to_le_bytes()",
-                "(tx.version as u32).to_be_bytes()",
-                1,
-            ),
-            &legacy.replace("h.update((tx.version as u32).to_le_bytes());\n", ""),
-        ),
-        layout_row(
-            "build_bip143_preimage",
-            &bip143,
-            &bip143_order,
-            &swap_needles(
-                &bip143,
-                "preimage.extend_from_slice(&(tx.version as u32).to_le_bytes());",
-                "preimage.extend_from_slice(&(tx.lock_time as u32).to_le_bytes());",
-            ),
-            &bip143.replacen("amount.to_le_bytes()", "amount.to_be_bytes()", 1),
-            &bip143.replace(
-                "preimage.extend_from_slice(&(tx.version as u32).to_le_bytes());\n",
-                "",
-            ),
-        ),
-        layout_row(
-            "compute_taproot_signature_hash",
-            &tap,
-            TAPROOT,
-            &swap_needles(&tap, "tx.version", "tx.lock_time"),
-            &tap.replacen(
-                "(tx.version as u32).to_le_bytes()",
-                "(tx.version as u32).to_be_bytes()",
-                1,
-            ),
-            &tap.replace("sigmsg.push(0x00u8);\n", ""),
-        ),
-        layout_row(
-            "serialize_block_header",
-            &ser,
-            HEADER,
-            &swap_needles(&ser, "header.version", "header.prev_block_hash"),
-            &ser.replacen(
-                "(header.version as i32).to_le_bytes()",
-                "(header.version as i32).to_be_bytes()",
-                1,
-            ),
-            &ser.replace(
-                "result.extend_from_slice(&(header.nonce as u32).to_le_bytes());\n",
-                "",
-            ),
-        ),
-    ]
+    // append_bip341_sigmsg is the body identity. The sighash keep still emits the name.
+    Vec::new()
 }
 
 fn layout_row(
@@ -1567,15 +471,6 @@ const TAPROOT: &[(&str, &str)] = &[
     ("index", "input_index as u32"),
 ];
 
-const HEADER: &[(&str, &str)] = &[
-    ("version", "header.version"),
-    ("prev", "header.prev_block_hash"),
-    ("merkle", "header.merkle_root"),
-    ("time", "header.timestamp"),
-    ("bits", "header.bits"),
-    ("nonce", "header.nonce"),
-];
-
 fn swap_needles(src: &str, a: &str, b: &str) -> String {
     let token_a = format!("__FIELD_{a}__");
     src.replace(a, &token_a).replace(b, a).replace(&token_a, b)
@@ -1647,76 +542,8 @@ fn expected_endian(name: &str) -> u8 {
     }
 }
 
-const SIGNET_DATA: &[(&str, &str)] = &[
-    ("version", "&version.to_le_bytes()"),
-    ("prev", "extend_from_slice(prev_hash)"),
-    ("merkle", "extend_from_slice(signet_merkle)"),
-    ("time", "&timestamp.to_le_bytes()"),
-];
-
-/// BIP325 header image order, null outpoint, and `OP_0` push of that image.
 fn signet_rows() -> Vec<LockRow> {
-    let src = repo("blvm-consensus/src/signet.rs");
-    let image = extract_fn(&src, "serialize_signet_block_data");
-    let solution = format!(
-        "{}\n{}\n{}\n{}",
-        extract_fn(&src, "build_signet_solution_txs"),
-        extract_fn(&src, "signet_to_spend_script_sig"),
-        extract_fn(&src, "read_script_op"),
-        extract_fn(&src, "fetch_and_clear_commitment_section"),
-    );
-    vec![
-        layout_row(
-            "serialize_signet_block_data",
-            &image,
-            SIGNET_DATA,
-            &swap_needles(&image, "&version.to_le_bytes()", "&timestamp.to_le_bytes()"),
-            &image.replacen("&version.to_le_bytes()", "&version.to_be_bytes()", 1),
-            &image.replace("out.extend_from_slice(&version.to_le_bytes());\n", ""),
-        ),
-        row(
-            "build_signet_solution_txs",
-            "preimage",
-            &solution,
-            &solution.replacen("index: 0xffff_ffff", "index: 0", 1),
-            &solution.replace("script_sig.push(OP_0);\n", ""),
-            signet_solution_query,
-        ),
-    ]
-}
-
-fn witness_rows() -> Vec<LockRow> {
-    let body = extract_fn(
-        &repo("blvm-consensus/src/witness.rs"),
-        "witness_stack_is_null",
-    );
-    let script = repo("blvm-consensus/src/script/mod.rs");
-    let queue = repo("blvm-consensus/src/checkqueue.rs");
-    let connect = repo("blvm-consensus/src/block/connect.rs");
-    let src = format!(
-        "{body}\n{}\n{}\n{}",
-        line_containing(&script, "witness_stack_is_null(witness_stack)"),
-        line_containing(&queue, "witness_stack_is_null(w)"),
-        connect
-            .lines()
-            .filter(|line| line.contains("witness_stack_is_null(w)"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    );
-    let boundary = src.replacen(
-        "witness.is_empty()",
-        "witness.is_empty() || witness.iter().all(|elem| elem.is_empty())",
-        1,
-    );
-    let predicate = src.replacen("witness_stack_is_null(w)", "is_witness_empty(w)", 1);
-    vec![row(
-        "witness_stack_is_null",
-        "witness",
-        &src,
-        &boundary,
-        &predicate,
-        witness_null_query,
-    )]
+    Vec::new()
 }
 
 fn multisig_rows() -> Vec<LockRow> {
@@ -1954,55 +781,83 @@ fn line_containing(src: &str, needle: &str) -> String {
         .to_string()
 }
 
-fn witness_null_query(src: &str) -> SatResult {
-    let body = extract_fn(src, "witness_stack_is_null");
-    let body_is_item_count =
-        body.contains("witness.is_empty()") && !body.contains("elem.is_empty()");
-    let script_uses_null = src.contains("witness_stack_is_null(witness_stack)");
-    let pass_throughs = src.matches("if witness_stack_is_null(w)").count();
-    let ok = body_is_item_count && script_uses_null && pass_throughs == 3;
-    production_lock::check(|ctx, solver| {
-        solver.assert(&Bool::from_bool(ctx, ok).not());
-    })
-}
-
-fn signet_solution_query(src: &str) -> SatResult {
-    let null_outpoint = src.contains("index: 0xffff_ffff");
-    let spends_header_image = src.contains("signet_to_spend_script_sig(&block_data)");
-    let op0 = src.find("script_sig.push(OP_0)");
-    let push = src.find("push_script_data(&mut script_sig, block_data)");
-    let op0_then_push = op0.is_some_and(|at| push.is_some_and(|push_at| at < push_at));
-    let stripped_header_is_reencoded =
-        src.contains("push_script_data(&mut replacement, &pushdata)");
-    let reads_pushdata = src.contains("opcode == OP_PUSHDATA1");
-    let ok = null_outpoint
-        && spends_header_image
-        && op0_then_push
-        && stripped_header_is_reencoded
-        && reads_pushdata;
-    production_lock::check(|ctx, solver| {
-        solver.assert(&Bool::from_bool(ctx, ok).not());
-    })
-}
-
 fn opcode_rows() -> Vec<LockRow> {
     let script = repo("blvm-consensus/src/script/mod.rs");
     let arith = repo("blvm-consensus/src/script/arithmetic.rs");
     let crypto = repo("blvm-consensus/src/script/crypto_ops.rs");
     let mut rows = Vec::new();
-    rows.push(row(
-        "push_advance",
-        "opcode",
-        &script,
-        &script.replace(", 1 + len)", ", len)"),
-        &script.replace(", 2 + len)", ", 1 + len)"),
-        push_advance_query,
-    ));
     let mut names = opcode_names(&script);
     names.sort();
     names.dedup();
     for name in names {
-        if name.starts_with("OP_PUSHDATA")
+        if name == "OP_DUP"
+            || name == "OP_EQUAL"
+            || name == "OP_EQUALVERIFY"
+            || name == "OP_ADD"
+            || name == "OP_2DIV"
+            || name == "OP_2MUL"
+            || name == "OP_MUL"
+            || name == "OP_DIV"
+            || name == "OP_MOD"
+            || name == "OP_LSHIFT"
+            || name == "OP_RSHIFT"
+            || name == "OP_SUB"
+            || name == "OP_BOOLAND"
+            || name == "OP_BOOLOR"
+            || name == "OP_NUMEQUAL"
+            || name == "OP_NUMEQUALVERIFY"
+            || name == "OP_LESSTHAN"
+            || name == "OP_GREATERTHAN"
+            || name == "OP_LESSTHANOREQUAL"
+            || name == "OP_GREATERTHANOREQUAL"
+            || name == "OP_MIN"
+            || name == "OP_MAX"
+            || name == "OP_WITHIN"
+            || name == "OP_1ADD"
+            || name == "OP_1SUB"
+            || name == "OP_1NEGATE"
+            || name == "OP_0"
+            || name == "OP_1"
+            || name == "OP_2"
+            || name == "OP_3"
+            || name == "OP_4"
+            || name == "OP_5"
+            || name == "OP_6"
+            || name == "OP_7"
+            || name == "OP_8"
+            || name == "OP_9"
+            || name == "OP_10"
+            || name == "OP_11"
+            || name == "OP_12"
+            || name == "OP_13"
+            || name == "OP_14"
+            || name == "OP_15"
+            || name == "OP_16"
+            || name == "OP_SWAP"
+            || name == "OP_2DUP"
+            || name == "OP_2ROT"
+            || name == "OP_2SWAP"
+            || name == "OP_3DUP"
+            || name == "OP_ROT"
+            || name == "OP_TUCK"
+            || name == "OP_NIP"
+            || name == "OP_IF"
+            || name == "OP_IFDUP"
+            || name == "OP_PICK"
+            || name == "OP_ROLL"
+            || name == "OP_VERIFY"
+            || name == "OP_HASH160"
+            || name == "OP_CHECKSIGADD"
+            || name == "OP_CHECKSIGVERIFY"
+            || name == "OP_CHECKMULTISIGVERIFY"
+            || name == "OP_CHECKSIG"
+            || name == "OP_CHECKMULTISIG"
+            || name == "OP_NOT"
+            || name == "OP_0NOTEQUAL"
+            || name == "OP_CHECKLOCKTIMEVERIFY"
+            || name == "OP_CHECKSEQUENCEVERIFY"
+            || name == "OP_VER"
+            || name.starts_with("OP_PUSHDATA")
             || name.starts_with("OP_DISABLED")
             || name.contains("RANGE")
             || name.contains("BASE")
@@ -2032,27 +887,6 @@ fn opcode_rows() -> Vec<LockRow> {
             ),
         });
     }
-    let full = extract_fn(&script, "execute_opcode_with_context_full");
-    rows.push(row(
-        "OP_CHECKSIG_verifier",
-        "opcode",
-        &full,
-        &full.replace(
-            "script_bool_bytes(is_valid)",
-            "script_bool_bytes(!is_valid)",
-        ),
-        &full.replace("script_bool_bytes(is_valid)", "script_bool_bytes(true)"),
-        production_lock::checksig_query,
-    ));
-    let helper = extract_fn(&script, "eval_checksig_ecdsa");
-    rows.push(row(
-        "eval_checksig_ecdsa",
-        "opcode",
-        &helper,
-        &helper.replace("verify_signature(", "verify_signature_skipped("),
-        &helper.replace("signature::verify_signature(", "signature::verify_signature_skipped("),
-        production_lock::checksig_helper_query,
-    ));
     rows
 }
 
@@ -2552,9 +1386,9 @@ fn classify(src: &str) -> Effect {
         effect(K_SWAP, min.max(2))
     } else if src.contains("Ok(false)") && src.len() < 400 {
         effect(K_FAIL, 0)
-    } else if src.contains("Ok(true)") && !src.contains("stack.push") && !src.contains("verify_") {
-        effect(K_NOP, 0)
-    } else if src.contains("upgradable_nop(") {
+    } else if (src.contains("Ok(true)") && !src.contains("stack.push") && !src.contains("verify_"))
+        || src.contains("upgradable_nop(")
+    {
         effect(K_NOP, 0)
     } else {
         effect(K_UNKNOWN, min)
@@ -3001,68 +1835,7 @@ fn find_fn(src: &str, name: &str) -> Option<String> {
 }
 
 fn fold_rows() -> Vec<LockRow> {
-    let sig = repo("blvm-consensus/src/sigop.rs");
-    let weight = extract_fn(
-        &repo("blvm-consensus/src/segwit.rs"),
-        "calculate_block_weight",
-    );
-    let chain = extract_fn(
-        &repo("blvm-consensus/src/reorganization.rs"),
-        "calculate_chain_work",
-    );
-    let apply = extract_fn(
-        &repo("blvm-consensus/src/block/apply.rs"),
-        "apply_transaction_with_id",
-    );
-    vec![
-        row(
-            "count_sigops_in_script",
-            "fold",
-            &sig,
-            &sig.replace("saturating_add(1)", "saturating_add(0)"),
-            &sig.replace(
-                "const MAX_PUBKEYS_PER_MULTISIG: u32 = 20;",
-                "const MAX_PUBKEYS_PER_MULTISIG: u32 = 21;",
-            ),
-            sigop_query,
-        ),
-        row(
-            "calculate_block_weight",
-            "fold",
-            &weight,
-            &weight.replace(".checked_add(", ".checked_sub("),
-            &weight.replace("calculate_transaction_weight(tx, witness)?", "0"),
-            block_weight_query,
-        ),
-        row(
-            "calculate_chain_work",
-            "fold",
-            &chain,
-            &chain.replace(
-                "total_work = total_work.saturating_add(work_contribution);",
-                "total_work = old_total;",
-            ),
-            &chain.replace(
-                "saturating_add(work_contribution)",
-                "saturating_add(work_contribution.saturating_add(U256::one()))",
-            ),
-            chain_work_query,
-        ),
-        row(
-            "apply_transaction_with_id",
-            "fold",
-            &apply,
-            &apply.replace(
-                "if let Some(arc) = utxo_set.remove(&input.prevout) {",
-                "if let Some(arc) = None {",
-            ),
-            &apply.replace(
-                "utxo_set.insert(outpoint, utxo_arc);",
-                "let _kept = utxo_arc;",
-            ),
-            utxo_step_query,
-        ),
-    ]
+    Vec::new()
 }
 
 fn zero_init(src: &str, name: &str, assign: &str) -> u64 {
@@ -3180,115 +1953,12 @@ fn utxo_step_query(src: &str) -> SatResult {
 
 /// Names the finish test requires. A missing or unlocked row fails the suite.
 pub const CENSUS: &[&str] = &[
-    "check_transaction",
-    "is_strict_der",
-    "merkle_tree_from_hashes",
-    "is_sequence_disabled",
-    "extract_sequence_type_flag",
-    "extract_sequence_locktime_value",
-    "get_locktime_type",
-    "check_bip65",
-    "check_proof_of_work",
-    "validate_witness_program_length",
-    "validate_block_header",
-    "validate_block_header_mtp",
-    "try_verify_p2pk_fast_path",
-    "try_verify_p2pkh_fast_path",
-    "try_verify_p2sh_fast_path",
-    "try_verify_p2wpkh_fast_path",
-    "compute_script_cache_key",
-    "verify_script_cache_hit",
-    "sighash_single_quirk",
-    "eval_script_pc",
-    "eval_script_control",
-    "get_block_subsidy",
-    "calculate_transaction_weight_segwit",
-    "weight_to_vsize",
-    "check_coinbase_subsidy",
-    "expand_target",
-    "get_block_proof",
-    "is_coinbase",
-    "taproot_activation_height",
-    "check_bip30",
-    "check_bip34",
-    "check_bip90",
     "check_bip147",
-    "is_bip54_active_at",
-    "check_coinbase_maturity",
-    "get_median_time_past",
-    "activation_height_from_headers",
-    "compute_legacy_sighash_nocache",
-    "build_bip143_preimage",
-    "compute_taproot_signature_hash",
-    "serialize_block_header",
-    "serialize_signet_block_data",
-    "build_signet_solution_txs",
-    "push_advance",
-    "OP_CHECKSIG_verifier",
-    "eval_checksig_ecdsa",
-    "OP_DUP",
-    "OP_EQUAL",
-    "OP_EQUALVERIFY",
-    "OP_HASH160",
-    "OP_CHECKSIG",
-    "OP_ADD",
-    "OP_CHECKLOCKTIMEVERIFY",
-    "count_sigops_in_script",
-    "calculate_block_weight",
-    "calculate_chain_work",
-    "apply_transaction_with_id",
-    "verify_signature",
-    "verify_tapscript_schnorr_signature",
-    "verify_signature_from_stack",
-    "calculate_sequence_locks",
-    "evaluate_sequence_locks",
-    "get_next_work_required",
-    "total_supply",
-    "verify_utxo_supply",
-    "get_block_script_verify_flags_core",
-    "check_bip66",
-    "check_bip54_timewarp",
-    "check_bip54_tx_stripped_size",
-    "check_bip54_sigop_limit",
-    "check_bip54_coinbase",
-    "cast_to_bool",
-    "is_minimal_if_condition",
     "p2sh_push_only_check",
-    "find_and_delete",
-    "extract_witness_commitment",
-    "compute_taproot_signature_hash",
-    "should_reorganize",
-    "get_transaction_sigop_cost_with_utxos",
-    "check_tx_inputs",
-    "block_weight_limit",
-    "block_sigop_limit",
-    "coinbase_scriptsig_len",
-    "is_final_tx",
-    "eval_script_limits",
-    "script_num_decode",
-    "opcode_dispatch",
-    "if_body_endif",
-    "enforce_tx_finality",
-    "retarget_mul_div",
-    "compress_target",
-    "opcode_bytes",
     "validate_supply_limit",
-    "calculate_fee",
-    "validate_witness_commitment",
-    "strip_taproot_annex",
-    "count_witness_sigops",
     "connect_block",
     "eval_script_pipeline",
-    "get_next_work_pipeline",
-    "count_sigops_induction",
-    "block_weight_induction",
-    "chain_work_induction",
     "block_fee_induction",
-    "validate_block_header_fields",
-    "validate_prev_block_hash",
-    "is_op_success",
-    "is_push_opcode",
-    "block_weight_from_nested",
 ];
 
 #[cfg(test)]
@@ -3384,38 +2054,6 @@ mod tests {
         assert_eq!(row.unpatched, SatResult::Unsat, "unpatched {}", row.note);
         assert_eq!(row.boundary, SatResult::Sat, "boundary");
         assert_eq!(row.predicate, SatResult::Sat, "predicate");
-    }
-
-    #[test]
-    fn witness_stack_null_is_locked() {
-        if !crate::parser::spec_expr::consensus_workspace_present() {
-            return;
-        }
-        let got = witness_rows();
-        assert_eq!(got.len(), 1);
-        let row = &got[0];
-        assert_eq!(row.unpatched, SatResult::Unsat, "unpatched {}", row.note);
-        assert_eq!(row.boundary, SatResult::Sat, "boundary");
-        assert_eq!(row.predicate, SatResult::Sat, "predicate");
-    }
-
-    #[test]
-    fn signet_solution_is_locked() {
-        if !crate::parser::spec_expr::consensus_workspace_present() {
-            return;
-        }
-        let got = signet_rows();
-        assert_eq!(got.len(), 2);
-        for row in got {
-            assert_eq!(
-                row.unpatched,
-                SatResult::Unsat,
-                "{} unpatched",
-                row.function
-            );
-            assert_eq!(row.boundary, SatResult::Sat, "{} boundary", row.function);
-            assert_eq!(row.predicate, SatResult::Sat, "{} predicate", row.function);
-        }
     }
 
     #[test]

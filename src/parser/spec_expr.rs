@@ -10,54 +10,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 /// Locked rows whose numeric clause bound is the parsed spec value.
-pub const SPEC_SOURCED: &[&str] = &[
-    "block_weight_limit",
-    "block_sigop_limit",
-    "eval_script_limits",
-    "validate_block_header",
-    "validate_block_header_fields",
-    "check_transaction",
-    "validate_supply_limit",
-    "get_block_subsidy",
-    "total_supply",
-    "coinbase_scriptsig_len",
-    "is_strict_der",
-    "check_coinbase_maturity",
-    "get_next_work_required",
-    "activation_height_from_headers",
-    "is_push_opcode",
-    "is_op_success",
-    "opcode_bytes",
-    "validate_block_header_mtp",
-    "is_sequence_disabled",
-    "extract_sequence_type_flag",
-    "extract_sequence_locktime_value",
-    "get_locktime_type",
-    "check_bip65",
-    "validate_witness_program_length",
-    "check_bip54_sigop_limit",
-    "check_bip54_coinbase",
-    "check_bip54_tx_stripped_size",
-    "check_bip54_timewarp",
-    "is_bip54_active_at",
-    "calculate_transaction_weight_segwit",
-    "weight_to_vsize",
-    "get_transaction_sigop_cost_with_utxos",
-    "is_coinbase",
-    "check_bip90",
-    "sighash_single_quirk",
-    "find_and_delete",
-    "opcode_dispatch",
-    "push_advance",
-    "extract_witness_commitment",
-    "build_bip143_preimage",
-    "check_proof_of_work",
-    "validate_prev_block_hash",
-    "p2sh_push_only_check",
-    "expand_target",
-    "strip_taproot_annex",
-    "merkle_tree_from_hashes",
-];
+pub const SPEC_SOURCED: &[&str] = &["validate_supply_limit", "p2sh_push_only_check"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeRow {
@@ -149,6 +102,25 @@ pub fn median_past_is_lower_bound() -> bool {
         let norm = normalize_math(&block);
         norm.contains("timestamp") && norm.contains('>') && norm.contains("MedianTimePast")
     })
+}
+
+/// The `k ≥ N` arm of the GetBlockSubsidy cases. `N` is the undefined-shift guard.
+pub fn subsidy_shift_guard() -> u64 {
+    for block in math_blocks(protocol_text()) {
+        if !block.contains("GetBlockSubsidy") || !block.contains("\\gg") {
+            continue;
+        }
+        let norm = block.replace("\\geq", ">=").replace('≥', ">=");
+        let Some(at) = norm.find(">=") else {
+            continue;
+        };
+        if let Some(n) = leading_decimal(norm[at + 2..].trim()) {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    panic!("spec subsidy shift guard is missing");
 }
 
 /// `INITIAL_SUBSIDY = 50 × C` from the subsidy section.
@@ -713,11 +685,12 @@ pub fn header_hash_rounds() -> u32 {
     panic!("spec header hash is missing");
 }
 
-pub fn header_hash_strict() -> bool {
+/// H07 writes `SHA256(SHA256(h)) ≤ ExpandTarget`. A hash equal to the target is proof of work.
+pub fn header_hash_at_most_target() -> bool {
     for block in math_blocks(protocol_text()) {
         if block.contains("ExpandTarget") && block.contains("SHA256") {
             let n = normalize_math(&block);
-            return n.contains('<') && !n.contains("<=");
+            return n.contains("<=");
         }
     }
     panic!("spec header hash comparison is missing");
@@ -750,6 +723,20 @@ pub fn taproot_height(network: &str) -> u64 {
         }
     }
     panic!("spec taproot {network} height is missing");
+}
+
+/// `F_TaprootActivationRegtest` is `result == 0`.
+pub fn taproot_regtest_height() -> u64 {
+    let md = protocol_text();
+    let at = md
+        .find("TaprootActivationRegtest")
+        .unwrap_or_else(|| panic!("spec Taproot regtest formula is missing"));
+    let window = &md[at..md.len().min(at + 400)];
+    let Some(eq) = window.find("==") else {
+        panic!("spec Taproot regtest height is missing");
+    };
+    leading_decimal(&window[eq + 2..])
+        .unwrap_or_else(|| panic!("spec Taproot regtest height is missing"))
 }
 
 fn byte_width_near(text: &str, phrase: &str) -> u64 {
@@ -987,6 +974,9 @@ fn rust_const_u64(src: &str, name: &str) -> Option<u64> {
 
 fn eval_rust_int(expr: &str) -> Option<u64> {
     let expr = expr.replace(['_', ' '], "");
+    if let Some(hex) = expr.strip_prefix("0x") {
+        return u64::from_str_radix(hex, 16).ok();
+    }
     if let Some((left, right)) = expr.split_once('*') {
         return Some(eval_rust_int(left)? * eval_rust_int(right)?);
     }
@@ -1522,11 +1512,211 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Domain comparisons in the paragraph after a formula.
+///
+/// A bound is kept when one side is a literal and the other is a parameter or a
+/// sum of parameters, or both sides are single parameters. Section 4 names
+/// (`M_{max}`, `L_{stack}`, `W_{max}`) become the values parsed from PROTOCOL.md.
+/// `2^{n}` is that power of two. A sum compared with a parameter is the claim, not a domain.
+pub fn when_assumptions(trailing: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for span in inline_math(trailing) {
+        if span.contains("result") {
+            continue;
+        }
+        let expanded = expand_powers(span);
+        let norm = normalize_math(&expanded).replace("{}", "");
+        let substituted = substitute_spec_constants(&norm);
+        for piece in split_chain(substituted.trim()) {
+            let piece = piece.trim();
+            if piece.is_empty() || !is_domain_comparison(piece) {
+                continue;
+            }
+            if !out.iter().any(|seen: &String| seen == piece) {
+                out.push(piece.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn inline_math(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut spans = Vec::new();
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+            i += 2;
+            if let Some(rel) = text[i..].find("$$") {
+                i += rel + 2;
+            } else {
+                break;
+            }
+            continue;
+        }
+        i += 1;
+        if let Some(rel) = text[i..].find('$') {
+            spans.push(&text[i..i + rel]);
+            i += rel + 1;
+        } else {
+            break;
+        }
+    }
+    spans
+}
+
+fn expand_powers(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'2' && text[i..].starts_with("2^{") {
+            if let Some(end) = text[i + 3..].find('}') {
+                let digits = &text[i + 3..i + 3 + end];
+                if let Ok(n) = digits.parse::<u32>() {
+                    if n < 64 && digits.chars().all(|c| c.is_ascii_digit()) {
+                        out.push_str(&(1u128 << n).to_string());
+                        i += 3 + end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn substitute_spec_constants(text: &str) -> String {
+    let constants = protocol_constants();
+    let mut out = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_alphabetic() || chars[i] == '_' {
+            let start = i;
+            i += 1;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let name: String = chars[start..i].iter().collect();
+            if let Some(value) = constants.get(&name.to_uppercase()) {
+                out.push_str(&value.to_string());
+            } else {
+                out.push_str(&name);
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn comparison_ops(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut ops = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if text[i..].starts_with("<=") || text[i..].starts_with(">=") || text[i..].starts_with("==")
+        {
+            ops.push((i, 2));
+            i += 2;
+        } else if bytes[i] == b'<' || bytes[i] == b'>' {
+            ops.push((i, 1));
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    ops
+}
+
+fn split_chain(text: &str) -> Vec<String> {
+    let ops = comparison_ops(text);
+    if ops.len() == 1 {
+        return vec![text.to_string()];
+    }
+    if ops.len() == 2 {
+        let (a, aw) = ops[0];
+        let (b, bw) = ops[1];
+        let left = text[..a].trim();
+        let mid = text[a + aw..b].trim();
+        let right = text[b + bw..].trim();
+        if !left.is_empty() && !mid.is_empty() && !right.is_empty() {
+            return vec![
+                format!("{left} {} {mid}", &text[a..a + aw]),
+                format!("{mid} {} {right}", &text[b..b + bw]),
+            ];
+        }
+    }
+    Vec::new()
+}
+
+fn is_domain_comparison(text: &str) -> bool {
+    let ops = comparison_ops(text);
+    if ops.len() != 1 {
+        return false;
+    }
+    let (at, width) = ops[0];
+    let left = text[..at].trim();
+    let right = text[at + width..].trim();
+    (is_param_sum(left) && is_literal(right))
+        || (is_literal(left) && is_param_sum(right))
+        || (is_single_param(left) && is_single_param(right))
+}
+
+fn is_literal(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| c.is_ascii_digit())
+}
+
+fn is_single_param(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty()
+        && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && text.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+}
+
+fn is_param_sum(text: &str) -> bool {
+    text.split('+').all(is_single_param)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn formula_paragraph_reads_section4_bounds() {
+        let supply = when_assumptions(
+            "when $supply \\geq 0$, $subsidy \\geq 0$, $supply \\leq M_{max}$, and $subsidy \\leq M_{max}$.",
+        );
+        assert!(supply.contains(&"supply >= 0".to_string()));
+        assert!(supply.contains(&"subsidy >= 0".to_string()));
+        assert!(supply.contains(&format!("supply <= {}", protocol_u64("M_MAX"))));
+        assert!(supply.contains(&format!("subsidy <= {}", protocol_u64("M_MAX"))));
+        assert!(!supply.iter().any(|piece| piece.contains('+')));
+
+        let len = when_assumptions("when $2 \\leq len \\leq 100$.");
+        assert_eq!(len, vec!["2 <= len".to_string(), "len <= 100".to_string()]);
+
+        let stack =
+            when_assumptions("$0 \\leq stack \\leq L_{stack}$ and $stack + alt \\leq L_{stack}$.");
+        assert!(stack.contains(&"0 <= stack".to_string()));
+        assert!(stack.contains(&format!("stack <= {}", protocol_u64("L_STACK"))));
+        assert!(stack.contains(&format!("stack + alt <= {}", protocol_u64("L_STACK"))));
+
+        let byte = when_assumptions("A one-byte payload, $0 \\leq byte < 2^{8}$.");
+        assert_eq!(
+            byte,
+            vec!["0 <= byte".to_string(), "byte < 256".to_string()]
+        );
+    }
+
     fn section4_folds_money_and_the_block_caps() {
         let markdown = "\
 ### 4.1 Monetary Constants
@@ -1639,11 +1829,12 @@ $S_{max} = 80,000$ (maximum sigops)
         assert_eq!(annex_rule(), (0x50, 2));
         assert_eq!(compact_target(), (0x007f_ffff, 3, 32, 3, 8));
         assert_eq!(header_hash_rounds(), 2);
-        assert!(header_hash_strict());
+        assert!(header_hash_at_most_target());
         assert!(parent_hash_equal());
         assert!(merkle_compares_unpadded());
         assert_eq!(taproot_height("mainnet"), 709_632);
         assert_eq!(taproot_height("testnet"), 2_011_968);
+        assert_eq!(taproot_regtest_height(), 0);
         assert_eq!(flag_bit("SCRIPT_VERIFY_DERSIG"), 0x04);
         assert_eq!(flag_bit("SCRIPT_VERIFY_LOW_S"), 0x08);
         assert_eq!(flag_bit("SCRIPT_VERIFY_NULLDUMMY"), 0x10);

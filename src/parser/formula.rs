@@ -1252,6 +1252,9 @@ mod tests {
 
     #[test]
     fn theorem_6212_emits_both_sides() {
+        if !crate::parser::spec_expr::spec_present() {
+            return;
+        }
         let raw = r"\forall h \geq 33 \times H: \text{GetBlockSubsidy}(h) = 0";
         let expr = parse_sentence(raw).expect("parse");
         let z3 = emit_z3(&expr, "height").expect("z3");

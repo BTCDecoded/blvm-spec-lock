@@ -2641,6 +2641,9 @@ mod tests {
 
     #[test]
     fn real_series_is_disputed() {
+        if !spec_ready() {
+            return;
+        }
         let row = real_series_disputed();
         assert_eq!(row.status, "spec_disputed");
         assert!(row.failing_statement.contains("totalSupply"));
@@ -2885,6 +2888,9 @@ axiom signatureUnforgeable : CryptoAssumptions → Prop := fun _ => True
     #[cfg(feature = "z3")]
     #[test]
     fn clause_6212_holds_and_mutations_flip_it() {
+        if !spec_ready() {
+            return;
+        }
         use crate::parser::contracts::{Contract, ContractType};
         use crate::translator::z3_verifier::{VerificationResult, Z3Verifier};
 

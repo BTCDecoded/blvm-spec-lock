@@ -194,7 +194,7 @@ pub fn normalize(raw: &str) -> String {
     s = rewrite_frac(&s);
     s = s.replace('$', "");
     s = s.replace('\\', "");
-    s = s.replace('{', "").replace('}', "");
+    s = s.replace(['{', '}'], "");
     s = s.replace("text", "");
     s = s.replace('_', "");
     s = s.replace("times", "*");
@@ -453,13 +453,15 @@ fn tokenize(s: &str) -> Vec<Tok> {
             i += 2;
             continue;
         }
-        if matches!(b[i], b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'<' | b'>' | b'^') {
+        if matches!(
+            b[i],
+            b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'<' | b'>' | b'^'
+        ) {
             toks.push(Tok::Op((b[i] as char).to_string()));
             i += 1;
             continue;
         }
-        if b[i].is_ascii_digit() || (b[i] == b'-' && i + 1 < b.len() && b[i + 1].is_ascii_digit())
-        {
+        if b[i].is_ascii_digit() || (b[i] == b'-' && i + 1 < b.len() && b[i + 1].is_ascii_digit()) {
             let start = i;
             if b[i] == b'-' {
                 i += 1;
@@ -914,11 +916,7 @@ pub fn emit_equations(expr: &Formula) -> Result<Equations, EmitError> {
     }
     let var = match args.first() {
         Some(Formula::Name(v)) => v.clone(),
-        _ => {
-            return Err(EmitError::unsupported(
-                "definition parameter is not a name",
-            ))
-        }
+        _ => return Err(EmitError::unsupported("definition parameter is not a name")),
     };
     let fname = lean_name(name);
     let mut conds = Vec::new();
@@ -1062,7 +1060,9 @@ pub fn emit_lean(expr: &Formula) -> Result<String, EmitError> {
         Formula::And(xs) => join_lean(xs, "∧"),
         Formula::Or(xs) => join_lean(xs, "∨"),
         Formula::Implies(a, b) => Ok(format!("({} → {})", emit_lean(a)?, emit_lean(b)?)),
-        Formula::Cmp(op, _l, r) if *op == Cmp::Eq && matches!(r.as_ref(), Formula::Piecewise { .. }) => {
+        Formula::Cmp(op, _l, r)
+            if *op == Cmp::Eq && matches!(r.as_ref(), Formula::Piecewise { .. }) =>
+        {
             let eqs = emit_equations(expr)?;
             Ok(eqs.combined())
         }
@@ -1111,9 +1111,7 @@ pub fn emit_lean(expr: &Formula) -> Result<String, EmitError> {
             emit_lean(bound)?,
             emit_lean(body)?
         )),
-        Formula::Forall { var, body } => {
-            Ok(format!("∀ ({} : Nat), {}", var, emit_lean(body)?))
-        }
+        Formula::Forall { var, body } => Ok(format!("∀ ({} : Nat), {}", var, emit_lean(body)?)),
         Formula::Rec { .. } => {
             let ind = emit_induction(expr)?;
             Ok(format!("{} ∧ {} ∧ {}", ind.base, ind.step, ind.principle))
@@ -1174,10 +1172,7 @@ fn lean_arith(op: Arith) -> &'static str {
 /// Any other shape is `unsupported` on the Z3 side.
 pub fn emit_z3(expr: &Formula, param: &str) -> Result<Z3Clause, EmitError> {
     let Formula::BoundForall {
-        cmp,
-        bound,
-        body,
-        ..
+        cmp, bound, body, ..
     } = expr
     else {
         return Err(EmitError::unsupported(
@@ -1192,9 +1187,8 @@ pub fn emit_z3(expr: &Formula, param: &str) -> Result<Z3Clause, EmitError> {
     if !matches!(call.as_ref(), Formula::Call(_, _)) {
         return Err(EmitError::unsupported("equality is not a function call"));
     }
-    let bound_n = eval_closed(bound).ok_or_else(|| {
-        EmitError::unsupported("bound does not evaluate from spec constants")
-    })?;
+    let bound_n = eval_closed(bound)
+        .ok_or_else(|| EmitError::unsupported("bound does not evaluate from spec constants"))?;
     let rhs_n = eval_closed(rhs)
         .ok_or_else(|| EmitError::unsupported("right-hand side is not a spec constant"))?;
     let rel = match cmp {
@@ -1203,7 +1197,9 @@ pub fn emit_z3(expr: &Formula, param: &str) -> Result<Z3Clause, EmitError> {
         Cmp::Gt => ">",
         Cmp::Lt => "<",
         Cmp::Eq | Cmp::Ne => {
-            return Err(EmitError::unsupported("bound comparison is not an inequality"));
+            return Err(EmitError::unsupported(
+                "bound comparison is not an inequality",
+            ));
         }
     };
     Ok(Z3Clause {
@@ -1270,6 +1266,9 @@ mod tests {
 
     #[test]
     fn subsidy_cases_emit_division_equations() {
+        if !crate::parser::spec_expr::spec_present() {
+            return;
+        }
         let raw = r#"\text{GetBlockSubsidy}(h) = \begin{cases}
 0 & \text{if } \lfloor h/H \rfloor \geq 64 \\
 \text{INITIAL\_SUBSIDY} \gg \lfloor h/H \rfloor & \text{otherwise}
@@ -1375,10 +1374,9 @@ mod tests {
         )
         .is_err());
 
-        let other = emit_induction(
-            &parse_sentence("other(0) = 0; other(n + 1) = other(n) + 1").unwrap(),
-        )
-        .unwrap();
+        let other =
+            emit_induction(&parse_sentence("other(0) = 0; other(n + 1) = other(n) + 1").unwrap())
+                .unwrap();
         assert_eq!(other.base, "other 0 = 0");
         assert_eq!(supply.principle, other.principle);
 

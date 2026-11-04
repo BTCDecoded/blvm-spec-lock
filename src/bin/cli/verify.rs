@@ -1572,6 +1572,7 @@ mod failure_kind_tests {
             spec_name_override: None,
             formula_anchor: None,
             constant_anchor: None,
+            formulas: Vec::new(),
             function_sig: None,
             parse_gap: true,
         };

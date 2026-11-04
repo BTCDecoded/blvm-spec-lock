@@ -1128,7 +1128,13 @@ fn sentence_counts_of(
 
 fn load_sentence_rows(
     spec_paths: &[std::path::PathBuf],
-) -> Result<(Vec<cli::sentence::Sentence>, std::collections::BTreeSet<String>), String> {
+) -> Result<
+    (
+        Vec<cli::sentence::Sentence>,
+        std::collections::BTreeSet<String>,
+    ),
+    String,
+> {
     if spec_paths.is_empty() {
         return Ok((Vec::new(), std::collections::BTreeSet::new()));
     }
@@ -1157,7 +1163,10 @@ fn load_sentence_rows(
         cli::sentence::audit_lean(&src)?;
         locked.extend(cli::sentence::locks_in(&src));
     }
-    let borrowed: Vec<(&str, &str)> = files.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect();
     Ok((cli::sentence::inventory(&borrowed, &locked), locked))
 }
 
@@ -1181,7 +1190,12 @@ fn sentence_gate(spec_paths: &[std::path::PathBuf], require_lean: bool) -> Resul
             Ok(())
         };
     }
-    if require_lean && std::process::Command::new("lake").arg("--version").output().is_err() {
+    if require_lean
+        && std::process::Command::new("lake")
+            .arg("--version")
+            .output()
+            .is_err()
+    {
         return Err("`--require-lean` needs the Lean toolchain (`lake`)".into());
     }
     let mut files = Vec::new();
@@ -1195,7 +1209,10 @@ fn sentence_gate(spec_paths: &[std::path::PathBuf], require_lean: bool) -> Resul
             .to_string();
         files.push((name, text));
     }
-    let borrowed: Vec<(&str, &str)> = files.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect();
     let mut locked = std::collections::BTreeSet::new();
     for entry in walk_lean(&lean) {
         let src = std::fs::read_to_string(&entry)
@@ -1208,10 +1225,8 @@ fn sentence_gate(spec_paths: &[std::path::PathBuf], require_lean: bool) -> Resul
     let mut counts = cli::sentence::status_counts(&rows);
     let mut theorem_6212_open = false;
     if require_lean {
-        let closure = cli::sentence::closure_of_elaborated(
-            &lean,
-            "SpecLock.subsidy_zero_from_epoch_33",
-        )?;
+        let closure =
+            cli::sentence::closure_of_elaborated(&lean, "SpecLock.subsidy_zero_from_epoch_33")?;
         if cli::sentence::theorem_6212_reported_status(&closure.unlocked) == "none" {
             theorem_6212_open = true;
             if counts.get("both").copied().unwrap_or(0) > 0 {
@@ -1270,10 +1285,7 @@ fn handle_mutation_rebuild(lean_dir: std::path::PathBuf) -> i32 {
             if report.not_load_bearing.is_empty() {
                 eprintln!("not_load_bearing none");
             } else {
-                eprintln!(
-                    "not_load_bearing {}",
-                    report.not_load_bearing.join(", ")
-                );
+                eprintln!("not_load_bearing {}", report.not_load_bearing.join(", "));
             }
             println!("{}", dir.display());
             0
@@ -1326,7 +1338,10 @@ fn handle_inventory(
             }
         }
     }
-    let borrowed: Vec<(&str, &str)> = files.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect();
     let rows = cli::sentence::inventory(&borrowed, &locked);
     cli::sentence::print_counts(&rows);
     let counts = cli::sentence::status_counts(&rows);
@@ -1364,7 +1379,10 @@ fn handle_inventory(
         if unlocked_path.is_file() {
             match std::fs::read_to_string(&unlocked_path) {
                 Ok(text) => {
-                    let listed = text.lines().filter(|line| !line.is_empty()).map(str::to_string);
+                    let listed = text
+                        .lines()
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_string);
                     let listed: std::collections::BTreeSet<_> = listed.collect();
                     if let Err(err) = cli::sentence::unlocked_delta(&listed, &rows) {
                         eprintln!("unlocked definitions: {err}");
@@ -2244,6 +2262,9 @@ mod definition_count_tests {
 
     #[test]
     fn verify_json_uses_the_inventory_definition_counts() {
+        if !crate::parser::spec_expr::spec_present() {
+            return;
+        }
         let spec = crate::parser::spec_expr::spec_checkout();
         assert!(spec.join("lean/lakefile.lean").is_file());
         let paths = vec![spec.join("PROTOCOL.md"), spec.join("ARCHITECTURE.md")];
@@ -2259,7 +2280,10 @@ mod definition_count_tests {
             &counts,
         );
         let value: serde_json::Value = serde_json::from_str(&report).unwrap();
-        assert_eq!(value["summary"]["definitions_locked"], serde_json::json!(locked_n));
+        assert_eq!(
+            value["summary"]["definitions_locked"],
+            serde_json::json!(locked_n)
+        );
         assert_eq!(
             value["summary"]["definitions_unlocked"],
             serde_json::json!(unlocked_n)

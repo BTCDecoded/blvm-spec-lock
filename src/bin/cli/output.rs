@@ -322,7 +322,10 @@ pub fn set_sentence_counts(
                 serde_json::json!(counts.get(key).copied().unwrap_or(0)),
             );
         }
-        summary.insert("sentences".to_string(), serde_json::Value::Object(sentences));
+        summary.insert(
+            "sentences".to_string(),
+            serde_json::Value::Object(sentences),
+        );
         summary.insert(
             "definitions_locked".to_string(),
             serde_json::json!(counts.get("definitions_locked").copied().unwrap_or(0)),

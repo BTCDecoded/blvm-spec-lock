@@ -598,6 +598,7 @@ $SMK = 7$
             spec_name_override: Some(name.into()),
             formula_anchor: None,
             constant_anchor: None,
+            formulas: Vec::new(),
             function_sig: Some(func),
             parse_gap: false,
         }

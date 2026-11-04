@@ -887,6 +887,20 @@ fn protocol_constants() -> &'static HashMap<String, u64> {
     })
 }
 
+/// True when [`spec_checkout`] can find `PROTOCOL.md`. Tests that read the
+/// Lean model return when this is false. The main CI job checks this repo out
+/// alone; the Lean evidence job checks `blvm-spec` out inside it.
+pub fn spec_present() -> bool {
+    if let Ok(dir) = std::env::var("BLVM_SPEC_DIR") {
+        if Path::new(&dir).join("PROTOCOL.md").is_file() {
+            return true;
+        }
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest.join("blvm-spec/PROTOCOL.md").is_file()
+        || manifest.join("../blvm-spec/PROTOCOL.md").is_file()
+}
+
 /// Orange Paper checkout.
 ///
 /// Actions checks `BTCDecoded/blvm-spec` out at `blvm-spec/` inside this crate.

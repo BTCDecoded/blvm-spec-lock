@@ -1692,6 +1692,9 @@ mod tests {
 
     #[test]
     fn formula_paragraph_reads_section4_bounds() {
+        if !consensus_workspace_present() {
+            return;
+        }
         let supply = when_assumptions(
             "when $supply \\geq 0$, $subsidy \\geq 0$, $supply \\leq M_{max}$, and $subsidy \\leq M_{max}$.",
         );

@@ -4698,6 +4698,9 @@ mod tests {
 
     #[test]
     fn weight_and_median_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let median = consensus_file("bip113.rs");
         let median = extract_fn(&median, "get_median_time_past");
         assert_eq!(median_time_query(&median, &[]), SatResult::Unsat);
@@ -4765,6 +4768,9 @@ mod tests {
 
     #[test]
     fn expand_target_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let src = consensus_file("pow.rs");
         let src = extract_fn(&src, "expand_target");
         let in_domain = [0x0300_0001u64, 0x0300_0000, 0x0400_0001, 0x2000_0001];
@@ -4817,6 +4823,9 @@ mod tests {
 
     #[test]
     fn calculate_fee_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let src = consensus_file("economic.rs");
         let src = extract_fn(&src, "calculate_fee");
         assert_eq!(
@@ -4899,6 +4908,9 @@ mod tests {
 
     #[test]
     fn witness_version_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let src = consensus_file("witness.rs");
         let src = extract_fn(&src, "is_witness_version_opcode");
         for opcode in [0x00, 0x51, 0x60, 0x4f, 0x50, 0x61, 0x01, 0x4c] {
@@ -4928,6 +4940,9 @@ mod tests {
 
     #[test]
     fn find_and_delete_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let src = consensus_file("script/mod.rs");
         let src = extract_fn(&src, "find_and_delete");
         assert_eq!(find_and_delete_query(&src, &[0x51], &[]), SatResult::Unsat);
@@ -5010,6 +5025,9 @@ mod tests {
 
     #[test]
     fn total_supply_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let interval = crate::parser::spec_expr::impl_u64("HALVING_INTERVAL");
         assert_eq!(
             spec_supply(interval.saturating_mul(33)),
@@ -5043,6 +5061,9 @@ mod tests {
 
     #[test]
     fn null_dummy_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let src = consensus_file("bip_validation.rs");
         let src = extract_fn(&src, "is_null_dummy");
         let points: &[&[u8]] = &[
@@ -5162,6 +5183,9 @@ mod tests {
 
     #[test]
     fn taproot_script_and_key_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("taproot.rs");
         let script_src = extract_fn(&file, "validate_taproot_script");
         let key_src = extract_fn(&file, "extract_taproot_output_key");
@@ -5242,6 +5266,9 @@ mod tests {
 
     #[test]
     fn witness_script_code_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("transaction_hash.rs");
         let src = format!(
             "{}\n{}",
@@ -5365,6 +5392,9 @@ mod tests {
 
     #[test]
     fn script_code_separator_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("transaction_hash.rs");
         let src = extract_fn(&file, "append_stripped_codeseparators");
         let points: &[&[u8]] = &[
@@ -5441,6 +5471,9 @@ mod tests {
 
     #[test]
     fn taproot_annex_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("taproot.rs");
         let src = extract_fn(&file, "strip_taproot_annex");
         let helper = extract_fn(&file, "compute_taproot_annex_sighash_hash");
@@ -5524,6 +5557,9 @@ mod tests {
 
     #[test]
     fn segwit_witness_structure_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("witness.rs");
         let src = extract_fn(&file, "validate_segwit_witness_structure");
         let empty: Vec<Vec<u8>> = vec![];
@@ -5555,6 +5591,9 @@ mod tests {
 
     #[test]
     fn p2sh_and_sigop_push_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("sigop.rs");
         let p2sh = extract_fn(&file, "is_pay_to_script_hash");
         let push = extract_fn(&file, "sigop_count_push_opcode");
@@ -5623,6 +5662,9 @@ mod tests {
 
     #[test]
     fn redeem_script_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("sigop.rs");
         let src = extract_fn(&file, "extract_redeem_script_from_scriptsig");
         let points: &[&[u8]] = &[
@@ -5727,6 +5769,9 @@ mod tests {
 
     #[test]
     fn bip30_repeat_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("bip_validation.rs");
         let src = extract_fn(&file, "is_bip30_repeat_block");
         let hash42 = BIP30_REPEAT_HASH_91842;
@@ -5793,6 +5838,9 @@ mod tests {
 
     #[test]
     fn witness_empty_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("witness.rs");
         let src = extract_fn(&file, "is_witness_empty");
         let body = "witness.is_empty() || witness.iter().all(|elem| elem.is_empty())";
@@ -5828,6 +5876,9 @@ mod tests {
 
     #[test]
     fn nonempty_input_witness_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("block/script_cache.rs");
         let src = extract_fn(&file, "tx_has_nonempty_input_witness");
         let empty: Vec<Vec<u8>> = vec![vec![]];
@@ -5878,6 +5929,9 @@ mod tests {
 
     #[test]
     fn reserved_nonce_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("segwit.rs");
         let src = extract_fn(&file, "coinbase_reserved_nonce");
         let item = vec![0x11u8; 32];
@@ -5938,6 +5992,9 @@ mod tests {
 
     #[test]
     fn witness_commitment_extract_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("segwit.rs");
         let src = extract_fn(&file, "extract_witness_commitment");
         let hash = [0xabu8; 32];
@@ -6000,6 +6057,9 @@ mod tests {
 
     #[test]
     fn last_witness_commitment_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("segwit.rs");
         let src = extract_fn(&file, "last_witness_commitment_in_coinbase_outputs");
         let magic = [0xaa_u8, 0x21, 0xa9, 0xed];
@@ -6061,6 +6121,9 @@ mod tests {
 
     #[test]
     fn witness_commitment_ok_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("segwit.rs");
         let src = extract_fn(&file, "validate_witness_commitment");
         let root = [0x11u8; 32];
@@ -6170,6 +6233,9 @@ mod tests {
 
     #[test]
     fn block_witness_commitment_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("segwit.rs");
         let src = extract_fn(&file, "block_witness_commitment_ok");
         let points = [
@@ -6243,6 +6309,9 @@ mod tests {
 
     #[test]
     fn witness_commitment_script_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("segwit.rs");
         let src = extract_fn(&file, "witness_commitment_script");
         let root = [0x11u8; 32];
@@ -6331,6 +6400,9 @@ mod tests {
 
     #[test]
     fn redeem_push_canonical_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("script/mod.rs");
         let src = extract_fn(&file, "redeem_push_is_canonical");
         let mut redeem22 = vec![0x00, 0x14];
@@ -6407,6 +6479,9 @@ mod tests {
 
     #[test]
     fn decode_locktime_value_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("locktime.rs");
         let src = extract_fn(&file, "decode_locktime_value");
         let points: &[&[u8]] = &[
@@ -6466,6 +6541,9 @@ mod tests {
 
     #[test]
     fn script_bool_bytes_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("script/mod.rs");
         let src = extract_fn(&file, "script_bool_bytes");
         assert_eq!(script_bool_query(&src, true), SatResult::Unsat);
@@ -6486,6 +6564,9 @@ mod tests {
 
     #[test]
     fn taproot_sig_parse_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("bip348.rs");
         let src = extract_fn(&file, "try_parse_taproot_schnorr_witness_sig");
         let sig64 = [0x11u8; 64];
@@ -6564,6 +6645,9 @@ mod tests {
 
     #[test]
     fn tapscript_sigop_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("sigop.rs");
         let src = extract_fn(&file, "count_tapscript_sigops");
         let scripts: &[&[u8]] = &[
@@ -6653,6 +6737,9 @@ mod tests {
 
     #[test]
     fn tapscript_opcode_end_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("script/mod.rs");
         let src = extract_fn(&file, "tapscript_opcode_end");
         let scripts: &[&[u8]] = &[
@@ -6823,6 +6910,9 @@ mod tests {
 
     #[test]
     fn opcode_position_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("script/mod.rs");
         let src = extract_fn(&file, "opcode_position_at_byte");
         let cases: &[(&[u8], usize)] = &[
@@ -6962,6 +7052,9 @@ mod tests {
 
     #[test]
     fn script_num_from_opcode_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("script/mod.rs");
         let src = extract_fn(&file, "script_num_from_opcode");
         for n in 1u8..=16 {
@@ -6985,6 +7078,9 @@ mod tests {
 
     #[test]
     fn zero_hash_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("optimizations.rs");
         let src = extract_fn(&file, "is_zero_hash");
         let zero = [0u8; 32];
@@ -7007,6 +7103,9 @@ mod tests {
 
     #[test]
     fn script_merkle_root_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let src = extract_fn(&consensus_file("taproot.rs"), "compute_script_merkle_root");
         let script = [0x51u8, 0x20];
         let low = [0u8; 32];
@@ -7110,6 +7209,9 @@ mod tests {
 
     #[test]
     fn script_path_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let src = extract_fn(
             &consensus_file("taproot.rs"),
             "validate_taproot_script_path_with_leaf_version",
@@ -7185,6 +7287,9 @@ mod tests {
 
     #[test]
     fn tap_leaf_hash_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let secp = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../blvm-secp256k1/src/taproot.rs"),
@@ -7249,6 +7354,9 @@ mod tests {
 
     #[test]
     fn tap_branch_hash_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let secp = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../blvm-secp256k1/src/taproot.rs"),
@@ -7313,6 +7421,9 @@ mod tests {
 
     #[test]
     fn tap_tweak_hash_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let secp = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../blvm-secp256k1/src/taproot.rs"),
@@ -7347,6 +7458,9 @@ mod tests {
 
     #[test]
     fn bip34_magnitude_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let src = extract_fn(&consensus_file("bip_validation.rs"), "bip34_magnitude");
         for height in [0u64, 17, 127, 128, 256, 32_768] {
             assert_eq!(bip34_magnitude_query(&src, height), SatResult::Unsat);
@@ -7376,6 +7490,9 @@ mod tests {
 
     #[test]
     fn bip34_prefix_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("bip_validation.rs");
         let src = format!(
             "{}\n{}",
@@ -7472,6 +7589,9 @@ mod tests {
 
     #[test]
     fn transaction_size_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let src = extract_fn(
             &consensus_file("transaction.rs"),
             "calculate_transaction_size",
@@ -7517,6 +7637,9 @@ mod tests {
 
     #[test]
     fn header_hash_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let serializer = extract_fn(
             &std::fs::read_to_string(
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7571,6 +7694,9 @@ mod tests {
 
     #[test]
     fn transaction_stripped_size_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let segwit = consensus_file("segwit.rs");
         let size_src = format!(
             "{}\n{}\n{}",
@@ -7693,6 +7819,9 @@ mod tests {
 
     #[test]
     fn pow_header_bytes_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let pow_src = extract_fn(&consensus_file("pow.rs"), "serialize_header");
         let wire_src = extract_fn(
             &std::fs::read_to_string(
@@ -7730,6 +7859,9 @@ mod tests {
 
     #[test]
     fn mining_varint_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let body = extract_fn(&consensus_file("mining.rs"), "encode_varint");
         let canonical = extract_fn(
             &std::fs::read_to_string(
@@ -7787,6 +7919,9 @@ mod tests {
 
     #[test]
     fn sighash_varint_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let body = extract_fn(
             &consensus_file("transaction_hash.rs"),
             "write_varint_to_vec",
@@ -7850,6 +7985,9 @@ mod tests {
 
     #[test]
     fn compact_size_len_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let body = extract_fn(&consensus_file("segwit.rs"), "compact_size_len");
         let canonical = extract_fn(
             &std::fs::read_to_string(
@@ -7894,6 +8032,9 @@ mod tests {
 
     #[test]
     fn decode_varint_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let body = extract_fn(
             &std::fs::read_to_string(
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -8013,6 +8154,9 @@ mod tests {
 
     #[test]
     fn header_decode_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let body = extract_fn(
             &std::fs::read_to_string(
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -8123,6 +8267,9 @@ mod tests {
 
     #[test]
     fn encode_locktime_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("locktime.rs");
         let encode = extract_fn(&file, "encode_locktime_value");
         let decode = extract_fn(&file, "decode_locktime_value");
@@ -8156,6 +8303,9 @@ mod tests {
 
     #[test]
     fn coinbase_short_circuit_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let coinbase: syn::ItemFn = syn::parse_str(&extract_fn(
             &consensus_file("transaction.rs"),
             "is_coinbase",
@@ -8221,6 +8371,9 @@ mod tests {
 
     #[test]
     fn output_sum_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let body = extract_fn(&consensus_file("transaction.rs"), "sum_output_values");
         for values in [Vec::new(), vec![5], vec![3, 4], vec![-1], vec![i64::MAX, 1]] {
             assert_eq!(output_sum_query(&body, &values), SatResult::Unsat);
@@ -8249,6 +8402,9 @@ mod tests {
 
     #[test]
     fn bip30_skip_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let constants = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../blvm-primitives/src/constants.rs"),
@@ -8345,6 +8501,9 @@ mod tests {
 
     #[test]
     fn mul_disabled_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let body = extract_fn(&consensus_file("script/arithmetic.rs"), "op_mul_disabled");
         assert_eq!(mul_disabled_query(&body), SatResult::Unsat);
         let patched = body.replacen(
@@ -8370,6 +8529,9 @@ mod tests {
 
     #[test]
     fn executable_opcode_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let src = extract_fn(
             &consensus_file("bip_validation.rs"),
             "script_contains_executable_opcode",
@@ -8504,6 +8666,9 @@ mod tests {
 
     #[test]
     fn bip54_deployment_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let file = consensus_file("version_bits.rs");
         for name in [
             "bip54_deployment_mainnet",
@@ -8526,6 +8691,9 @@ mod tests {
 
     #[test]
     fn script_num_minimal_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let src = extract_fn(
             &consensus_file("script/mod.rs"),
             "script_num_is_minimally_encoded",
@@ -8570,6 +8738,9 @@ mod tests {
 
     #[test]
     fn sighash_script_code_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let src = extract_fn(
             &consensus_file("transaction_hash.rs"),
             "write_script_code_for_sighash",
@@ -8620,6 +8791,9 @@ mod tests {
 
     #[test]
     fn base_script_flags_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let src = extract_fn(
             &consensus_file("block/script_cache.rs"),
             "calculate_base_script_flags_for_block",
@@ -8722,6 +8896,9 @@ mod tests {
 
     #[test]
     fn transaction_round_trip_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let primitives = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../blvm-primitives/src/serialization/transaction.rs"),
@@ -8932,6 +9109,9 @@ mod tests {
 
     #[test]
     fn published_gate_matches_the_table() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let verification =
             std::fs::read_to_string(root.join("../blvm-consensus/docs/VERIFICATION.md"))

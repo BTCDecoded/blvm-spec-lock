@@ -17,14 +17,14 @@ rg '#\[spec_locked' --glob '*.rs' ../blvm-consensus/src | wc -l
 
 | Crate | Functions with `#[spec_locked]` |
 |-------|---------------------------------|
-| **blvm-consensus** | **168** |
+| **blvm-consensus** | **281** |
 | **blvm-node** | **5** (Dandelion 10.6) |
 | **blvm-protocol** | **6** (11.4 UTXO commitments + 13.4 peer consensus) |
-| **Total** | **179** |
+| **Total** | **292** |
 
 All point to valid Orange Paper sections. With **`PROTOCOL.md` + `ARCHITECTURE.md`** and **`--spec-path`**, locked consensus functions receive spec-derived contracts (**`check-drift`** unparseables = 0; **`SPEC_LOCK_STRICT=1`** + Z3 **`verify`** passes on **blvm-consensus**).
 
-**Parseable / contract totals:** run **`cargo spec-lock coverage`** (human or **`--format json`**) instead of freezing numbers in prose. Example (this checkout): **168** impl functions with contracts, **433** parseable contracts, **100%** parseable rate for **blvm-consensus**.
+**Parseable / contract totals:** run **`cargo spec-lock coverage`** (human or **`--format json`**) instead of freezing numbers in prose. The attribute count above is not a contract total, and a green `verify` run is not the 13-function body-proof count.
 
 Without **`--spec-path`**, **`coverage`** reports **Rust inventory** only (impl counts, per-section listing). **`--format json`** carries **`total_spec_locked`**, **`with_contracts`**, **`formulas_*`**, **`formula_anchor_*`**, **`constants_defined`**, **`constants_bound_to_rust`**, **`formulas_verify_rollup`**, **`constants_verify_rollup`** (registry-derived **`formulas_*` / `formula_anchor_*` / `constants_defined`** default to **`0`** without a merged spec; **`formulas_bound_to_rust`**, **`constants_bound_to_rust`**, and rollup objects may still be filled from **`--rollup-from-verify-json`** when passed).
 
@@ -32,7 +32,7 @@ With **`--spec-path`**, the CLI prints **spec coverage** (theorems → contracts
 
 ## Locked Sections by Orange Paper
 
-The **168** consensus locks map to these spec sections (each section may have multiple functions):
+Annotated consensus functions map to these spec sections (each section may have multiple functions):
 
 | Section | Modules |
 |---------|---------|
@@ -53,12 +53,12 @@ The **168** consensus locks map to these spec sections (each section may have mu
 
 ## Maximum Consensus Coverage
 
-**Current status (verified)**: With strict mode and Z3, all **`#[spec_locked]`** functions in **blvm-consensus** discovered by **`verify`** are expected to reach **PASSED** in CI.
+**Current status**: The consensus verify job is strict mode and Z3. Re-run `verify` and `coverage` for the current pass count. The attribute count is 281. The body-proof count is 13.
 
 | Metric | Value (reconfirm with commands) |
 |--------|----------------------------------|
-| **Z3 + strict (`verify`)** | Exit **0** on **blvm-consensus**; **168** locked functions in tree |
-| **Parseable (`coverage`)** | e.g. **433** / **433** contracts, **100%** (this checkout) |
+| **Z3 + strict (`verify`)** | Exit **0** on **blvm-consensus** is the target. The tree has **281** `#[spec_locked]` attributes. That is not the 13-function body-proof count. |
+| **Parseable (`coverage`)** | Re-run `cargo spec-lock coverage`. Do not treat an old checkout total as current. |
 | **Missing from spec** | **0** (goal: stay **0** after **`check-drift`**) |
 | **Unparseable** | **0** | **check-drift** is blocking in **blvm-consensus** CI |
 | **Drift** | **0** unparseables for scanned crate |
@@ -115,7 +115,7 @@ blvm-node `dandelion.rs` has `#[spec_locked("10.6")]` on the key functions.
 
 ```bash
 cd blvm-spec-lock
-# blvm-consensus (168 #[spec_locked] in this workspace)
+# blvm-consensus (281 #[spec_locked] attributes on main)
 cargo run --bin cargo-spec-lock -- verify --strict \
   --spec-path ../blvm-spec/PROTOCOL.md ../blvm-spec/ARCHITECTURE.md \
   --crate-path ../blvm-consensus

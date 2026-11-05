@@ -29,7 +29,7 @@ This guide explains how to add `#[spec_locked("section")]` to functions so they 
 
 | Crate | Annotated (`#[spec_locked]`) | Verified (strict + Z3, CI target) |
 |-------|------------------------------|-----------------------------------|
-| **blvm-consensus** | 168 | 168 (re-run `verify` / `coverage` after changes) |
+| **blvm-consensus** | 281 | re-run `verify`; a green run is not a body proof |
 | **blvm-node** | 5 | 5 (Dandelion 10.6) |
 | **blvm-protocol** | 6 | 6 (11.4 + 13.4; use `verify --section` when scoping) |
 

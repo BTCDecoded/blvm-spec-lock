@@ -13,7 +13,8 @@ Purpose-built checker for the BLVM implementation of the Bitcoin Commons specifi
 
 BLVM Spec Lock annotates Bitcoin consensus functions and Z3-checks their contracts by the steps below. A passing check is not a proof. This pass proves 13 functions from the function body: the check passes on the code as written, and two edits of the body make it fail. The functions are `sigop_count_push_opcode`, `is_pay_to_script_hash`, `validate_supply_limit`, `is_witness_empty`, `is_witness_version_opcode`, `validate_taproot_script`, `validate_segwit_witness_structure`, `tx_has_nonempty_input_witness`, `script_bool_bytes`, `is_version_zero_witness_program`, `validate_taproot_script_path_with_leaf_version`, `locktime_types_match`, and `tx_requires_witness_script_flags`. Older counts: 93 of 224 ([`VERIFICATION.md`](https://github.com/BTCDecoded/blvm-consensus/blob/main/docs/VERIFICATION.md)) and 34 of 34 ([`docs/MUTATION_COVERAGE.md`](docs/MUTATION_COVERAGE.md)). Of 274 Orange Paper sentences, the subsidy theorem (6.1.2) is proved in Rust and in Lean, 16 are Lean only, and 257 are not proved yet ([`docs/LEAN_EVIDENCE.md`](docs/LEAN_EVIDENCE.md)).
 - Linking Rust functions to Orange Paper specifications via `#[spec_locked]` attributes
-- Verifying contracts (`#[requires]` and `#[ensures]`) using static analysis and Z3
+- Verifying Rust contracts (`#[requires]` and `#[ensures]`) with static analysis and Z3
+- Checking Orange Paper sentences as Lean theorems of the model in `blvm-spec/lean/`. Lean does not check the Rust. That check is the `lean-evidence` workflow
 - Providing a `cargo test`-like CLI experience
 - Reporting an evidence set per anchor (`z3_contract`, `lean_formula`, `lean_model`, `differential`, `none`). See [docs/btc-lean/EVIDENCE.md](docs/btc-lean/EVIDENCE.md). `verify` JSON is `report_format` 2.
 

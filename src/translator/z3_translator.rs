@@ -1068,7 +1068,7 @@ impl Z3Translator {
                 let literals: Option<Vec<i64>> =
                     array.elems.iter().map(extract_int_literal).collect();
                 if let Some(literals) = literals {
-                    if (1..=40).contains(&literals.len()) {
+                    if (0..=40).contains(&literals.len()) {
                         return Ok(self.pack_literals(&literals).into());
                     }
                 }
@@ -1662,7 +1662,14 @@ impl Z3Translator {
                 Ok(sum.into())
             }
             "unwrap_or" | "unwrap_or_else" => {
-                // x.unwrap_or(default) or x.unwrap_or_else(|| default) - use receiver (the Option)
+                // `opt.map(|xs| xs.iter().any(|x| pred)).unwrap_or(default)` is the
+                // default when the option is absent, and the element predicate
+                // when it is present. A different `unwrap_or` stays the receiver.
+                if method_name == "unwrap_or" {
+                    if let Some(value) = self.option_any(method, vars)? {
+                        return Ok(value.into());
+                    }
+                }
                 self.translate_expr_with_vars(&method.receiver, vars)
             }
             "min" | "max" => {
@@ -2140,7 +2147,10 @@ impl Z3Translator {
                 Ok(len_int._eq(&zero).into())
             }
             "all" => {
-                // iter.all(|x| pred(x)) — uninterpreted Bool; no closure expansion
+                if let Some(walk) = self.element_eq_walk(method, vars)? {
+                    return Ok(walk.into());
+                }
+                // A closure this walk does not read stays an uninterpreted Bool.
                 let _ = self.translate_expr_with_vars(&method.receiver, vars);
                 let base = expr_to_var_hint(&method.receiver);
                 let name = format!("{base}_all");
@@ -2160,7 +2170,7 @@ impl Z3Translator {
                 let x_int = x_z3.as_int().ok_or_else(|| {
                     TranslationError::TypeError("contains: arg must be Int".to_string())
                 })?;
-                if let Expr::Range(range) = &*method.receiver {
+                if let Expr::Range(range) = peel_paren(&method.receiver) {
                     let lo_int = if let Some(start) = &range.start {
                         let lo = self.translate_expr_with_vars(start, vars)?;
                         lo.as_int().ok_or_else(|| {
@@ -2506,7 +2516,12 @@ impl Z3Translator {
         }
         let arity = arg_asts.len();
         let base = name.split("::").last().unwrap_or(&name);
-        let z3_fn_name = format!("call_{}_{}", base.replace("::", "_"), arity);
+        // `total_supply(height)` and the spec's `TotalSupply(height)` are one function.
+        let z3_fn_name = if base == "total_supply" || base == "TotalSupply" {
+            "TotalSupply".to_string()
+        } else {
+            format!("call_{}_{}", base.replace("::", "_"), arity)
+        };
         let int_sort = Sort::int(&self.ctx);
         let sorts: Vec<&z3::Sort> = std::iter::repeat_n(&int_sort, arity).collect();
         let fn_decl = z3::FuncDecl::new(
@@ -4629,6 +4644,178 @@ impl Z3Translator {
         let failed = coinbase.not() & ran.not();
         let err_value = failed.ite(&one, &zero);
         Some(result._eq(&value) & err._eq(&err_value))
+    }
+
+    /// `opt.map(|xs| xs.iter().any(|x| pred)).unwrap_or(default)`.
+    /// Absent is the default. Present is some element satisfying `pred`.
+    fn option_any<'a>(
+        &'a self,
+        method: &syn::ExprMethodCall,
+        vars: &mut Z3VarMap<'a>,
+    ) -> Result<Option<Bool<'a>>, TranslationError> {
+        let Some(default) = lit_bool(method.args.first()) else {
+            return Ok(None);
+        };
+        let Expr::MethodCall(map) = peel_paren(&method.receiver) else {
+            return Ok(None);
+        };
+        if map.method != "map" {
+            return Ok(None);
+        }
+        let Some(Expr::Closure(outer)) = map.args.first() else {
+            return Ok(None);
+        };
+        let Some(outer_param) = closure_param(outer) else {
+            return Ok(None);
+        };
+        let Expr::MethodCall(any) = peel_paren(&outer.body) else {
+            return Ok(None);
+        };
+        if any.method != "any" {
+            return Ok(None);
+        }
+        let Some(Expr::Closure(inner)) = any.args.first() else {
+            return Ok(None);
+        };
+        let Some(element) = closure_param(inner) else {
+            return Ok(None);
+        };
+        let Expr::MethodCall(iter) = peel_paren(&any.receiver) else {
+            return Ok(None);
+        };
+        if iter.method != "iter" {
+            return Ok(None);
+        }
+        let Expr::Path(path) = peel_paren(&iter.receiver) else {
+            return Ok(None);
+        };
+        if path_to_string(&path.path) != outer_param {
+            return Ok(None);
+        }
+        let base = expr_to_var_hint(&map.receiver);
+        let present = self.bool_input(vars, &format!("{base}_some"));
+        let len = self.int_input(vars, &format!("{base}_len"));
+        let array_name = format!("{base}_elems");
+        self.note_input(array_name.clone());
+        let int_sort = Sort::int(&self.ctx);
+        let elems = Array::new_const(
+            &self.ctx,
+            z3::Symbol::String(array_name),
+            &int_sort,
+            &int_sort,
+        );
+        let index_name = format!("{base}_any_i");
+        self.quantifier_bounds
+            .borrow_mut()
+            .insert(index_name.clone());
+        let idx = Int::new_const(&self.ctx, z3::Symbol::String(index_name));
+        let zero = Int::from_i64(&self.ctx, 0);
+        let here = elems.select(&idx).as_int().unwrap_or_else(|| zero.clone());
+        let old = vars.insert(element.clone(), here.into());
+        let pred = self.translate_expr_with_vars(&inner.body, vars)?;
+        if let Some(prev) = old {
+            vars.insert(element, prev);
+        } else {
+            vars.remove(&element);
+        }
+        let Some(pred) = pred.as_bool() else {
+            return Err(TranslationError::TypeError(
+                "any predicate must be bool".to_string(),
+            ));
+        };
+        let in_range = idx.ge(&zero) & idx.lt(&len);
+        let some = z3::ast::exists_const(&self.ctx, &[&idx], &[], &(in_range & pred));
+        let fallback = Bool::from_bool(&self.ctx, default);
+        Ok(Some(present.ite(&some, &fallback)))
+    }
+
+    /// `iter().all` when every element is compared with one integer.
+    /// `is_empty()` is length 0. `x == n` is that integer. A different closure
+    /// is not this walk.
+    fn element_eq_walk<'a>(
+        &'a self,
+        method: &syn::ExprMethodCall,
+        vars: &mut Z3VarMap<'a>,
+    ) -> Result<Option<Bool<'a>>, TranslationError> {
+        let Some(target) = all_closure_target(method.args.first()) else {
+            return Ok(None);
+        };
+        self.forall_elements(iter_collection(&method.receiver), target, vars)
+    }
+
+    /// Every element of `collection` satisfies `bound`.
+    fn forall_elements<'a>(
+        &'a self,
+        collection: &Expr,
+        bound: ElemBound,
+        vars: &mut Z3VarMap<'a>,
+    ) -> Result<Option<Bool<'a>>, TranslationError> {
+        let base = expr_to_var_hint(collection);
+        let len_name = if base == "x" {
+            "len_result".to_string()
+        } else {
+            format!("{base}_len")
+        };
+        if self.rooted_at_param(collection) {
+            self.note_input(len_name.clone());
+        }
+        let len_var = vars
+            .entry(len_name.clone())
+            .or_insert_with(|| {
+                Int::new_const(&self.ctx, z3::Symbol::String(len_name.clone())).into()
+            })
+            .clone();
+        let Some(len) = len_var.as_int() else {
+            return Err(TranslationError::TypeError(
+                "element walk: len must be Int".to_string(),
+            ));
+        };
+        let index_name = format!("{base}_i");
+        self.quantifier_bounds
+            .borrow_mut()
+            .insert(index_name.clone());
+        let array_name = format!("{base}_elems");
+        self.note_input(array_name.clone());
+        let int_sort = Sort::int(&self.ctx);
+        let elems = Array::new_const(
+            &self.ctx,
+            z3::Symbol::String(array_name),
+            &int_sort,
+            &int_sort,
+        );
+        let idx = Int::new_const(&self.ctx, z3::Symbol::String(index_name));
+        let zero = Int::from_i64(&self.ctx, 0);
+        let here = elems.select(&idx).as_int().unwrap_or_else(|| zero.clone());
+        let in_range = idx.ge(&zero) & idx.lt(&len);
+        let step = match bound {
+            ElemBound::Eq(value) => here._eq(&Int::from_i64(&self.ctx, value)),
+            ElemBound::AtMost(value) => here.le(&Int::from_i64(&self.ctx, value)),
+        };
+        Ok(Some(z3::ast::forall_const(
+            &self.ctx,
+            &[&idx],
+            &[],
+            &(in_range.not() | step),
+        )))
+    }
+
+    /// `for e in coll { if e.len() > N { return Ok(false); } } Ok(true)`.
+    /// That is every element length at most `N`. `>=` lowers the bound by one.
+    fn try_reject_long_element<'a>(
+        &'a self,
+        block: &Block,
+        vars: &mut Z3VarMap<'a>,
+    ) -> Result<Option<Bool<'a>>, TranslationError> {
+        let Some((collection, bound)) = reject_long_element(block) else {
+            return Ok(None);
+        };
+        let Some(walk) = self.forall_elements(collection, ElemBound::AtMost(bound), vars)? else {
+            return Ok(None);
+        };
+        let Some(result) = vars.get("result").and_then(|value| value.as_bool()) else {
+            return Ok(None);
+        };
+        Ok(Some(result._eq(&walk)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9389,6 +9576,9 @@ impl Z3Translator {
         // return-value Z3 constant with the rebound local expression.
         let result_slot = vars.get("result").cloned();
 
+        if let Some(formula) = self.try_reject_long_element(block, vars)? {
+            return Ok(Some(formula));
+        }
         if let Some(formula) = self.try_compact_target(block, vars) {
             return Ok(Some(formula));
         }
@@ -10546,6 +10736,163 @@ impl Z3Translator {
     }
 }
 
+fn iter_collection(expr: &Expr) -> &Expr {
+    if let Expr::MethodCall(call) = expr {
+        if call.method == "iter" {
+            return &call.receiver;
+        }
+    }
+    expr
+}
+
+/// How every element is constrained.
+enum ElemBound {
+    Eq(i64),
+    AtMost(i64),
+}
+
+/// The integer an `all` closure requires of every element.
+fn all_closure_target(arg: Option<&Expr>) -> Option<ElemBound> {
+    let expr = match arg? {
+        Expr::Paren(paren) => &*paren.expr,
+        other => other,
+    };
+    let Expr::Closure(closure) = expr else {
+        return None;
+    };
+    let body = match &*closure.body {
+        Expr::Paren(paren) => &*paren.expr,
+        other => other,
+    };
+    if let Expr::MethodCall(call) = body {
+        if call.method == "is_empty" {
+            return Some(ElemBound::Eq(0));
+        }
+    }
+    if let Expr::Binary(bin) = body {
+        if let Expr::MethodCall(call) = peel_paren(&bin.left) {
+            if call.method == "len" && matches!(bin.op, syn::BinOp::Le(_)) {
+                return lit_i64(&bin.right).map(ElemBound::AtMost);
+            }
+        }
+        if matches!(bin.op, syn::BinOp::Eq(_)) {
+            return lit_i64(&bin.right).map(ElemBound::Eq);
+        }
+    }
+    None
+}
+
+/// A loop that rejects an element longer than a constant, then returns `Ok(true)`.
+fn reject_long_element(block: &Block) -> Option<(&Expr, i64)> {
+    let mut bound_name: Option<String> = None;
+    let mut bound_value = None;
+    let mut collection = None;
+    let mut accepted = false;
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::Item(syn::Item::Use(_)) => {}
+            Stmt::Item(syn::Item::Const(item)) => {
+                bound_name = Some(item.ident.to_string());
+                bound_value = int_token(&quote::quote!(#item.expr).to_string()).or_else(|| {
+                    if let Expr::Lit(lit) = &*item.expr {
+                        lit_i64_from_lit(&lit.lit)
+                    } else {
+                        None
+                    }
+                });
+            }
+            Stmt::Expr(Expr::ForLoop(loop_expr), _) => {
+                let limit = loop_len_limit(loop_expr, bound_name.as_deref(), bound_value)?;
+                collection = Some(&*loop_expr.expr);
+                bound_value = Some(limit);
+            }
+            Stmt::Expr(expr, _) if ok_bool_expr(expr, true) => accepted = true,
+            _ => return None,
+        }
+    }
+    if !accepted {
+        return None;
+    }
+    Some((collection?, bound_value?))
+}
+
+fn loop_len_limit(
+    loop_expr: &syn::ExprForLoop,
+    bound_name: Option<&str>,
+    bound_value: Option<i64>,
+) -> Option<i64> {
+    if loop_expr.body.stmts.len() != 1 {
+        return None;
+    }
+    let Stmt::Expr(Expr::If(iff), _) = &loop_expr.body.stmts[0] else {
+        return None;
+    };
+    if iff.else_branch.is_some() || !returns_ok_bool(&iff.then_branch, false) {
+        return None;
+    }
+    let Expr::Binary(bin) = peel_paren(&iff.cond) else {
+        return None;
+    };
+    let Expr::MethodCall(len) = peel_paren(&bin.left) else {
+        return None;
+    };
+    if len.method != "len" {
+        return None;
+    }
+    let value = match peel_paren(&bin.right) {
+        Expr::Lit(_) => lit_i64(&bin.right)?,
+        Expr::Path(path) => {
+            let name = path.path.segments.last()?.ident.to_string();
+            if bound_name == Some(name.as_str()) {
+                bound_value?
+            } else {
+                sourced_const_i64(&name)?
+            }
+        }
+        _ => return None,
+    };
+    match &bin.op {
+        syn::BinOp::Gt(_) => Some(value),
+        syn::BinOp::Ge(_) => Some(value.saturating_sub(1)),
+        _ => None,
+    }
+}
+
+fn lit_bool(expr: Option<&Expr>) -> Option<bool> {
+    let Expr::Lit(lit) = peel_paren(expr?) else {
+        return None;
+    };
+    let syn::Lit::Bool(value) = &lit.lit else {
+        return None;
+    };
+    Some(value.value)
+}
+
+fn closure_param(closure: &syn::ExprClosure) -> Option<String> {
+    if closure.inputs.len() != 1 {
+        return None;
+    }
+    let syn::Pat::Ident(ident) = &closure.inputs[0] else {
+        return None;
+    };
+    Some(ident.ident.to_string())
+}
+
+fn lit_i64_from_lit(lit: &syn::Lit) -> Option<i64> {
+    let syn::Lit::Int(int) = lit else {
+        return None;
+    };
+    int.base10_parse().ok()
+}
+
+fn int_token(expr: &str) -> Option<i64> {
+    let expr = expr.trim();
+    if let Some(hex) = expr.strip_prefix("0x").or_else(|| expr.strip_prefix("0X")) {
+        return i64::try_from(u64::from_str_radix(hex, 16).ok()?).ok();
+    }
+    expr.replace('_', "").parse().ok()
+}
+
 /// Resolve common Bitcoin consensus constants
 /// Returns the constant value if known, None otherwise
 fn resolve_constant(name: &str) -> Option<i64> {
@@ -10568,6 +10915,7 @@ fn resolve_constant(name: &str) -> Option<i64> {
         // Script opcodes (blvm-primitives/src/opcodes.rs)
         "OP_1" => Some(0x51),  // 81
         "OP_16" => Some(0x60), // 96
+        name if name.starts_with("OP_") => prim_opcode(name),
 
         // SegWit program lengths (blvm-primitives/src/constants.rs)
         "SEGWIT_P2WPKH_LENGTH" => Some(20),
@@ -10596,8 +10944,50 @@ fn resolve_constant(name: &str) -> Option<i64> {
             }
         }
 
-        _ => None,
+        _ => sourced_const_i64(name),
     }
+}
+
+/// A `const` in the opcode or consensus sources, including one alias such as `OP_1`.
+fn sourced_const_i64(name: &str) -> Option<i64> {
+    if let Some(value) = prim_opcode(name) {
+        return Some(value);
+    }
+    if !crate::parser::spec_expr::consensus_workspace_present() {
+        return None;
+    }
+    const FILES: &[&str] = &[
+        "../blvm-primitives/src/constants.rs",
+        "../blvm-consensus/src/constants.rs",
+        "../blvm-consensus/src/taproot.rs",
+    ];
+    for rel in FILES {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let needle = format!("const {name}:");
+        let Some(at) = src.find(&needle) else {
+            continue;
+        };
+        let rest = &src[at + needle.len()..];
+        let Some(eq) = rest.find('=') else {
+            continue;
+        };
+        let expr = rest[eq + 1..].split([';', '\n']).next()?.trim();
+        if let Some(value) = int_token(expr) {
+            return Some(value);
+        }
+        if expr
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            if let Some(value) = prim_opcode(expr) {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 /// Activation height written on `BIP54_ACTIVATION_*` in the primitives source.
@@ -32697,11 +33087,10 @@ fn known_uninterpreted_function(name: &str) -> Option<(&'static str, Option<usiz
 fn known_int_returning_function(name: &str) -> Option<String> {
     let base = name.split("::").last().unwrap_or(name);
     match base {
-        "total_supply"
-        | "get_next_work_required"
-        | "expand_target"
-        | "compress_target"
-        | "difficulty_from_bits" => Some(format!("call_{base}_result")),
+        "total_supply" | "TotalSupply" => Some("TotalSupply".to_string()),
+        "get_next_work_required" | "expand_target" | "compress_target" | "difficulty_from_bits" => {
+            Some(format!("call_{base}_result"))
+        }
         "calculate_merkle_root" | "calculate_block_hash" => Some(format!("call_{base}_result")),
         "extract_sequence_locktime_value" | "ExtractSequenceLocktimeValue" => {
             Some("call_extract_sequence_locktime_value_result".to_string())

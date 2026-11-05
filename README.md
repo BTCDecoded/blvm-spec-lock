@@ -11,7 +11,7 @@ Purpose-built checker for the BLVM implementation of the Bitcoin Commons specifi
 
 ## Overview
 
-BLVM Spec Lock annotates Bitcoin consensus functions and Z3-checks their contracts by the steps below. A passing check is not formal verification of a function: in blvm-consensus only 93 of 224 anchors are mutation-validated (see [`docs/VERIFICATION.md`](https://github.com/BTCDecoded/blvm-consensus/blob/main/docs/VERIFICATION.md)).
+BLVM Spec Lock annotates Bitcoin consensus functions and Z3-checks their contracts by the steps below. A passing check is not a proof. A proof is a deliberate break in the function that makes the check fail. The written list is 93 proved functions out of 224 ([`VERIFICATION.md`](https://github.com/BTCDecoded/blvm-consensus/blob/main/docs/VERIFICATION.md)). The list this tool writes is 34 proved functions ([`docs/MUTATION_COVERAGE.md`](docs/MUTATION_COVERAGE.md)). Of 274 Orange Paper sentences, the subsidy theorem (6.1.2) is proved in Rust and in Lean, 16 are Lean proofs of the specification only, and 257 are not proved yet ([`docs/LEAN_EVIDENCE.md`](docs/LEAN_EVIDENCE.md)).
 - Linking Rust functions to Orange Paper specifications via `#[spec_locked]` attributes
 - Verifying contracts (`#[requires]` and `#[ensures]`) using static analysis and Z3
 - Providing a `cargo test`-like CLI experience

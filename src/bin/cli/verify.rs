@@ -666,6 +666,15 @@ pub fn verify_function(
     // True when at least one ensures contract was verified using the function body
     // (i.e. Z3 used body constraints). False means all passes are type-level only.
     let mut any_body_translated = false;
+    // A spec clause counts only when every spec-derived ensures was proved from
+    // the body. An axiom does not count. A body that returns `true` does not
+    // count while a spec clause is present.
+    let returns_true = function
+        .function_sig
+        .as_ref()
+        .is_some_and(body_returns_literal_true);
+    let mut spec_ensures = 0u32;
+    let mut spec_from_body = 0u32;
 
     // Separate requires, ensures, and axiom contracts
     let requires_contracts: Vec<_> = function
@@ -761,6 +770,13 @@ pub fn verify_function(
                         Ok(()) => {
                             verified_count += 1;
                             any_body_translated = true;
+                            note_spec_ensures(
+                                contract.is_spec_derived,
+                                true,
+                                returns_true,
+                                &mut spec_ensures,
+                                &mut spec_from_body,
+                            );
                         }
                         Err(e) => {
                             failed_contracts.push((
@@ -798,6 +814,13 @@ pub fn verify_function(
             ) {
                 StaticCheck::Passed => {
                     verified_count += 1;
+                    note_spec_ensures(
+                        contract.is_spec_derived,
+                        false,
+                        returns_true,
+                        &mut spec_ensures,
+                        &mut spec_from_body,
+                    );
                 }
                 StaticCheck::Failed(reason) => {
                     failed_contracts.push((
@@ -830,6 +853,13 @@ pub fn verify_function(
                                 if body_translated {
                                     any_body_translated = true;
                                 }
+                                note_spec_ensures(
+                                    contract.is_spec_derived,
+                                    body_translated,
+                                    returns_true,
+                                    &mut spec_ensures,
+                                    &mut spec_from_body,
+                                );
                             }
                         }
                     }
@@ -865,10 +895,15 @@ pub fn verify_function(
         return failed_verification(contract_type, reason, failed_contracts.len());
     }
 
+    let body_translated = if spec_ensures > 0 {
+        spec_from_body == spec_ensures
+    } else if returns_true && !axiom_contracts.is_empty() {
+        false
+    } else {
+        any_body_translated
+    };
     if verified_count == function.contracts.len() {
-        VerificationResult::Passed {
-            body_translated: any_body_translated,
-        }
+        VerificationResult::Passed { body_translated }
     } else if requires_z3_count > 0 {
         let trans_err = translation_error.into_inner();
         let reason_msg = format!(
@@ -894,9 +929,58 @@ pub fn verify_function(
             partial_reason: Some(partial_reason),
         }
     } else {
-        VerificationResult::Passed {
-            body_translated: any_body_translated,
-        }
+        VerificationResult::Passed { body_translated }
+    }
+}
+
+/// A spec-derived ensures counts toward `body_translated` only when Z3 proved
+/// it from a body that is not the literal `true`.
+fn note_spec_ensures(
+    is_spec_derived: bool,
+    proved_from_body: bool,
+    returns_true: bool,
+    spec_ensures: &mut u32,
+    spec_from_body: &mut u32,
+) {
+    if !is_spec_derived {
+        return;
+    }
+    *spec_ensures += 1;
+    if proved_from_body && !returns_true {
+        *spec_from_body += 1;
+    }
+}
+
+/// The returned expression is the literal `true`, ignoring `let _ = ...` bindings.
+fn body_returns_literal_true(func: &syn::ItemFn) -> bool {
+    block_returns_literal_true(&func.block)
+}
+
+fn block_returns_literal_true(block: &syn::Block) -> bool {
+    let meaningful: Vec<_> = block
+        .stmts
+        .iter()
+        .filter(|stmt| !is_ignored_let(stmt))
+        .collect();
+    match meaningful.as_slice() {
+        [syn::Stmt::Expr(expr, _)] => expr_is_literal_true(expr),
+        _ => false,
+    }
+}
+
+fn is_ignored_let(stmt: &syn::Stmt) -> bool {
+    let syn::Stmt::Local(local) = stmt else {
+        return false;
+    };
+    matches!(local.pat, syn::Pat::Wild(_))
+}
+
+fn expr_is_literal_true(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Lit(lit) => matches!(&lit.lit, syn::Lit::Bool(b) if b.value),
+        syn::Expr::Block(block) => block_returns_literal_true(&block.block),
+        syn::Expr::Paren(paren) => expr_is_literal_true(&paren.expr),
+        _ => false,
     }
 }
 
@@ -1768,6 +1852,675 @@ mod failure_kind_tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(all(test, feature = "z3"))]
+mod supply_limit_is_not_a_body_proof {
+    use super::{VerificationResult, make_function_to_verify, verify_function};
+    use crate::cli::spec_enrich::enrich_functions_with_spec;
+    use crate::parser::spec_expr::consensus_workspace_present;
+    use std::path::PathBuf;
+
+    #[test]
+    fn true_body_does_not_prove_the_supply_clause() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        // The flag rule, on a body that returns `true` beside the supply axiom.
+        let src = r#"
+            #[blvm_spec_lock::axiom(TotalSupply(height) <= MAX_MONEY)]
+            #[spec_locked("6.3", "ValidateSupplyLimit")]
+            fn validate_supply_limit(height: u64) -> bool {
+                let _ = height;
+                true
+            }
+        "#;
+        let file = syn::parse_file(src).expect("parse the true body");
+        let func = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(f) if f.sig.ident == "validate_supply_limit" => Some(f),
+                _ => None,
+            })
+            .expect("validate_supply_limit");
+        let mut functions = [make_function_to_verify(
+            std::path::Path::new("src/economic.rs"),
+            "validate_supply_limit",
+            &func.attrs,
+            func,
+        )];
+        enrich_functions_with_spec(&mut functions, &[root.join("blvm-spec/PROTOCOL.md")])
+            .expect("enrich");
+        match verify_function(&functions[0], 8, &[]) {
+            VerificationResult::Passed { body_translated } => {
+                assert!(
+                    !body_translated,
+                    "a body of true does not prove the supply clause: {:?}",
+                    functions[0]
+                        .contracts
+                        .iter()
+                        .map(|c| format!("{:?} {}", c.contract_type, c.condition))
+                        .collect::<Vec<_>>()
+                );
+            }
+            VerificationResult::Partial { .. } => {}
+            other => panic!("supply limit must stay a non-failing pass, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "z3"))]
+mod open_body_identity {
+    use super::{FailureKind, VerificationResult, make_function_to_verify, verify_function};
+    use crate::parser::spec_expr::consensus_workspace_present;
+
+    fn fn_in(src: &str, name: &str) -> syn::ItemFn {
+        let file = syn::parse_file(src).unwrap_or_else(|err| panic!("parse {name}: {err}"));
+        file.items
+            .into_iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(func) if func.sig.ident == name => Some(func),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name}"))
+    }
+
+    fn load(rel: &str) -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("{rel}"))
+    }
+
+    fn query(file: &str, name: &str, func: &syn::ItemFn, clause: &str) -> VerificationResult {
+        let mut function =
+            make_function_to_verify(std::path::Path::new(file), name, &func.attrs, func);
+        function.contracts = vec![super::Contract {
+            contract_type: super::ContractType::Ensures,
+            condition: clause.to_string(),
+            expr: syn::parse_str(clause).ok(),
+            is_spec_derived: true,
+        }];
+        verify_function(&function, 15, &[])
+    }
+
+    fn assert_body(result: VerificationResult, what: &str) {
+        match result {
+            VerificationResult::Passed { body_translated } => {
+                assert!(body_translated, "{what} must use the body");
+            }
+            other => panic!("{what} must pass, got {other:?}"),
+        }
+    }
+
+    fn assert_flip(result: VerificationResult, what: &str) {
+        assert!(
+            matches!(
+                result,
+                VerificationResult::Failed {
+                    kind: FailureKind::Counterexample,
+                    ..
+                }
+            ),
+            "{what} must flip, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn sigop_push_passes_and_both_edits_flip() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let src = load("blvm-consensus/src/sigop.rs");
+        let func = fn_in(&src, "sigop_count_push_opcode");
+        let clause = "result == (op <= 96)";
+        assert_body(
+            query("src/sigop.rs", "sigop_count_push_opcode", &func, clause),
+            "sigop push",
+        );
+        let mut tightened = func.clone();
+        assert!(
+            crate::translator::body_edit::tighten_returned_le(&mut tightened),
+            "the push bound is <="
+        );
+        assert_flip(
+            query(
+                "src/sigop.rs",
+                "sigop_count_push_opcode",
+                &tightened,
+                clause,
+            ),
+            "tightening the push bound",
+        );
+        let raised = src.replacen("op <= OP_16", "op <= 97", 1);
+        assert_ne!(raised, src, "the push bound must change");
+        assert_flip(
+            query(
+                "src/sigop.rs",
+                "sigop_count_push_opcode",
+                &fn_in(&raised, "sigop_count_push_opcode"),
+                clause,
+            ),
+            "raising the push bound",
+        );
+    }
+
+    #[test]
+    fn p2sh_pattern_passes_and_both_edits_flip() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let src = load("blvm-consensus/src/sigop.rs");
+        let func = fn_in(&src, "is_pay_to_script_hash");
+        let clause = "result == (script.len() == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87)";
+        assert_body(
+            query("src/sigop.rs", "is_pay_to_script_hash", &func, clause),
+            "p2sh",
+        );
+        let short = src.replacen(
+            "script.len() == 23\n        && script[0] == OP_HASH160",
+            "script.len() == 22\n        && script[0] == OP_HASH160",
+            1,
+        );
+        assert_ne!(short, src);
+        assert_flip(
+            query(
+                "src/sigop.rs",
+                "is_pay_to_script_hash",
+                &fn_in(&short, "is_pay_to_script_hash"),
+                clause,
+            ),
+            "shortening the script",
+        );
+        let swapped = src.replacen("script[22] == OP_EQUAL", "script[22] == OP_EQUALVERIFY", 1);
+        assert_ne!(swapped, src);
+        assert_flip(
+            query(
+                "src/sigop.rs",
+                "is_pay_to_script_hash",
+                &fn_in(&swapped, "is_pay_to_script_hash"),
+                clause,
+            ),
+            "swapping the final opcode",
+        );
+    }
+
+    #[test]
+    fn supply_cap_passes_and_both_edits_flip() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let src = load("blvm-consensus/src/economic.rs");
+        let func = fn_in(&src, "validate_supply_limit");
+        let clause = "result == (TotalSupply(height) <= 2100000000000000)";
+        assert_body(
+            query("src/economic.rs", "validate_supply_limit", &func, clause),
+            "supply cap",
+        );
+        let mut strict = func.clone();
+        assert!(
+            crate::translator::body_edit::tighten_returned_le(&mut strict),
+            "the cap comparison is <="
+        );
+        assert_flip(
+            query("src/economic.rs", "validate_supply_limit", &strict, clause),
+            "tightening the cap",
+        );
+        let zeroed = src.replacen(
+            "total_supply(height) <= MAX_MONEY",
+            "total_supply(height) <= 0",
+            1,
+        );
+        assert_ne!(zeroed, src);
+        assert_flip(
+            query(
+                "src/economic.rs",
+                "validate_supply_limit",
+                &fn_in(&zeroed, "validate_supply_limit"),
+                clause,
+            ),
+            "replacing the cap with zero",
+        );
+    }
+
+    #[test]
+    fn witness_empty_passes_and_both_edits_flip() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let src = load("blvm-consensus/src/witness.rs");
+        let func = fn_in(&src, "is_witness_empty");
+        let clause = "result == (witness.is_empty() || witness.iter().all(|elem| elem.is_empty()))";
+        assert_body(
+            query("src/witness.rs", "is_witness_empty", &func, clause),
+            "witness empty",
+        );
+        let lengths = src.replacen(
+            "witness.iter().all(|elem| elem.is_empty())",
+            "witness.iter().all(|elem| elem.len() == 1)",
+            1,
+        );
+        assert_ne!(lengths, src);
+        assert_flip(
+            query(
+                "src/witness.rs",
+                "is_witness_empty",
+                &fn_in(&lengths, "is_witness_empty"),
+                clause,
+            ),
+            "requiring length 1",
+        );
+        let dropped = src.replacen(
+            "witness.is_empty() || witness.iter().all(|elem| elem.is_empty())",
+            "witness.is_empty()",
+            1,
+        );
+        assert_ne!(dropped, src);
+        assert_flip(
+            query(
+                "src/witness.rs",
+                "is_witness_empty",
+                &fn_in(&dropped, "is_witness_empty"),
+                clause,
+            ),
+            "dropping the element walk",
+        );
+    }
+
+    #[test]
+    fn witness_version_passes_and_both_edits_flip() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let src = load("blvm-consensus/src/witness.rs");
+        let func = fn_in(&src, "is_witness_version_opcode");
+        let clause = "result == (opcode == 0 || (81..=96).contains(&opcode))";
+        assert_body(
+            query("src/witness.rs", "is_witness_version_opcode", &func, clause),
+            "witness version",
+        );
+        let dropped_low = src.replacen("OP_1..=OP_16", "OP_2..=OP_16", 1);
+        assert_ne!(dropped_low, src);
+        assert_flip(
+            query(
+                "src/witness.rs",
+                "is_witness_version_opcode",
+                &fn_in(&dropped_low, "is_witness_version_opcode"),
+                clause,
+            ),
+            "dropping OP_1",
+        );
+        let shortened = src.replacen("OP_1..=OP_16", "OP_1..=OP_15", 1);
+        assert_ne!(shortened, src);
+        assert_flip(
+            query(
+                "src/witness.rs",
+                "is_witness_version_opcode",
+                &fn_in(&shortened, "is_witness_version_opcode"),
+                clause,
+            ),
+            "dropping OP_16",
+        );
+    }
+
+    #[test]
+    fn taproot_script_passes_and_both_edits_flip() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let src = load("blvm-consensus/src/taproot.rs");
+        let func = fn_in(&src, "validate_taproot_script");
+        let clause = "result == (script.len() == 34 && script[0] == 0x51 && script[1] == 0x20)";
+        assert_body(
+            query("src/taproot.rs", "validate_taproot_script", &func, clause),
+            "taproot script",
+        );
+        let short = src.replacen(
+            "script.len() != TAPROOT_SCRIPT_LENGTH",
+            "script.len() != 33",
+            1,
+        );
+        assert_ne!(short, src);
+        assert_flip(
+            query(
+                "src/taproot.rs",
+                "validate_taproot_script",
+                &fn_in(&short, "validate_taproot_script"),
+                clause,
+            ),
+            "rejecting a 34-byte script",
+        );
+        let push = src.replacen("script[1] != PUSH_32_BYTES", "script[1] != OP_0", 1);
+        assert_ne!(push, src);
+        assert_flip(
+            query(
+                "src/taproot.rs",
+                "validate_taproot_script",
+                &fn_in(&push, "validate_taproot_script"),
+                clause,
+            ),
+            "rejecting the 32-byte push",
+        );
+    }
+
+    #[test]
+    fn witness_element_bound_passes_and_both_edits_flip() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let src = load("blvm-consensus/src/witness.rs");
+        let func = fn_in(&src, "validate_segwit_witness_structure");
+        let clause = "result == witness.iter().all(|elem| elem.len() <= 520)";
+        assert_body(
+            query(
+                "src/witness.rs",
+                "validate_segwit_witness_structure",
+                &func,
+                clause,
+            ),
+            "witness element bound",
+        );
+        let tighter = src.replacen(
+            "const MAX_WITNESS_ELEMENT_SIZE: usize = 520;",
+            "const MAX_WITNESS_ELEMENT_SIZE: usize = 519;",
+            1,
+        );
+        assert_ne!(tighter, src);
+        assert_flip(
+            query(
+                "src/witness.rs",
+                "validate_segwit_witness_structure",
+                &fn_in(&tighter, "validate_segwit_witness_structure"),
+                clause,
+            ),
+            "lowering the element bound",
+        );
+        let inclusive = src.replacen(
+            "element.len() > MAX_WITNESS_ELEMENT_SIZE",
+            "element.len() >= MAX_WITNESS_ELEMENT_SIZE",
+            1,
+        );
+        assert_ne!(inclusive, src);
+        assert_flip(
+            query(
+                "src/witness.rs",
+                "validate_segwit_witness_structure",
+                &fn_in(&inclusive, "validate_segwit_witness_structure"),
+                clause,
+            ),
+            "rejecting the bound itself",
+        );
+    }
+
+    #[test]
+    fn nonempty_witness_passes_and_both_edits_flip() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let src = load("blvm-consensus/src/block/script_cache.rs");
+        let func = fn_in(&src, "tx_has_nonempty_input_witness");
+        let clause = "result == per_input_witnesses.map(|ws| ws.iter().any(|w| !is_witness_empty(w))).unwrap_or(false)";
+        assert_body(
+            query(
+                "src/block/script_cache.rs",
+                "tx_has_nonempty_input_witness",
+                &func,
+                clause,
+            ),
+            "nonempty witness",
+        );
+        let negated = src.replacen(
+            "ws.iter().any(|w| !is_witness_empty(w))",
+            "ws.iter().any(|w| is_witness_empty(w))",
+            1,
+        );
+        assert_ne!(negated, src);
+        assert_flip(
+            query(
+                "src/block/script_cache.rs",
+                "tx_has_nonempty_input_witness",
+                &fn_in(&negated, "tx_has_nonempty_input_witness"),
+                clause,
+            ),
+            "dropping the negation",
+        );
+        let absent = src.replacen(".unwrap_or(false)", ".unwrap_or(true)", 1);
+        assert_ne!(absent, src);
+        assert_flip(
+            query(
+                "src/block/script_cache.rs",
+                "tx_has_nonempty_input_witness",
+                &fn_in(&absent, "tx_has_nonempty_input_witness"),
+                clause,
+            ),
+            "treating a missing witness as present",
+        );
+    }
+
+    #[test]
+    fn script_bool_bytes_passes_and_both_edits_flip() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let src = load("blvm-consensus/src/script/mod.rs");
+        let func = fn_in(&src, "script_bool_bytes");
+        let clause = "result == if value { &[1] } else { &[] }";
+        assert_body(
+            query("src/script/mod.rs", "script_bool_bytes", &func, clause),
+            "script bool bytes",
+        );
+        let byte = src.replacen("if value { &[1] }", "if value { &[2] }", 1);
+        assert_ne!(byte, src);
+        assert_flip(
+            query(
+                "src/script/mod.rs",
+                "script_bool_bytes",
+                &fn_in(&byte, "script_bool_bytes"),
+                clause,
+            ),
+            "changing the true byte",
+        );
+        let filled = src.replacen("else { &[] }", "else { &[1] }", 1);
+        assert_ne!(filled, src);
+        assert_flip(
+            query(
+                "src/script/mod.rs",
+                "script_bool_bytes",
+                &fn_in(&filled, "script_bool_bytes"),
+                clause,
+            ),
+            "filling the false result",
+        );
+    }
+
+    #[test]
+    fn version_zero_witness_program_passes_and_both_edits_flip() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let src = load("blvm-consensus/src/sigop.rs");
+        let func = fn_in(&src, "is_version_zero_witness_program");
+        let clause = "result == ((script.len() == 22 && script[0] == 0 && script[1] == 0x14) || (script.len() == 34 && script[0] == 0 && script[1] == 0x20))";
+        assert_body(
+            query(
+                "src/sigop.rs",
+                "is_version_zero_witness_program",
+                &func,
+                clause,
+            ),
+            "version-zero witness program",
+        );
+        let short = src.replacen(
+            "(script.len() == 22 && script[0] == OP_0 && script[1] == 0x14)",
+            "(script.len() == 21 && script[0] == OP_0 && script[1] == 0x14)",
+            1,
+        );
+        assert_ne!(short, src);
+        assert_flip(
+            query(
+                "src/sigop.rs",
+                "is_version_zero_witness_program",
+                &fn_in(&short, "is_version_zero_witness_program"),
+                clause,
+            ),
+            "shortening the 20-byte program",
+        );
+        let wide = src.replacen(
+            "script.len() == 34 && script[0] == OP_0 && script[1] == 0x20",
+            "script.len() == 33 && script[0] == OP_0 && script[1] == 0x20",
+            1,
+        );
+        assert_ne!(wide, src);
+        assert_flip(
+            query(
+                "src/sigop.rs",
+                "is_version_zero_witness_program",
+                &fn_in(&wide, "is_version_zero_witness_program"),
+                clause,
+            ),
+            "shortening the 32-byte program",
+        );
+    }
+
+    #[test]
+    fn taproot_script_path_passes_and_both_edits_flip() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let src = load("blvm-consensus/src/taproot.rs");
+        let func = fn_in(&src, "validate_taproot_script_path_with_leaf_version");
+        let clause = "result == (compute_script_merkle_root(script, merkle_proof, leaf_version) == merkle_root)";
+        assert_body(
+            query(
+                "src/taproot.rs",
+                "validate_taproot_script_path_with_leaf_version",
+                &func,
+                clause,
+            ),
+            "taproot script path",
+        );
+        let flipped = src.replacen(
+            "computed_root == *merkle_root",
+            "computed_root != *merkle_root",
+            1,
+        );
+        assert_ne!(flipped, src);
+        assert_flip(
+            query(
+                "src/taproot.rs",
+                "validate_taproot_script_path_with_leaf_version",
+                &fn_in(&flipped, "validate_taproot_script_path_with_leaf_version"),
+                clause,
+            ),
+            "reversing the root comparison",
+        );
+        let swapped = src.replacen(
+            "compute_script_merkle_root(script, merkle_proof, leaf_version)",
+            "compute_script_merkle_root(merkle_root, merkle_proof, leaf_version)",
+            1,
+        );
+        assert_ne!(swapped, src);
+        assert_flip(
+            query(
+                "src/taproot.rs",
+                "validate_taproot_script_path_with_leaf_version",
+                &fn_in(&swapped, "validate_taproot_script_path_with_leaf_version"),
+                clause,
+            ),
+            "hashing the expected root",
+        );
+    }
+
+    #[test]
+    fn locktime_types_match_passes_and_both_edits_flip() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let src = load("blvm-consensus/src/locktime.rs");
+        let func = fn_in(&src, "locktime_types_match");
+        let clause = "result == (get_locktime_type(locktime1) == get_locktime_type(locktime2))";
+        assert_body(
+            query("src/locktime.rs", "locktime_types_match", &func, clause),
+            "locktime types match",
+        );
+        let flipped = src.replacen(
+            "get_locktime_type(locktime1) == get_locktime_type(locktime2)",
+            "get_locktime_type(locktime1) != get_locktime_type(locktime2)",
+            1,
+        );
+        assert_ne!(flipped, src);
+        assert_flip(
+            query(
+                "src/locktime.rs",
+                "locktime_types_match",
+                &fn_in(&flipped, "locktime_types_match"),
+                clause,
+            ),
+            "reversing the type comparison",
+        );
+        let same = src.replacen(
+            "get_locktime_type(locktime2)",
+            "get_locktime_type(locktime1)",
+            1,
+        );
+        assert_ne!(same, src);
+        assert_flip(
+            query(
+                "src/locktime.rs",
+                "locktime_types_match",
+                &fn_in(&same, "locktime_types_match"),
+                clause,
+            ),
+            "classifying both values from the first",
+        );
+    }
+
+    #[test]
+    fn witness_flag_condition_passes_and_both_edits_flip() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let src = load("blvm-consensus/src/block/script_cache.rs");
+        let func = fn_in(&src, "tx_requires_witness_script_flags");
+        let clause = "result == (has_witness || is_segwit_transaction(tx))";
+        assert_body(
+            query(
+                "src/block/script_cache.rs",
+                "tx_requires_witness_script_flags",
+                &func,
+                clause,
+            ),
+            "witness flag condition",
+        );
+        let both = src.replacen(
+            "has_witness || is_segwit_transaction(tx)",
+            "has_witness && is_segwit_transaction(tx)",
+            1,
+        );
+        assert_ne!(both, src);
+        assert_flip(
+            query(
+                "src/block/script_cache.rs",
+                "tx_requires_witness_script_flags",
+                &fn_in(&both, "tx_requires_witness_script_flags"),
+                clause,
+            ),
+            "requiring both witness facts",
+        );
+        let dropped = src.replacen("has_witness || is_segwit_transaction(tx)", "has_witness", 1);
+        assert_ne!(dropped, src);
+        assert_flip(
+            query(
+                "src/block/script_cache.rs",
+                "tx_requires_witness_script_flags",
+                &fn_in(&dropped, "tx_requires_witness_script_flags"),
+                clause,
+            ),
+            "dropping the segwit output",
+        );
     }
 }
 

@@ -66,6 +66,13 @@ pub struct MismatchedContract {
     pub section: String,
 }
 
+/// An empty contract list is "missing from the paper" only when enrichment found no spec entry.
+/// A parse gap means the entry exists but none of its properties parsed; those properties are
+/// already listed as unparseable spec contracts.
+fn missing_from_spec_entry(parse_gap: bool) -> bool {
+    !parse_gap
+}
+
 /// Detect spec drift
 ///
 /// When **`scoped_unparseables`** is true, only unparseable spec properties in sections that match a
@@ -128,7 +135,9 @@ pub fn detect_drift(
             continue;
         }
         if func.contracts.is_empty() {
-            missing_from_spec.push(func.clone());
+            if missing_from_spec_entry(func.parse_gap) {
+                missing_from_spec.push(func.clone());
+            }
             continue;
         }
 
@@ -616,7 +625,9 @@ pub fn format_drift_json(result: &DriftResult) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{formula_latex_parseable_for_verify, spec_section_matches_lock};
+    use super::{
+        formula_latex_parseable_for_verify, missing_from_spec_entry, spec_section_matches_lock,
+    };
 
     #[test]
     fn formula_parse_gate_accepts_known_witness_style_body() {
@@ -659,5 +670,11 @@ mod tests {
     fn section_prefix_matches_descendants() {
         assert!(spec_section_matches_lock("5.1.1", "5.1"));
         assert!(spec_section_matches_lock("5.1", "5.1"));
+    }
+
+    #[test]
+    fn parse_gap_is_not_missing_from_spec() {
+        assert!(missing_from_spec_entry(false));
+        assert!(!missing_from_spec_entry(true));
     }
 }

@@ -589,12 +589,14 @@ fn tx_version_rows() -> Vec<LockRow> {
         .filter(|line| line.contains("(tx.version as u32).to_le_bytes()"))
         .collect::<Vec<_>>()
         .join("\n");
+    let mempool = repo("blvm-consensus/src/mempool.rs");
     let src = format!(
-        "{}\n{writes}\n{}\n{}\n{}",
+        "{}\n{writes}\n{}\n{}\n{}\n{}",
         extract_fn(&ser, "deserialize_transaction_with_witness"),
-        line_containing(&locks, "let enforce_bip68 = tx.version >= 2"),
-        line_containing(&script, "if tx.version < 2 {"),
-        line_containing(&connect, "if tx.version < 2 {"),
+        extract_fn(&locks, "version_enforces_relative_lock"),
+        line_containing(&script, "version_enforces_relative_lock"),
+        line_containing(&connect, "version_enforces_relative_lock"),
+        line_containing(&mempool, "version_enforces_relative_lock"),
     );
     let boundary = src.replacen(
         "let version = u32::from_le_bytes(",
@@ -602,8 +604,8 @@ fn tx_version_rows() -> Vec<LockRow> {
         1,
     );
     let predicate = src.replacen(
-        "let enforce_bip68 = tx.version >= 2",
-        "let enforce_bip68 = (tx.version as i32) >= 2",
+        "(version as u32) >= 2",
+        "(version as u32) as i32 >= 2",
         1,
     );
     vec![row(
@@ -742,10 +744,11 @@ fn tx_version_wire_query(src: &str) -> SatResult {
     let read_u32 = body.contains("let version = u32::from_le_bytes(");
     let no_sign_extend = !body.contains("i32::from_le_bytes(");
     let writes = src.matches("(tx.version as u32).to_le_bytes()").count() == 2;
-    let bip68 = src.contains("let enforce_bip68 = tx.version >= 2");
-    let below_two = src.matches("if tx.version < 2 {").count() == 2;
-    let no_signed = !src.contains("(tx.version as i32)");
-    let ok = read_u32 && no_sign_extend && writes && bip68 && below_two && no_signed;
+    let gate = extract_fn(src, "version_enforces_relative_lock");
+    let unsigned = gate.contains("(version as u32) >= 2");
+    let no_signed_gate = !gate.contains("as i32");
+    let callers = src.matches("version_enforces_relative_lock").count() >= 4;
+    let ok = read_u32 && no_sign_extend && writes && unsigned && no_signed_gate && callers;
     production_lock::check(|ctx, solver| {
         solver.assert(&Bool::from_bool(ctx, ok).not());
     })

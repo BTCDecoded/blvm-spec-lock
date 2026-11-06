@@ -1264,18 +1264,31 @@ fn sentence_gate(spec_paths: &[std::path::PathBuf], require_lean: bool) -> Resul
 
 fn walk_lean(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    walk_lean_seen(dir, &mut out, &mut seen);
+    out
+}
+
+fn walk_lean_seen(
+    dir: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if !seen.insert(canon) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
+        return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            out.extend(walk_lean(&path));
+            walk_lean_seen(&path, out, seen);
         } else if path.extension().and_then(|s| s.to_str()) == Some("lean") {
             out.push(path);
         }
     }
-    out
 }
 
 fn handle_mutation_rebuild(lean_dir: std::path::PathBuf) -> i32 {
@@ -2297,5 +2310,41 @@ mod definition_count_tests {
         let value: serde_json::Value = serde_json::from_str(&zeros).unwrap();
         assert_eq!(value["summary"]["definitions_locked"], 0);
         assert_eq!(value["summary"]["definitions_unlocked"], 0);
+    }
+}
+
+#[cfg(test)]
+mod spec_walk_tests {
+    use super::*;
+
+    #[test]
+    fn a_self_symlink_returns_and_the_file_is_collected() {
+        let dir = std::env::temp_dir().join(format!(
+            "blvm-f69-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("keep.rs"), "fn keep() {}\n").unwrap();
+        std::fs::write(dir.join("keep.lean"), "theorem keep : True := by trivial\n").unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("sub")).unwrap();
+
+        let mut rs = Vec::new();
+        cli::verify::collect_rs_files(&dir, &mut rs);
+        assert_eq!(
+            rs.iter().filter(|path| path.ends_with("keep.rs")).count(),
+            1,
+            "rs walk collected {rs:?}"
+        );
+
+        let lean = walk_lean(&dir);
+        assert_eq!(
+            lean.iter().filter(|path| path.ends_with("keep.lean")).count(),
+            1,
+            "lean walk collected {lean:?}"
+        );
     }
 }

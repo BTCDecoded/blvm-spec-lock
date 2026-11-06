@@ -158,7 +158,23 @@ pub struct CalleePostcond {
 }
 
 /// Recursively collect all `.rs` files under `dir`, skipping `target/`, `.git/`, `.cargo/`.
-fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+///
+/// The canonical directory is recorded before its children are walked. A symlink
+/// that resolves to a directory already recorded is not entered again.
+pub(crate) fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut seen = std::collections::HashSet::new();
+    collect_rs_files_seen(dir, out, &mut seen);
+}
+
+fn collect_rs_files_seen(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) {
+    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if !seen.insert(canon) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -172,7 +188,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
             continue;
         }
         if path.is_dir() {
-            collect_rs_files(&path, out);
+            collect_rs_files_seen(&path, out, seen);
         } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
             out.push(path);
         }

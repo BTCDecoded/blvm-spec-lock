@@ -603,11 +603,7 @@ fn tx_version_rows() -> Vec<LockRow> {
         "let version = i32::from_le_bytes(",
         1,
     );
-    let predicate = src.replacen(
-        "(version as u32) >= 2",
-        "(version as u32) as i32 >= 2",
-        1,
-    );
+    let predicate = src.replacen("(version as u32) >= 2", "(version as u32) as i32 >= 2", 1);
     vec![row(
         "deserialize_transaction_with_witness",
         "tx-version",

@@ -2342,7 +2342,9 @@ mod spec_walk_tests {
 
         let lean = walk_lean(&dir);
         assert_eq!(
-            lean.iter().filter(|path| path.ends_with("keep.lean")).count(),
+            lean.iter()
+                .filter(|path| path.ends_with("keep.lean"))
+                .count(),
             1,
             "lean walk collected {lean:?}"
         );

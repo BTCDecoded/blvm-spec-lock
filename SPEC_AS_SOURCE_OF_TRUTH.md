@@ -74,7 +74,7 @@ When enriching a function, the parser tries in order:
 
 3. **Run with `--spec-path`** always—verification without it cannot use spec-derived contracts
 
-4. **Use `--strict`** to fail on any no-contracts or partial (CI enforcement)
+4. **Partial exits 0.** `--strict` does not change that. Gate CI on `.summary.partial`.
 
 ## Commands
 
@@ -84,9 +84,8 @@ cargo run -p blvm-spec-lock --bin cargo-spec-lock -- verify \
   --spec-path ../blvm-spec/THE_ORANGE_PAPER.md \
   --crate-path ../blvm-consensus
 
-# Strict mode (fails on no-contracts)
+# Partial still exits 0. Check .summary.partial when CI must reject it.
 cargo run -p blvm-spec-lock --bin cargo-spec-lock -- verify \
-  --spec-path ../blvm-spec/THE_ORANGE_PAPER.md \
-  --crate-path ../blvm-consensus \
-  --strict
+  --spec-path ../blvm-spec/PROTOCOL.md ../blvm-spec/ARCHITECTURE.md \
+  --crate-path ../blvm-consensus
 ```

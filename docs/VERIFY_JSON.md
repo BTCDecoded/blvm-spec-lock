@@ -124,8 +124,8 @@ jq -r '.summary.passed // 0' spec_lock_verify.json
 # Fail if any failures or missing-contract outcomes (belt-and-suspenders with exit code)
 jq -e '(.summary.failed + .summary.no_contracts) == 0' spec_lock_verify.json >/dev/null
 
-# If the verify run was *without* `--strict`, exit code may still be 0 when `.summary.partial > 0`;
-# gate on JSON as well when you require full coverage:
+# Partial exits 0 with or without `--strict`.
+# Gate on JSON when CI must reject Partial:
 # jq -e '.summary.partial == 0' spec_lock_verify.json >/dev/null
 
 # Tool identity in logs / metadata

@@ -7,7 +7,7 @@
 
 Purpose-built checker for the BLVM implementation of the Bitcoin Commons specification.
 
-**Locking mechanism**: See [docs/LOCKING_MECHANISM.md](docs/LOCKING_MECHANISM.md) for the full lifecycle (discover → enrich → verify), attribute syntax, status semantics, and **exit codes** (Partial is non-fatal unless **`--strict`**). **Spec wording**: See [SPEC_WORDING.md](SPEC_WORDING.md) for parseable condition patterns. **How to annotate**: See [docs/ANNOTATION_GUIDE.md](docs/ANNOTATION_GUIDE.md) for adding `#[spec_locked]` to new functions. **Verify JSON (CI / attestation)**: See [docs/VERIFY_JSON.md](docs/VERIFY_JSON.md) (`report_format` **2**, `--json-out`, **`results[].anchor_kind`** — **`function` \| `formula` \| `constant`**, optional **`results[].detail`** — **`failure_kind`** on **`failed`**, **`partial_reason`** on **`partial`** or on **`solver_unknown`** **`failed`** rows as **`z3_timeout`** vs **`z3_unknown`**). **Dashboard `jq` examples** (summaries, anchor kinds): [docs/VERIFY_JSON.md — `jq` recipes](docs/VERIFY_JSON.md#jq-recipes); nested **`formula_registry`** (merged **`F_*`** gate) matches **`schemas/formula_verify_report_v1.json`** when **`verify`** runs with **`--spec-path`**.
+**Locking mechanism**: See [docs/LOCKING_MECHANISM.md](docs/LOCKING_MECHANISM.md) for the full lifecycle (discover → enrich → verify), attribute syntax, status semantics, and **exit codes** (a **Partial** result exits 0. **`--strict`** does not change that. A CI script that must reject Partial checks **`.summary.partial`**). **Spec wording**: See [SPEC_WORDING.md](SPEC_WORDING.md) for parseable condition patterns. **How to annotate**: See [docs/ANNOTATION_GUIDE.md](docs/ANNOTATION_GUIDE.md) for adding `#[spec_locked]` to new functions. **Verify JSON (CI / attestation)**: See [docs/VERIFY_JSON.md](docs/VERIFY_JSON.md) (`report_format` **2**, `--json-out`, **`results[].anchor_kind`** — **`function` \| `formula` \| `constant`**, optional **`results[].detail`** — **`failure_kind`** on **`failed`**, **`partial_reason`** on **`partial`** or on **`solver_unknown`** **`failed`** rows as **`z3_timeout`** vs **`z3_unknown`**). **Dashboard `jq` examples** (summaries, anchor kinds): [docs/VERIFY_JSON.md — `jq` recipes](docs/VERIFY_JSON.md#jq-recipes); nested **`formula_registry`** (merged **`F_*`** gate) matches **`schemas/formula_verify_report_v1.json`** when **`verify`** runs with **`--spec-path`**.
 
 ## Overview
 
@@ -45,8 +45,8 @@ cargo spec-lock verify
 # With Orange Paper: derive contracts from spec (required for 0 no-contracts)
 cargo spec-lock verify --spec-path path/to/THE_ORANGE_PAPER.md
 
-# Strict mode: fail on Partial (CI); Failed / no-contracts fail regardless — see docs/LOCKING_MECHANISM.md
-cargo spec-lock verify --strict
+# Partial exits 0. Gate CI on .summary.partial. Failed and NoContracts exit 1.
+cargo spec-lock verify
 
 # Verify specific file
 cargo spec-lock verify src/economic.rs
@@ -118,9 +118,9 @@ pub fn get_block_subsidy(height: u64) -> i64 {
 From `blvm-spec-lock` directory:
 
 ```bash
-# Verify blvm-consensus (140 functions)
+# Verify blvm-consensus. The count is `cargo spec-lock coverage`, not a hard-coded total.
 cargo run --bin cargo-spec-lock -- verify \
-  --spec-path ../blvm-spec/THE_ORANGE_PAPER.md \
+  --spec-path ../blvm-spec/PROTOCOL.md ../blvm-spec/ARCHITECTURE.md \
   --crate-path ../blvm-consensus
 
 # Verify blvm-node (Dandelion 10.6)

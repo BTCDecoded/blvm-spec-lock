@@ -21,8 +21,9 @@ This guide explains how to add `#[spec_locked("section")]` to functions so they 
 4. **Verify** (with Z3 for full SMT solving):
 
    ```bash
-   cargo run --features z3 -p blvm-spec-lock --bin cargo-spec-lock -- verify --strict \
+   cargo run --features z3 -p blvm-spec-lock --bin cargo-spec-lock -- verify \
      --spec-path ../blvm-spec/PROTOCOL.md ../blvm-spec/ARCHITECTURE.md --crate-path ../blvm-consensus
+   # Partial exits 0. Gate CI on .summary.partial.
    ```
 
 ## Current Coverage

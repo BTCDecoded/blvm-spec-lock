@@ -203,8 +203,8 @@ cargo spec-lock summary --crate-path . --format badge
 # Basic verification (fail on any Failed)
 cargo spec-lock verify --spec-path ../blvm-spec/THE_ORANGE_PAPER.md --crate-path .
 
-# Strict: fail on Partial or NoContracts
-cargo spec-lock verify --spec-path ... --crate-path . --strict
+# Partial exits 0. Reject it by checking .summary.partial, not --strict.
+cargo spec-lock verify --spec-path ../blvm-spec/PROTOCOL.md ../blvm-spec/ARCHITECTURE.md --crate-path .
 
 # JUnit for CI reporting
 cargo spec-lock verify --spec-path ... --crate-path . --format junit > spec-lock.xml

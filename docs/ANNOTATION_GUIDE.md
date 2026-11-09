@@ -72,7 +72,7 @@ For a function to receive contracts, the Orange Paper section must have either:
 - **FunctionName**: $\mathbb{N} \rightarrow \mathbb{Z}$ with **Properties** list, or
 - **Implementation Invariants** (e.g. 10.6 Dandelion)
 
-The spec parser matches by name (PascalCase ↔ snake_case). If no exact match, it falls back to the first function in the section.
+The spec parser matches by name (PascalCase ↔ snake_case). If the attribute gives no function name and the section has exactly one named function, that function applies. An explicit name that is not in the spec does not inherit another function. A section with several named functions does not apply its first function.
 
 ## Troubleshooting
 

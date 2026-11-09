@@ -607,8 +607,11 @@ impl SpecParser {
         // Get section content first
         let section_content = content.to_string();
 
-        // Extract functions
-        let function_re = Regex::new(r"\*\*(\w+)\*\*:\s*\$?([^\$]+)\$?")
+        // Extract functions. Match the heading only. A metadata heading such as
+        // **Properties**: is not a function, and its body must not consume the
+        // next **Name**: line.
+        let function_re = Regex::new(r"\*\*(\w+)\*\*:").map_err(|e| format!("Regex error: {e}"))?;
+        let signature_re = Regex::new(r"^\s*\$?([^\$\n]+)\$?")
             .map_err(|e| format!("Regex error: {e}"))?;
 
         let mut functions = Vec::new();
@@ -626,7 +629,14 @@ impl SpecParser {
             ) {
                 continue;
             }
-            let signature = cap.get(2).map(|m| m.as_str().to_string());
+            let heading_end = cap.get(0).unwrap().end();
+            let after = &content[heading_end..];
+            let next_heading = function_re.find(after).map(|m| m.start()).unwrap_or(after.len());
+            let signature = signature_re
+                .captures(&after[..next_heading])
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str().trim().to_string())
+                .filter(|s| !s.is_empty());
 
             let mut func_spec = FunctionSpec {
                 name: name.clone(),

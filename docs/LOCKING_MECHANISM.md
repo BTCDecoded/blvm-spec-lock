@@ -142,7 +142,7 @@ The spec parser matches functions using this order:
 
 1. **Exact name** in section (e.g. `VerifyScript` ↔ `verify_script`)
 2. **Name anywhere** in spec
-3. **First function** in section (one spec function applies to all impls in that section)
+3. **Sole named function** in the section, then in parent sections, when the attribute gives no function name and that section has exactly one named function. An explicit name that is not in the spec does not inherit another function. A section that names several functions does not lend its first function to an unmatched name.
 4. **Parent sections** (5.4.1 → 5.4 → 5) when granularity differs
 5. **Implementation Invariants** (`*`) when section has invariants but no named function
 

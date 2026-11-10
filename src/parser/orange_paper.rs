@@ -611,8 +611,8 @@ impl SpecParser {
         // **Properties**: is not a function, and its body must not consume the
         // next **Name**: line.
         let function_re = Regex::new(r"\*\*(\w+)\*\*:").map_err(|e| format!("Regex error: {e}"))?;
-        let signature_re = Regex::new(r"^\s*\$?([^\$\n]+)\$?")
-            .map_err(|e| format!("Regex error: {e}"))?;
+        let signature_re =
+            Regex::new(r"^\s*\$?([^\$\n]+)\$?").map_err(|e| format!("Regex error: {e}"))?;
 
         let mut functions = Vec::new();
 
@@ -631,7 +631,10 @@ impl SpecParser {
             }
             let heading_end = cap.get(0).unwrap().end();
             let after = &content[heading_end..];
-            let next_heading = function_re.find(after).map(|m| m.start()).unwrap_or(after.len());
+            let next_heading = function_re
+                .find(after)
+                .map(|m| m.start())
+                .unwrap_or(after.len());
             let signature = signature_re
                 .captures(&after[..next_heading])
                 .and_then(|c| c.get(1))

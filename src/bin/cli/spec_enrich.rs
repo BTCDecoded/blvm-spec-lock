@@ -732,13 +732,21 @@ $SMK = 7$
         )
         .expect("write fixture");
         let _cleanup_dir = TmpDirCleanup(dir);
-        let mut functions = vec![gap_fn("NotInTheSpec", "99.96"), gap_fn("OtherFunc", "99.96")];
+        let mut functions = vec![
+            gap_fn("NotInTheSpec", "99.96"),
+            gap_fn("OtherFunc", "99.96"),
+        ];
         let n = enrich_functions_with_spec(&mut functions, &[md_path]).expect("enrich");
         assert_eq!(n, 1);
         assert!(functions[0].contracts.is_empty());
         assert!(!functions[0].parse_gap);
         assert_eq!(functions[1].contracts.len(), 1);
-        assert!(functions[1].contracts[0].condition.replace(' ', "").contains("result==7"));
+        assert!(
+            functions[1].contracts[0]
+                .condition
+                .replace(' ', "")
+                .contains("result==7")
+        );
     }
 
     #[test]

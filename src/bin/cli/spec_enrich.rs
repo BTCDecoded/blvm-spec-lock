@@ -7,15 +7,26 @@ use crate::parser::orange_paper::{
 };
 use std::path::PathBuf;
 
-fn find_function_in_section_or_parents<'a>(
+/// The section's only named function, else the same rule on parent sections.
+///
+/// A section with several named functions does not lend its first function to
+/// an unmatched name. A section with no named function climbs to its parent.
+fn sole_named_in_section_or_parents<'a>(
     parser: &'a SpecParser,
     section: &str,
-    name: Option<&str>,
 ) -> Option<&'a crate::parser::orange_paper::FunctionSpec> {
     let mut s = section;
     loop {
-        if let Some(f) = parser.find_function(s, name) {
-            return Some(f);
+        let named: Vec<_> = parser
+            .get_section_functions(s)
+            .into_iter()
+            .filter(|f| f.name != "*")
+            .collect();
+        if named.len() == 1 {
+            return Some(named[0]);
+        }
+        if named.len() > 1 {
+            return None;
         }
         if let Some(dot) = s.rfind('.') {
             s = &s[..dot];
@@ -237,11 +248,18 @@ pub fn enrich_functions_with_spec(
             .clone()
             .unwrap_or_else(|| rust_to_spec_name(&func.function_name));
 
-        let spec_func = parser
+        let named = parser
             .find_function(section_ref, Some(&spec_name))
-            .or_else(|| parser.find_function_anywhere(&spec_name).map(|(f, _)| f))
-            .or_else(|| parser.find_function(section_ref, None))
-            .or_else(|| find_function_in_section_or_parents(&parser, section_ref, None));
+            .or_else(|| parser.find_function_anywhere(&spec_name).map(|(f, _)| f));
+        // An explicit spec name that is not in the spec must not inherit another
+        // function. An omitted name still uses the section's only named function.
+        let spec_func = if named.is_some() {
+            named
+        } else if func.spec_name_override.is_some() {
+            None
+        } else {
+            sole_named_in_section_or_parents(&parser, section_ref)
+        };
         if std::env::var("SPEC_LOCK_DEBUG_ENRICH").is_ok() {
             let found = spec_func
                 .as_ref()
@@ -697,6 +715,107 @@ $SMK = 7$
         assert!(!functions[0].parse_gap);
         assert_eq!(functions[0].contracts.len(), 1);
         assert_eq!(functions[0].contracts[0].condition, "result >= 0");
+    }
+
+    #[test]
+    fn unmatched_name_does_not_take_the_first_of_several_functions() {
+        let dir = std::env::temp_dir().join(format!(
+            "spec_lock_multi_unmatched_{}_{}",
+            std::process::id(),
+            rand_unique()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let md_path = dir.join("multi.md");
+        std::fs::write(
+            &md_path,
+            "## 99.96 Several\n\n**GetBlockSubsidy**: $h \\to r$\n\n**Properties**:\n- Non-negative: $result \\geq 0$\n\n**OtherFunc**: $h \\to r$\n\n**Properties**:\n- Exact: $result = 7$\n",
+        )
+        .expect("write fixture");
+        let _cleanup_dir = TmpDirCleanup(dir);
+        let mut functions = vec![gap_fn("NotInTheSpec", "99.96"), gap_fn("OtherFunc", "99.96")];
+        let n = enrich_functions_with_spec(&mut functions, &[md_path]).expect("enrich");
+        assert_eq!(n, 1);
+        assert!(functions[0].contracts.is_empty());
+        assert!(!functions[0].parse_gap);
+        assert_eq!(functions[1].contracts.len(), 1);
+        assert!(functions[1].contracts[0].condition.replace(' ', "").contains("result==7"));
+    }
+
+    #[test]
+    fn unmatched_name_uses_the_only_function_in_the_section() {
+        let dir = std::env::temp_dir().join(format!(
+            "spec_lock_sole_unmatched_{}_{}",
+            std::process::id(),
+            rand_unique()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let md_path = dir.join("sole.md");
+        std::fs::write(
+            &md_path,
+            "## 99.97 Sole\n\n**OnlyFunc**: $h \\to r$\n\n**Properties**:\n- Non-negative: $result \\geq 0$\n",
+        )
+        .expect("write fixture");
+        let _cleanup_dir = TmpDirCleanup(dir);
+        let mut only = gap_fn("not_the_only_name", "99.97");
+        only.spec_name_override = None;
+        let mut functions = vec![only];
+        let n = enrich_functions_with_spec(&mut functions, &[md_path]).expect("enrich");
+        assert_eq!(n, 1);
+        assert_eq!(functions[0].contracts.len(), 1);
+        assert!(
+            functions[0].contracts[0]
+                .condition
+                .replace(' ', "")
+                .contains("result>=0")
+        );
+    }
+
+    #[test]
+    fn explicit_missing_name_does_not_take_the_only_function() {
+        let dir = std::env::temp_dir().join(format!(
+            "spec_lock_explicit_miss_{}_{}",
+            std::process::id(),
+            rand_unique()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let md_path = dir.join("sole.md");
+        std::fs::write(
+            &md_path,
+            "## 99.97b Explicit\n\n**OnlyFunc**: $h \\to r$\n\n**Properties**:\n- Non-negative: $result \\geq 0$\n",
+        )
+        .expect("write fixture");
+        let _cleanup_dir = TmpDirCleanup(dir);
+        let mut functions = vec![gap_fn("IsP2SH", "99.97b")];
+        let n = enrich_functions_with_spec(&mut functions, &[md_path]).expect("enrich");
+        assert_eq!(n, 0);
+        assert!(functions[0].contracts.is_empty());
+    }
+
+    #[test]
+    fn properties_heading_does_not_swallow_the_next_function() {
+        let dir = std::env::temp_dir().join(format!(
+            "spec_lock_swallow_{}_{}",
+            std::process::id(),
+            rand_unique()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let md_path = dir.join("swallow.md");
+        std::fs::write(
+            &md_path,
+            "## 99.98 Swallow\n\n**FirstFunc**: $h \\to r$\n\n**Properties**:\n- Note: no dollar here\n\n**SecondFunc**: $h \\to r$\n\n**Properties**:\n- Exact: $result = 7$\n",
+        )
+        .expect("write fixture");
+        let _cleanup_dir = TmpDirCleanup(dir);
+        let mut functions = vec![gap_fn("SecondFunc", "99.98")];
+        let n = enrich_functions_with_spec(&mut functions, &[md_path]).expect("enrich");
+        assert_eq!(n, 1);
+        assert_eq!(functions[0].contracts.len(), 1);
+        assert!(
+            functions[0].contracts[0]
+                .condition
+                .replace(' ', "")
+                .contains("result==7")
+        );
     }
 
     fn rand_unique() -> u64 {

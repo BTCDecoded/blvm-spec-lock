@@ -403,7 +403,55 @@ fn contracts_similar(spec: &str, impl_contract: &str) -> bool {
 
 /// Normalize contract string for comparison
 fn normalize_contract(contract: &str) -> String {
-    contract.to_lowercase().replace(' ', "")
+    canonicalize_single_inequality(&contract.to_lowercase().replace(' ', ""))
+}
+
+/// Rewrite a lone `>=` / `>` as the flipped `<=` / `<`, so `stack >= 0`
+/// matches the Orange Paper's `0 <= stack`. Compound or chained
+/// comparisons are left untouched.
+fn canonicalize_single_inequality(s: &str) -> String {
+    let mut ops = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        let rest = &s[i..];
+        if rest.starts_with("=>") || rest.starts_with("->") {
+            i += 2;
+            continue;
+        }
+        let two = if rest.starts_with(">=") {
+            Some(">=")
+        } else if rest.starts_with("<=") {
+            Some("<=")
+        } else if rest.starts_with("==") {
+            Some("==")
+        } else if rest.starts_with("!=") {
+            Some("!=")
+        } else {
+            None
+        };
+        if let Some(op) = two {
+            ops.push((i, op));
+            i += 2;
+            continue;
+        }
+        if rest.starts_with('>') || rest.starts_with('<') {
+            ops.push((i, &rest[..1]));
+            i += 1;
+            continue;
+        }
+        i += rest.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+    }
+
+    if ops.len() != 1 {
+        return s.to_string();
+    }
+    let (pos, op) = ops[0];
+    let flipped = match op {
+        ">=" => "<=",
+        ">" => "<",
+        _ => return s.to_string(),
+    };
+    format!("{}{}{}", &s[pos + op.len()..], flipped, &s[..pos])
 }
 
 /// Find theorems in Orange Paper without corresponding implementations
@@ -626,8 +674,35 @@ pub fn format_drift_json(result: &DriftResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        formula_latex_parseable_for_verify, missing_from_spec_entry, spec_section_matches_lock,
+        contracts_similar, formula_latex_parseable_for_verify, missing_from_spec_entry,
+        normalize_contract, spec_section_matches_lock,
     };
+
+    #[test]
+    fn normalize_flips_a_lone_gt_comparison() {
+        assert!(contracts_similar("0 <= stack", "stack >= 0"));
+        assert!(contracts_similar("0 < pk", "pk > 0"));
+        assert_eq!(normalize_contract("stack >= 0"), "0<=stack");
+        assert_eq!(normalize_contract("pk_len > 0"), "0<pk_len");
+    }
+
+    #[test]
+    fn normalize_leaves_an_already_le_contract() {
+        assert_eq!(normalize_contract("0 <= stack"), "0<=stack");
+        assert!(contracts_similar("0 <= stack", "0 <= stack"));
+    }
+
+    #[test]
+    fn normalize_leaves_a_compound_comparison() {
+        assert_eq!(
+            normalize_contract("stack >= 0 && alt >= 0"),
+            "stack>=0&&alt>=0"
+        );
+        assert_eq!(
+            normalize_contract("0 <= stack <= l_stack"),
+            "0<=stack<=l_stack"
+        );
+    }
 
     #[test]
     fn formula_parse_gate_accepts_known_witness_style_body() {

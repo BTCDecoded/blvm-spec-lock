@@ -1635,10 +1635,10 @@ fn expand_powers(text: &str) -> String {
 }
 
 fn substitute_spec_constants(text: &str) -> String {
-    // The main CI job checks this crate out alone. Leave names as written
-    // when PROTOCOL.md is not present, so a when-clause with no section 4
-    // constants still parses.
-    if !spec_present() {
+    // Test-only: the main CI job checks this crate out alone. An installed
+    // binary has no sibling blvm-spec and must still panic rather than skip
+    // substitution. Unit tests of this crate compile with `cfg!(test)`.
+    if cfg!(test) && !spec_present() {
         return text.to_string();
     }
     let constants = protocol_constants();

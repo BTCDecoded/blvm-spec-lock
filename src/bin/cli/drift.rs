@@ -397,13 +397,84 @@ fn contracts_similar(spec: &str, impl_contract: &str) -> bool {
         return true;
     }
 
-    // Check if one contains the other (for partial matches)
-    spec_norm.contains(&impl_norm) || impl_norm.contains(&spec_norm)
+    // Check if one contains the other (for partial matches).
+    // Numbers compare as whole tokens so `x < 50000000` is not a
+    // substring of `x < 500000000`.
+    let spec_tok = bound_numeric_tokens(&spec_norm);
+    let impl_tok = bound_numeric_tokens(&impl_norm);
+    spec_tok.contains(&impl_tok) || impl_tok.contains(&spec_tok)
+}
+
+/// Wrap each run of digits in a delimiter that cannot appear in a
+/// normalized contract, so a shorter number is not a substring of a
+/// longer one that shares the same prefix.
+fn bound_numeric_tokens(s: &str) -> String {
+    let mut out = String::new();
+    let mut digits = String::new();
+    let flush = |digits: &mut String, out: &mut String| {
+        if !digits.is_empty() {
+            out.push('\u{1}');
+            out.push_str(digits);
+            out.push('\u{1}');
+            digits.clear();
+        }
+    };
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else {
+            flush(&mut digits, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut digits, &mut out);
+    out
 }
 
 /// Normalize contract string for comparison
 fn normalize_contract(contract: &str) -> String {
-    canonicalize_single_inequality(&contract.to_lowercase().replace(' ', ""))
+    canonicalize_single_inequality(
+        &substitute_rust_constants(contract)
+            .to_lowercase()
+            .replace(' ', ""),
+    )
+}
+
+/// Replace an upper-case identifier the verifier already resolves (e.g.
+/// `LOCKTIME_THRESHOLD`) with its value, so a witness `x < LOCKTIME_THRESHOLD`
+/// matches the Orange Paper's `x < 500000000`.
+fn substitute_rust_constants(s: &str) -> String {
+    let mut out = String::new();
+    let mut ident = String::new();
+    let flush = |ident: &mut String, out: &mut String| {
+        if ident.is_empty() {
+            return;
+        }
+        let is_const = ident.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && ident
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        let value = if is_const {
+            crate::translator::constants::resolve_constant(ident)
+        } else {
+            None
+        };
+        match value {
+            Some(v) => out.push_str(&v.to_string()),
+            None => out.push_str(ident),
+        }
+        ident.clear();
+    };
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            ident.push(c);
+        } else {
+            flush(&mut ident, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut ident, &mut out);
+    out
 }
 
 /// Rewrite a lone `>=` / `>` as the flipped `<=` / `<`, so `stack >= 0`
@@ -702,6 +773,21 @@ mod tests {
             normalize_contract("0 <= stack <= l_stack"),
             "0<=stack<=l_stack"
         );
+    }
+
+    #[test]
+    fn normalize_resolves_locktime_threshold_to_its_value() {
+        assert_eq!(
+            normalize_contract("tx_locktime < LOCKTIME_THRESHOLD"),
+            "tx_locktime<500000000"
+        );
+        assert!(contracts_similar("x < 500000000", "x < LOCKTIME_THRESHOLD"));
+    }
+
+    #[test]
+    fn shorter_literal_is_not_a_prefix_of_locktime_threshold() {
+        assert!(!contracts_similar("x < 50000000", "x < LOCKTIME_THRESHOLD"));
+        assert!(!contracts_similar("x < LOCKTIME_THRESHOLD", "x < 50000000"));
     }
 
     #[test]

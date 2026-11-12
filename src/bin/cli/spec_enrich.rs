@@ -208,7 +208,14 @@ pub fn enrich_functions_with_spec(
                         .filter(|c| c.is_spec_derived && c.contract_type == ContractType::Ensures)
                         .all(|c| c.condition.trim() == "true");
                     for assumption in crate::parser::spec_expr::when_assumptions(&fspec.trailing) {
-                        if func.contracts.iter().any(|c| c.condition == assumption) {
+                        // Only skip a duplicate already taken from the spec. A
+                        // manual #[requires] with the same text must not hide
+                        // the spec-derived copy, or drift has nothing to match.
+                        if func
+                            .contracts
+                            .iter()
+                            .any(|c| c.is_spec_derived && c.condition == assumption)
+                        {
                             continue;
                         }
                         let Ok(expr) = syn::parse_str::<syn::Expr>(&assumption) else {
@@ -556,6 +563,64 @@ $$true$$
             ContractType::Ensures
         );
         assert!(functions[0].contracts[0].expr.is_some());
+    }
+
+    #[test]
+    fn when_assumption_is_kept_even_if_a_manual_requires_has_the_same_text() {
+        let dir = std::env::temp_dir().join(format!(
+            "spec_lock_when_dedup_{}_{}",
+            std::process::id(),
+            rand_unique()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let md_path = dir.join("when_dedup.md");
+
+        let md = r"## 99.97 When-assumption dedup
+
+**Formula** (**F_DedupWhen**):
+
+$$result >= 0$$
+
+when $stack \geq 0$.
+";
+        std::fs::write(&md_path, md).expect("write fixture");
+        let _cleanup_dir = TmpDirCleanup(dir);
+
+        let func: syn::ItemFn = parse_quote! {
+            fn witness_dedup_when(stack: i64) -> i64 { stack }
+        };
+
+        let mut functions = vec![FunctionToVerify {
+            file_path: PathBuf::from("witness.rs"),
+            function_name: "witness_dedup_when".into(),
+            contracts: vec![Contract {
+                contract_type: ContractType::Requires,
+                condition: "stack >= 0".into(),
+                expr: syn::parse_str("stack >= 0").ok(),
+                is_spec_derived: false,
+            }],
+            section: Some("99.97".into()),
+            spec_name_override: None,
+            formula_anchor: Some("F_DedupWhen".into()),
+            constant_anchor: None,
+            formulas: Vec::new(),
+            function_sig: Some(func),
+            parse_gap: false,
+        }];
+
+        enrich_functions_with_spec(&mut functions, &[md_path]).expect("enrich");
+        let requires: Vec<_> = functions[0]
+            .contracts
+            .iter()
+            .filter(|c| c.contract_type == ContractType::Requires && c.condition == "stack >= 0")
+            .collect();
+        assert_eq!(
+            requires.len(),
+            2,
+            "manual and spec-derived copies should both remain"
+        );
+        assert!(requires.iter().any(|c| !c.is_spec_derived));
+        assert!(requires.iter().any(|c| c.is_spec_derived));
     }
 
     #[test]

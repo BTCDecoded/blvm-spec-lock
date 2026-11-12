@@ -7,6 +7,7 @@
 
 pub mod ast_body;
 pub mod body_edit;
+pub mod constants;
 pub mod sample_eval;
 pub mod static_checker;
 

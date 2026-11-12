@@ -189,15 +189,42 @@ fn rewrite_cases(s: &str) -> String {
     out
 }
 
+/// Replace `word` only where it stands alone, so `times` -> `*` leaves
+/// identifiers such as `timestamp` or `blocktimes` intact. A word that starts
+/// with a non-identifier character (a LaTeX command such as `\times`) only
+/// needs the boundary after it.
+fn replace_word(s: &str, word: &str, rep: &str) -> String {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let check_before = word.chars().next().is_some_and(is_ident);
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find(word) {
+        let before = rest[..pos].chars().next_back().or(out.chars().next_back());
+        let after = rest[pos + word.len()..].chars().next();
+        out.push_str(&rest[..pos]);
+        if (check_before && before.is_some_and(is_ident)) || after.is_some_and(is_ident) {
+            out.push_str(word);
+        } else {
+            out.push_str(rep);
+        }
+        rest = &rest[pos + word.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn normalize(raw: &str) -> String {
     let mut s = rewrite_cases(raw.trim());
     s = rewrite_frac(&s);
     s = s.replace('$', "");
+    // `\times` is the LaTeX operator; rewrite it before backslashes are stripped
+    // so `a\times b` does not become the identifier `atimes`.
+    s = replace_word(&s, "\\times", " * ");
     s = s.replace('\\', "");
     s = s.replace(['{', '}'], "");
     s = s.replace("text", "");
     s = s.replace('_', "");
-    s = s.replace("times", "*");
+    s = replace_word(&s, "times", "*");
     s = s.replace('×', "*");
     s = s.replace("cdot", "*");
     s = s.replace("geq", ">=");
@@ -450,6 +477,11 @@ fn tokenize(s: &str) -> Vec<Tok> {
         }
         if b[i] == b'=' && i + 1 < b.len() && b[i + 1] == b'>' {
             toks.push(Tok::Op("=>".into()));
+            i += 2;
+            continue;
+        }
+        if b[i] == b'=' && i + 1 < b.len() && b[i + 1] == b'=' {
+            toks.push(Tok::Op("==".into()));
             i += 2;
             continue;
         }
@@ -1419,5 +1451,56 @@ mod tests {
         let lean = emit_lean(&summed).unwrap();
         assert!(lean.contains("Finset.sum"));
         assert!(emit_z3(&summed, "h").is_err());
+    }
+
+    /// `==` must tokenize as one comparison. Formulas from PROTOCOL.md §5.5 / BIP112.
+    #[test]
+    fn double_equals_formulas_parse() {
+        for (raw, rhs) in [
+            // F_CsvVersionBelowTwoFails
+            ("$$result == false$$", "false"),
+            // F_CsvDisableBitSkipsVersion
+            ("$$result == true$$", "true"),
+            // F_EvalSeqLocksTimeMet
+            (r"$$result == true$$", "true"),
+        ] {
+            let expr = parse_sentence(raw).unwrap_or_else(|| panic!("parse {raw}"));
+            match expr {
+                Formula::Cmp(Cmp::Eq, l, r) => {
+                    assert_eq!(*l, Formula::Name("result".into()), "{raw}");
+                    assert!(
+                        matches!(*r, Formula::Name(ref n) if n == rhs),
+                        "{raw}: {r:?}"
+                    );
+                }
+                other => panic!("{raw}: expected Eq, got {other:?}"),
+            }
+        }
+    }
+
+    /// F_HeaderTimestampAfterMtp / F_Bip94Timewarp: `timestamp` must survive
+    /// the `times` -> `*` rewrite.
+    #[test]
+    fn timestamp_is_not_rewritten_as_times() {
+        assert!(normalize("timestamp").contains("timestamp"));
+        assert!(!normalize("timestamp").contains('*'));
+        assert_eq!(
+            normalize("a times b")
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["a", "*", "b"]
+        );
+        assert!(normalize(r"a\times b").contains('*'));
+        for raw in [
+            "$$(timestamp > mtp) == result$$",
+            "$$(timestamp + 600 >= parent_time) == result$$",
+        ] {
+            let expr = parse_sentence(raw).unwrap_or_else(|| panic!("parse {raw}"));
+            let Formula::Cmp(Cmp::Eq, l, r) = expr else {
+                panic!("{raw}: expected Eq");
+            };
+            assert_eq!(*r, Formula::Name("result".into()), "{raw}");
+            assert!(format!("{l:?}").contains("timestamp"), "{raw}: {l:?}");
+        }
     }
 }

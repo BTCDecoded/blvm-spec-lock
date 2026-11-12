@@ -397,13 +397,132 @@ fn contracts_similar(spec: &str, impl_contract: &str) -> bool {
         return true;
     }
 
-    // Check if one contains the other (for partial matches)
-    spec_norm.contains(&impl_norm) || impl_norm.contains(&spec_norm)
+    // Check if one contains the other (for partial matches).
+    // Numbers compare as whole tokens so `x < 50000000` is not a
+    // substring of `x < 500000000`.
+    let spec_tok = bound_numeric_tokens(&spec_norm);
+    let impl_tok = bound_numeric_tokens(&impl_norm);
+    spec_tok.contains(&impl_tok) || impl_tok.contains(&spec_tok)
+}
+
+/// Wrap each run of digits in a delimiter that cannot appear in a
+/// normalized contract, so a shorter number is not a substring of a
+/// longer one that shares the same prefix.
+fn bound_numeric_tokens(s: &str) -> String {
+    let mut out = String::new();
+    let mut digits = String::new();
+    let flush = |digits: &mut String, out: &mut String| {
+        if !digits.is_empty() {
+            out.push('\u{1}');
+            out.push_str(digits);
+            out.push('\u{1}');
+            digits.clear();
+        }
+    };
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else {
+            flush(&mut digits, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut digits, &mut out);
+    out
 }
 
 /// Normalize contract string for comparison
 fn normalize_contract(contract: &str) -> String {
-    contract.to_lowercase().replace(' ', "")
+    canonicalize_single_inequality(
+        &substitute_rust_constants(contract)
+            .to_lowercase()
+            .replace(' ', ""),
+    )
+}
+
+/// Replace an upper-case identifier the verifier already resolves (e.g.
+/// `LOCKTIME_THRESHOLD`) with its value, so a witness `x < LOCKTIME_THRESHOLD`
+/// matches the Orange Paper's `x < 500000000`.
+fn substitute_rust_constants(s: &str) -> String {
+    let mut out = String::new();
+    let mut ident = String::new();
+    let flush = |ident: &mut String, out: &mut String| {
+        if ident.is_empty() {
+            return;
+        }
+        let is_const = ident.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && ident
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        let value = if is_const {
+            crate::translator::constants::resolve_constant(ident)
+        } else {
+            None
+        };
+        match value {
+            Some(v) => out.push_str(&v.to_string()),
+            None => out.push_str(ident),
+        }
+        ident.clear();
+    };
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            ident.push(c);
+        } else {
+            flush(&mut ident, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut ident, &mut out);
+    out
+}
+
+/// Rewrite a lone `>=` / `>` as the flipped `<=` / `<`, so `stack >= 0`
+/// matches the Orange Paper's `0 <= stack`. Compound or chained
+/// comparisons are left untouched.
+fn canonicalize_single_inequality(s: &str) -> String {
+    let mut ops = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        let rest = &s[i..];
+        if rest.starts_with("=>") || rest.starts_with("->") {
+            i += 2;
+            continue;
+        }
+        let two = if rest.starts_with(">=") {
+            Some(">=")
+        } else if rest.starts_with("<=") {
+            Some("<=")
+        } else if rest.starts_with("==") {
+            Some("==")
+        } else if rest.starts_with("!=") {
+            Some("!=")
+        } else {
+            None
+        };
+        if let Some(op) = two {
+            ops.push((i, op));
+            i += 2;
+            continue;
+        }
+        if rest.starts_with('>') || rest.starts_with('<') {
+            ops.push((i, &rest[..1]));
+            i += 1;
+            continue;
+        }
+        i += rest.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+    }
+
+    if ops.len() != 1 {
+        return s.to_string();
+    }
+    let (pos, op) = ops[0];
+    let flipped = match op {
+        ">=" => "<=",
+        ">" => "<",
+        _ => return s.to_string(),
+    };
+    format!("{}{}{}", &s[pos + op.len()..], flipped, &s[..pos])
 }
 
 /// Find theorems in Orange Paper without corresponding implementations
@@ -626,8 +745,50 @@ pub fn format_drift_json(result: &DriftResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        formula_latex_parseable_for_verify, missing_from_spec_entry, spec_section_matches_lock,
+        contracts_similar, formula_latex_parseable_for_verify, missing_from_spec_entry,
+        normalize_contract, spec_section_matches_lock,
     };
+
+    #[test]
+    fn normalize_flips_a_lone_gt_comparison() {
+        assert!(contracts_similar("0 <= stack", "stack >= 0"));
+        assert!(contracts_similar("0 < pk", "pk > 0"));
+        assert_eq!(normalize_contract("stack >= 0"), "0<=stack");
+        assert_eq!(normalize_contract("pk_len > 0"), "0<pk_len");
+    }
+
+    #[test]
+    fn normalize_leaves_an_already_le_contract() {
+        assert_eq!(normalize_contract("0 <= stack"), "0<=stack");
+        assert!(contracts_similar("0 <= stack", "0 <= stack"));
+    }
+
+    #[test]
+    fn normalize_leaves_a_compound_comparison() {
+        assert_eq!(
+            normalize_contract("stack >= 0 && alt >= 0"),
+            "stack>=0&&alt>=0"
+        );
+        assert_eq!(
+            normalize_contract("0 <= stack <= l_stack"),
+            "0<=stack<=l_stack"
+        );
+    }
+
+    #[test]
+    fn normalize_resolves_locktime_threshold_to_its_value() {
+        assert_eq!(
+            normalize_contract("tx_locktime < LOCKTIME_THRESHOLD"),
+            "tx_locktime<500000000"
+        );
+        assert!(contracts_similar("x < 500000000", "x < LOCKTIME_THRESHOLD"));
+    }
+
+    #[test]
+    fn shorter_literal_is_not_a_prefix_of_locktime_threshold() {
+        assert!(!contracts_similar("x < 50000000", "x < LOCKTIME_THRESHOLD"));
+        assert!(!contracts_similar("x < LOCKTIME_THRESHOLD", "x < 50000000"));
+    }
 
     #[test]
     fn formula_parse_gate_accepts_known_witness_style_body() {

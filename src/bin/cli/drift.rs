@@ -162,6 +162,13 @@ pub fn detect_drift(
                         && contracts_similar(&s.condition, &m.condition)
                 });
                 if !has_match {
+                    // A lone `x >= 0` / `0 <= x` on an unsigned witness variable
+                    // is implied by the Rust type, so a missing Orange Paper
+                    // lower bound is not drift. Signed or unresolvable types
+                    // still count as a mismatch.
+                    if is_implied_unsigned_nonneg(&m.condition, func.function_sig.as_ref()) {
+                        continue;
+                    }
                     // Find the first spec contract of the same type for the mismatch report.
                     if let Some(s) = spec.iter().find(|s| s.contract_type == m.contract_type) {
                         mismatched_contracts.push(MismatchedContract {
@@ -378,6 +385,126 @@ fn rust_to_pascal_case(rust_name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// After orientation normalization, a lone non-negative lower bound is `0<=ident`.
+fn nonneg_lower_bound_var(normalized: &str) -> Option<&str> {
+    let rest = normalized.strip_prefix("0<=")?;
+    let mut chars = rest.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+/// Unsigned primitives plus the known unsigned alias `Natural` (`u64` in
+/// blvm-primitives). Other named types, including signed aliases such as
+/// `Integer` and newtypes such as `Amount`, are not treated as unsigned.
+fn is_known_unsigned_type(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Reference(r) => is_known_unsigned_type(&r.elem),
+        syn::Type::Path(path) => {
+            let Some(seg) = path.path.segments.last() else {
+                return false;
+            };
+            matches!(
+                seg.ident.to_string().as_str(),
+                "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "Natural"
+            )
+        }
+        _ => false,
+    }
+}
+
+fn bind_pat_type(
+    pat: &syn::Pat,
+    ty: Option<&syn::Type>,
+    map: &mut std::collections::HashMap<String, syn::Type>,
+) {
+    match pat {
+        syn::Pat::Type(pt) => bind_pat_type(&pt.pat, Some(&pt.ty), map),
+        syn::Pat::Ident(ident) => {
+            if let Some(ty) = ty {
+                map.insert(ident.ident.to_string(), ty.clone());
+            }
+        }
+        syn::Pat::Tuple(tuple) => {
+            let Some(syn::Type::Tuple(elems)) = ty else {
+                return;
+            };
+            if elems.elems.len() != tuple.elems.len() {
+                return;
+            }
+            for (elem_pat, elem_ty) in tuple.elems.iter().zip(elems.elems.iter()) {
+                bind_pat_type(elem_pat, Some(elem_ty), map);
+            }
+        }
+        syn::Pat::Paren(paren) => bind_pat_type(&paren.pat, ty, map),
+        syn::Pat::Reference(reference) => bind_pat_type(&reference.pat, ty, map),
+        _ => {}
+    }
+}
+
+/// Types from the annotated function signature and from locals that carry an
+/// explicit type. Untyped `let` bindings are left unresolved (fail closed).
+fn lookup_var_type(func: &syn::ItemFn, name: &str) -> Option<syn::Type> {
+    let mut types = std::collections::HashMap::new();
+    for input in &func.sig.inputs {
+        if let syn::FnArg::Typed(pat_type) = input {
+            bind_pat_type(&pat_type.pat, Some(&pat_type.ty), &mut types);
+        }
+    }
+    for stmt in &func.block.stmts {
+        let syn::Stmt::Local(local) = stmt else {
+            continue;
+        };
+        // `let (a, b) = pair` names the elements of a tuple parameter.
+        if let syn::Pat::Tuple(tuple) = &local.pat {
+            if let Some(init) = &local.init {
+                if let syn::Expr::Path(path) = &*init.expr {
+                    if let Some(ident) = path.path.get_ident() {
+                        if let Some(syn::Type::Tuple(elems)) =
+                            types.get(&ident.to_string()).cloned()
+                        {
+                            if elems.elems.len() == tuple.elems.len() {
+                                for (elem_pat, elem_ty) in
+                                    tuple.elems.iter().zip(elems.elems.iter())
+                                {
+                                    bind_pat_type(elem_pat, Some(elem_ty), &mut types);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bind_pat_type(&local.pat, None, &mut types);
+    }
+    types.remove(name)
+}
+
+/// A code-side contract whose whole requirement is `x >= 0` / `0 <= x` counts
+/// as implied only when `x`'s Rust type is a known unsigned type. A signed
+/// quantity (e.g. an `i64` amount or locktime) is a real consensus check and
+/// still counts as drift. If the type cannot be read from the annotated
+/// function signature or a typed local, do not skip.
+fn is_implied_unsigned_nonneg(condition: &str, func: Option<&syn::ItemFn>) -> bool {
+    let normalized = normalize_contract(condition);
+    let Some(name) = nonneg_lower_bound_var(&normalized) else {
+        return false;
+    };
+    let Some(func) = func else {
+        return false;
+    };
+    let Some(ty) = lookup_var_type(func, name) else {
+        return false;
+    };
+    is_known_unsigned_type(&ty)
 }
 
 /// Check if two contracts are similar (allows for minor formatting differences)
@@ -745,9 +872,13 @@ pub fn format_drift_json(result: &DriftResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        contracts_similar, formula_latex_parseable_for_verify, missing_from_spec_entry,
-        normalize_contract, spec_section_matches_lock,
+        contracts_similar, formula_latex_parseable_for_verify, is_implied_unsigned_nonneg,
+        missing_from_spec_entry, normalize_contract, spec_section_matches_lock,
     };
+
+    fn parse_fn(src: &str) -> syn::ItemFn {
+        syn::parse_str(src).unwrap_or_else(|e| panic!("parse fn `{src}`: {e}"))
+    }
 
     #[test]
     fn normalize_flips_a_lone_gt_comparison() {
@@ -837,5 +968,61 @@ mod tests {
     fn parse_gap_is_not_missing_from_spec() {
         assert!(missing_from_spec_entry(false));
         assert!(!missing_from_spec_entry(true));
+    }
+
+    #[test]
+    fn unsigned_nonneg_lower_bound_is_implied() {
+        let func = parse_fn("fn f(depth: u32) {}");
+        assert!(is_implied_unsigned_nonneg("depth >= 0", Some(&func)));
+        assert!(is_implied_unsigned_nonneg("0 <= depth", Some(&func)));
+        let func = parse_fn("fn f(n_outputs: usize) {}");
+        assert!(is_implied_unsigned_nonneg("n_outputs >= 0", Some(&func)));
+        let func = parse_fn("fn f(lock: Natural) {}");
+        assert!(is_implied_unsigned_nonneg("lock >= 0", Some(&func)));
+        let func = parse_fn("fn f(r: &u64) {}");
+        assert!(is_implied_unsigned_nonneg("r >= 0", Some(&func)));
+        let func = parse_fn("fn f() { let value: u16 = 0; }");
+        assert!(is_implied_unsigned_nonneg("value >= 0", Some(&func)));
+        let func = parse_fn("fn f(pair: (u32, i64)) { let (n, _x) = pair; }");
+        assert!(is_implied_unsigned_nonneg("n >= 0", Some(&func)));
+    }
+
+    #[test]
+    fn signed_nonneg_lower_bound_is_still_drift() {
+        let func = parse_fn("fn f(depth: i64) {}");
+        assert!(!is_implied_unsigned_nonneg("depth >= 0", Some(&func)));
+        let func = parse_fn("fn f(value: Integer) {}");
+        assert!(!is_implied_unsigned_nonneg("value >= 0", Some(&func)));
+        let func = parse_fn("fn f(amount: i64) {}");
+        assert!(!is_implied_unsigned_nonneg("amount >= 0", Some(&func)));
+        let func = parse_fn("fn f(pair: (u32, i64)) { let (_n, x) = pair; }");
+        assert!(!is_implied_unsigned_nonneg("x >= 0", Some(&func)));
+    }
+
+    #[test]
+    fn nonneg_lower_bound_is_not_implied_when_type_is_unresolved() {
+        let func = parse_fn("fn f(depth: u32) {}");
+        assert!(!is_implied_unsigned_nonneg("missing >= 0", Some(&func)));
+        let func = parse_fn("fn f() { let depth = 0u32; }");
+        assert!(!is_implied_unsigned_nonneg("depth >= 0", Some(&func)));
+        assert!(!is_implied_unsigned_nonneg("depth >= 0", None));
+        // Unknown newtypes fail closed; a signed Amount must not be skipped.
+        let func = parse_fn("fn f(amount: Amount) {}");
+        assert!(!is_implied_unsigned_nonneg("amount >= 0", Some(&func)));
+    }
+
+    #[test]
+    fn only_a_lone_nonneg_bound_can_be_implied() {
+        let func = parse_fn("fn f(depth: u32) {}");
+        assert!(!is_implied_unsigned_nonneg("depth > 0", Some(&func)));
+        assert!(!is_implied_unsigned_nonneg("depth >= 1", Some(&func)));
+        assert!(!is_implied_unsigned_nonneg(
+            "depth >= 0 && other >= 0",
+            Some(&func)
+        ));
+        assert!(!is_implied_unsigned_nonneg(
+            "0 <= depth && depth < 1000",
+            Some(&func)
+        ));
     }
 }

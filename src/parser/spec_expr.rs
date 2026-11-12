@@ -1768,6 +1768,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn section4_folds_money_and_the_block_caps() {
         let markdown = "\
 ### 4.1 Monetary Constants

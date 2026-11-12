@@ -1560,6 +1560,8 @@ impl<'a> Parser<'a> {
 /// sum of parameters, or both sides are single parameters. Section 4 names
 /// (`M_{max}`, `L_{stack}`, `W_{max}`) become the values parsed from PROTOCOL.md.
 /// `2^{n}` is that power of two. A sum compared with a parameter is the claim, not a domain.
+/// A lone Orange Paper `=` is kept only when a parameter is identified with a sum
+/// (`total = base + wit`) or `output_type` is compared with a literal, and becomes `==`.
 pub fn when_assumptions(trailing: &str) -> Vec<String> {
     let mut out = Vec::new();
     for span in inline_math(trailing) {
@@ -1574,8 +1576,9 @@ pub fn when_assumptions(trailing: &str) -> Vec<String> {
             if piece.is_empty() || !is_domain_comparison(piece) {
                 continue;
             }
-            if !out.iter().any(|seen: &String| seen == piece) {
-                out.push(piece.to_string());
+            let piece = eq_as_eqeq(piece);
+            if !out.contains(&piece) {
+                out.push(piece);
             }
         }
     }
@@ -1675,7 +1678,9 @@ fn comparison_ops(text: &str) -> Vec<(usize, usize)> {
         {
             ops.push((i, 2));
             i += 2;
-        } else if bytes[i] == b'<' || bytes[i] == b'>' {
+        } else if text[i..].starts_with("!=") || text[i..].starts_with("=>") {
+            i += 2;
+        } else if bytes[i] == b'<' || bytes[i] == b'>' || bytes[i] == b'=' {
             ops.push((i, 1));
             i += 1;
         } else {
@@ -1714,9 +1719,33 @@ fn is_domain_comparison(text: &str) -> bool {
     let (at, width) = ops[0];
     let left = text[..at].trim();
     let right = text[at + width..].trim();
+    if &text[at..at + width] == "=" {
+        return is_scoped_equality(left, right);
+    }
     (is_param_sum(left) && is_literal(right))
         || (is_literal(left) && is_param_sum(right))
         || (is_single_param(left) && is_single_param(right))
+}
+
+/// `total = base + wit` or `output_type = 3`. Bare `param = literal` such as
+/// `|sig| = 0` or `network = 2` is notation, not a domain, and is not kept.
+fn is_scoped_equality(left: &str, right: &str) -> bool {
+    let sum = |text: &str| text.contains('+') && is_param_sum(text);
+    let output_type = |a: &str, b: &str| a == "output_type" && is_literal(b);
+    (is_single_param(left) && sum(right))
+        || (sum(left) && is_single_param(right))
+        || output_type(left, right)
+        || output_type(right, left)
+}
+
+/// Rewrite the one lone `=` in a kept comparison to `==` to match `#[requires]`.
+fn eq_as_eqeq(text: &str) -> String {
+    match comparison_ops(text)[..] {
+        [(at, 1)] if text.as_bytes()[at] == b'=' => {
+            format!("{}=={}", &text[..at], &text[at + 1..])
+        }
+        _ => text.to_string(),
+    }
 }
 
 fn is_literal(text: &str) -> bool {
@@ -1766,6 +1795,29 @@ mod tests {
             byte,
             vec!["0 <= byte".to_string(), "byte < 256".to_string()]
         );
+    }
+
+    #[test]
+    fn when_assumptions_keeps_scoped_equalities() {
+        let tap = when_assumptions(
+            "When $output\\_type = 3$, $n\\_outputs \\geq 0$ and $input\\_index \\geq n\\_outputs$.",
+        );
+        assert!(tap.contains(&"output_type == 3".to_string()));
+        assert!(tap.contains(&"n_outputs >= 0".to_string()));
+        assert!(tap.contains(&"input_index >= n_outputs".to_string()));
+
+        let weight = when_assumptions("Under $total = base + wit$, when $0 \\leq base$.");
+        assert!(weight.contains(&"total == base + wit".to_string()));
+        assert!(weight.contains(&"0 <= base".to_string()));
+
+        let sig = when_assumptions("When $|sig| = 0$ and $|pk| > 0$.");
+        assert_eq!(sig, vec!["pk > 0".to_string()]);
+
+        let net = when_assumptions("On regtest ($\\text{network} = 2$).");
+        assert!(net.is_empty());
+
+        let neq = when_assumptions("When $bits \\neq 0$.");
+        assert!(neq.is_empty());
     }
 
     fn section4_folds_money_and_the_block_caps() {

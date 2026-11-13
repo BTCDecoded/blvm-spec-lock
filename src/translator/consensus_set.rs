@@ -136,6 +136,8 @@ fn build_rows() -> Vec<LockRow> {
     rows.extend(legacy_rows());
     rows.extend(threshold_rows());
     rows.extend(preimage_rows());
+    rows.extend(sighash_rows());
+    rows.extend(connect_sentence_rows());
     rows.extend(signet_rows());
     rows.extend(multisig_rows());
     rows.extend(tx_version_rows());
@@ -378,6 +380,247 @@ fn version_bits_query(src: &str) -> SatResult {
 fn preimage_rows() -> Vec<LockRow> {
     // append_bip341_sigmsg is the body identity. The sighash keep still emits the name.
     Vec::new()
+}
+
+fn sighash_rows() -> Vec<LockRow> {
+    let src = repo("blvm-consensus/src/transaction_hash.rs");
+    let plain = format!(
+        "{}\n{}\n{}",
+        extract_fn(&src, "base_type"),
+        extract_fn(&src, "is_all"),
+        extract_fn(&src, "build_bip143_preimage"),
+    );
+    let boundary = plain.replacen("self.0 & 0x1f", "self.0 & 0x1e", 1);
+    let predicate = plain.replacen(
+        "(sighash_type as u32).to_le_bytes()",
+        "&1u32.to_le_bytes()",
+        1,
+    );
+    vec![row(
+        "sighash_base",
+        "sighash",
+        &plain,
+        &boundary,
+        &predicate,
+        sighash_base_query,
+    )]
+}
+
+fn sighash_base_modulus() -> u64 {
+    let text = repo("blvm-spec/PROTOCOL.md");
+    let at = text.find("**F_SighashBase**").expect("F_SighashBase");
+    let rest = &text[at..];
+    let math = rest.find("$$").expect("F_SighashBase math");
+    let inner = &rest[math + 2..];
+    let end = inner.find("$$").expect("F_SighashBase math end");
+    let body = inner[..end].replace('\\', "");
+    let pct = body.find('%').expect("F_SighashBase modulus");
+    let digits: String = body[pct + 1..]
+        .chars()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().expect("F_SighashBase modulus")
+}
+
+fn sighash_mask(src: &str) -> u64 {
+    if src.contains("self.0 & 0x1f") {
+        0x1f
+    } else if src.contains("self.0 & 0x1e") {
+        0x1e
+    } else {
+        0
+    }
+}
+
+fn sighash_base_query(src: &str) -> SatResult {
+    let mask = sighash_mask(src);
+    let clause_mask = sighash_base_modulus().saturating_sub(1);
+    let all = src.contains("base != 0x02 && base != 0x03");
+    let raw = src.contains("(sighash_type as u32).to_le_bytes()");
+    production_lock::check(|ctx, solver| {
+        let byte = BV::new_const(ctx, "byte", 8);
+        let body = byte.bvand(&BV::from_u64(ctx, mask, 8));
+        let clause = byte.bvand(&BV::from_u64(ctx, clause_mask, 8));
+        let base = byte.bvand(&BV::from_u64(ctx, clause_mask, 8));
+        let two = BV::from_u64(ctx, 2, 8);
+        let three = BV::from_u64(ctx, 3, 8);
+        let body_all = if all {
+            base._eq(&two).not() & base._eq(&three).not()
+        } else {
+            Bool::from_bool(ctx, false)
+        };
+        let clause_all = base._eq(&two).not() & base._eq(&three).not();
+        let raw_ok = Bool::from_bool(ctx, raw);
+        solver.assert(&(body._eq(&clause) & body_all._eq(&clause_all) & raw_ok).not());
+    })
+}
+
+fn structural(ok: bool) -> SatResult {
+    production_lock::check(|ctx, solver| {
+        solver.assert(&Bool::from_bool(ctx, ok).not());
+    })
+}
+
+fn connect_sentence_rows() -> Vec<LockRow> {
+    let script = repo("blvm-consensus/src/script/mod.rs");
+    let verify = extract_fn(&script, "verify_script_with_context_full");
+    let eval = extract_fn(&script, "eval_script_with_context_full_inner");
+    let stack = format!("{verify}\n{eval}");
+    let stack_boundary = stack.replacen(
+        "sigversion == SigVersion::WitnessV0 || sigversion == SigVersion::Tapscript",
+        "sigversion == SigVersion::Tapscript",
+        1,
+    );
+    let stack_predicate = stack.replacen(
+        "!stack.is_empty() && cast_to_bool(stack.last().expect(\"Stack is not empty\"))",
+        "stack.len() == 1 && cast_to_bool(stack.last().expect(\"Stack is not empty\"))",
+        1,
+    );
+
+    let flags = extract_fn(
+        &repo("blvm-consensus/src/block/script_cache.rs"),
+        "get_block_script_verify_flags_core",
+    );
+    let flags_boundary = flags.replacen(
+        "SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT",
+        "SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT",
+        1,
+    );
+    let flags_predicate = format!("{flags}\nlet _gate = ForkId::Bip16;\n");
+
+    let sigops = extract_fn(&repo("blvm-consensus/src/sigop.rs"), "count_sigops_in_script");
+    let sigops_boundary = sigops.replacen("i += 1 + len", "i += 1", 1);
+    let sigops_predicate = sigops.replacen(
+        "(OP_1..=OP_16).contains(&prev_op)",
+        "(OP_1..=OP_16).contains(&0u8)",
+        1,
+    );
+
+    let preimage = extract_fn(
+        &repo("blvm-consensus/src/transaction_hash.rs"),
+        "build_bip143_preimage",
+    );
+    let seq_boundary = preimage.replacen(
+        "anyone_can_pay || is_none || is_single",
+        "anyone_can_pay || is_none",
+        1,
+    );
+    let seq_predicate = preimage.replacen(
+        "anyone_can_pay || is_none || is_single",
+        "anyone_can_pay",
+        1,
+    );
+
+    let sep_boundary = eval.replacen("code_separator_pos = i + 1", "code_separator_pos = 0", 1);
+    let sep_predicate = eval.replace("&script[code_separator_pos..]", "&script[..]");
+
+    let elem_boundary = verify.replacen(
+        "witness_stack.iter().take(witness_stack.len() - 1)",
+        "witness_stack.iter()",
+        1,
+    );
+    let elem_predicate = verify.replace(
+        "witness_stack.iter().take(witness_stack.len() - 1)",
+        "witness_stack.iter()",
+    );
+
+    vec![
+        row(
+            "script_success",
+            "stack",
+            &stack,
+            &stack_boundary,
+            &stack_predicate,
+            script_success_query,
+        ),
+        row(
+            "block_script_mask",
+            "flags",
+            &flags,
+            &flags_boundary,
+            &flags_predicate,
+            block_script_mask_query,
+        ),
+        row(
+            "sigop_walk",
+            "sigop",
+            &sigops,
+            &sigops_boundary,
+            &sigops_predicate,
+            sigop_walk_query,
+        ),
+        row(
+            "hash_sequence",
+            "sighash",
+            &preimage,
+            &seq_boundary,
+            &seq_predicate,
+            hash_sequence_query,
+        ),
+        row(
+            "script_code_suffix",
+            "sighash",
+            &eval,
+            &sep_boundary,
+            &sep_predicate,
+            script_code_suffix_query,
+        ),
+        row(
+            "witness_element_bound",
+            "witness",
+            &verify,
+            &elem_boundary,
+            &elem_predicate,
+            witness_element_query,
+        ),
+    ]
+}
+
+fn script_success_query(src: &str) -> SatResult {
+    structural(
+        src.contains("flags::SCRIPT_VERIFY_CLEANSTACK) != 0")
+            && src.contains("!stack.is_empty() && cast_to_bool(stack.last()")
+            && src.contains(
+                "sigversion == SigVersion::WitnessV0 || sigversion == SigVersion::Tapscript",
+            )
+            && src.contains("stack.len() == 1 && cast_to_bool(&stack[0])"),
+    )
+}
+
+fn block_script_mask_query(src: &str) -> SatResult {
+    structural(
+        src.contains("SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT")
+            && !src.contains("ForkId::Bip16"),
+    )
+}
+
+fn sigop_walk_query(src: &str) -> SatResult {
+    structural(
+        src.contains("i += 1 + len") && src.contains("(OP_1..=OP_16).contains(&prev_op)"),
+    )
+}
+
+fn hash_sequence_query(src: &str) -> SatResult {
+    structural(src.contains("anyone_can_pay || is_none || is_single"))
+}
+
+fn script_code_suffix_query(src: &str) -> SatResult {
+    structural(
+        src.contains("code_separator_pos = i + 1")
+            && src.matches("&script[code_separator_pos..]").count() == 2,
+    )
+}
+
+fn witness_element_query(src: &str) -> SatResult {
+    structural(
+        src.matches("witness_stack.iter().take(witness_stack.len() - 1)")
+            .count()
+            == 3
+            && src.contains(
+                "signature_bytes.len() > max_witness_elem || pubkey_bytes.len() > max_witness_elem",
+            ),
+    )
 }
 
 fn layout_row(
@@ -1040,6 +1283,10 @@ fn encode_of_operation(op: &str) -> (u16, i64) {
         "within" => (K_WITHIN, 0),
         "size" => (K_SIZE, 0),
         "checksig" => (K_CHECKSIG, 0),
+        // Opcode-table cell for OP_CHECKSIGFROMSTACK while the csfs feature is off.
+        // The feature-off arm returns Ok(true) while scanning a tapscript, which
+        // classifies as a no-op. The feature-on body is SC-020, not this cell.
+        "success until CSFS is active" => (K_NOP, 0),
         "sigadd" => (K_SIGADD, 1),
         "bip65" => (K_BIP65, 0),
         "csv" => (K_CSV, 0),
@@ -1988,6 +2235,37 @@ mod tests {
         assert_eq!(diff, -1);
         let swapped = body.replace("b + a", "b - a");
         assert_ne!(classify(&body).kind, classify(&swapped).kind);
+    }
+
+    #[test]
+    fn sighash_base_is_locked() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let got = sighash_rows();
+        assert_eq!(got.len(), 1);
+        let row = &got[0];
+        assert_eq!(row.unpatched, SatResult::Unsat, "unpatched {}", row.note);
+        assert_eq!(row.boundary, SatResult::Sat, "boundary");
+        assert_eq!(row.predicate, SatResult::Sat, "predicate");
+        assert_eq!(sighash_base_modulus(), 32);
+    }
+
+    #[test]
+    fn connect_sentences_are_locked() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        for row in connect_sentence_rows() {
+            assert_eq!(
+                row.unpatched,
+                SatResult::Unsat,
+                "unpatched {}",
+                row.function
+            );
+            assert_eq!(row.boundary, SatResult::Sat, "boundary {}", row.function);
+            assert_eq!(row.predicate, SatResult::Sat, "predicate {}", row.function);
+        }
     }
 
     #[test]

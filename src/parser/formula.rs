@@ -1141,6 +1141,7 @@ fn lean_name(name: &str) -> String {
         "INITIALSUBSIDY" => "initialSubsidy".into(),
         "MAXMONEY" => "maxMoney".into(),
         "CheckTransaction" => "checkTransaction".into(),
+        "SighashBase" => "sighashBase".into(),
         other => other.to_string(),
     }
 }
@@ -1322,6 +1323,17 @@ mod tests {
         assert!(lean.contains("otherFn"));
         assert!(!lean.contains("getBlockSubsidy"));
         assert!(!lean.contains('H'));
+    }
+
+    #[test]
+    fn sighash_base_is_lean_only() {
+        let raw = r"\forall byte: \text{SighashBase}(byte) = byte \% 32";
+        let expr = parse_sentence(raw).expect("parse");
+        let lean = emit_lean(&expr).expect("lean");
+        assert!(lean.contains("sighashBase"), "{lean}");
+        assert!(lean.contains("Int.fmod"), "{lean}");
+        assert!(lean.contains("32"), "{lean}");
+        assert!(emit_z3(&expr, "byte").is_err());
     }
 
     #[test]

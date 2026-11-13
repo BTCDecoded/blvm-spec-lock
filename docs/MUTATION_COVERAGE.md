@@ -37,6 +37,13 @@ Unpatched production arms:
 | function | shape | unpatched | boundary | predicate |
 |---|---|---|---|---|
 | check_bip147 | threshold | UNSAT | SAT | SAT |
+| sighash_base | sighash | UNSAT | SAT | SAT |
+| script_success | stack | UNSAT | SAT | SAT |
+| block_script_mask | flags | UNSAT | SAT | SAT |
+| sigop_walk | sigop | UNSAT | SAT | SAT |
+| hash_sequence | sighash | UNSAT | SAT | SAT |
+| script_code_suffix | sighash | UNSAT | SAT | SAT |
+| witness_element_bound | witness | UNSAT | SAT | SAT |
 | checkmultisig_window | multisig | UNSAT | SAT | SAT |
 | deserialize_transaction_with_witness | tx-version | UNSAT | SAT | SAT |
 | calculate_block_hash | reorg-undo | UNSAT | SAT | SAT |
@@ -79,7 +86,7 @@ Unpatched production arms:
 
 ## Coverage
 
-locked / (locked + unlocked) = 34 / 34
+locked / (locked + unlocked) = 41 / 41
 
 Spec-sourced clauses: 25 locked rows take every clause value from the spec parse (opcode table, section 4 constants, header equations, inclusive ranges, the subsidy shift, and the numeric atoms and concatenations the paper already writes).
 `validate_block_header_fields` still proves the null merkle root from the prover. Section 5.3.1 says the merkle root is not part of `ValidBlockHeader`. Timestamp ≠ 0 and bits ≠ 0 are the parsed header equations.
@@ -87,6 +94,13 @@ ConnectBlock keeps every gate. The header-call patch leaves the weight compariso
 Hash compression stays uninterpreted.
 Residual, still locked: the verifier-call rows (`try_verify_p2pk_fast_path`, `try_verify_p2pkh_fast_path`, `try_verify_p2sh_fast_path`, `try_verify_p2wpkh_fast_path`, `OP_CHECKSIG_verifier`, and the result-equals-verifier conjunct on `verify_signature`, `verify_tapscript_schnorr_signature`, `verify_signature_from_stack`); ConnectBlock gates the existing patches do not break; the two pipelines; the five inductive rows; the median index; the program-counter and control-stack steps; `if_body_endif`; the script cache; reorg; block proof; and any row whose parsed sentence is weaker than the existing patch.
 - check_bip147
+- sighash_base
+- script_success
+- block_script_mask
+- sigop_walk
+- hash_sequence
+- script_code_suffix
+- witness_element_bound
 - checkmultisig_window
 - deserialize_transaction_with_witness
 - calculate_block_hash

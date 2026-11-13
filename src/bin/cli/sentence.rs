@@ -1788,6 +1788,7 @@ fn mutate_body(name: &str, body: &str) -> Result<String, String> {
         "C" => body.replace("100000000", "100000001"),
         "initialSubsidy" => body.replace("50 * C", "50 * C + 1"),
         "LocktimeType" => body.replace("500000000", "500000001"),
+        "sighashBase" => body.replace("% 32", "% 31"),
         _ => body.replacen(":= 0", ":= 1", 1),
     };
     if mutated == body {

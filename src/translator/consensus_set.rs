@@ -489,7 +489,10 @@ fn connect_sentence_rows() -> Vec<LockRow> {
     );
     let flags_predicate = format!("{flags}\nlet _gate = ForkId::Bip16;\n");
 
-    let sigops = extract_fn(&repo("blvm-consensus/src/sigop.rs"), "count_sigops_in_script");
+    let sigops = extract_fn(
+        &repo("blvm-consensus/src/sigop.rs"),
+        "count_sigops_in_script",
+    );
     let sigops_boundary = sigops.replacen("i += 1 + len", "i += 1", 1);
     let sigops_predicate = sigops.replacen(
         "(OP_1..=OP_16).contains(&prev_op)",
@@ -592,8 +595,11 @@ fn connect_sentence_rows() -> Vec<LockRow> {
                 body = body.replacen("187..=254", "188..=254", 1);
                 body
             },
-            &format!("{}\n{eval}", extract_fn(&script, "is_op_success"))
-                .replacen("if is_op_success(opcode)", "if false", 1),
+            &format!("{}\n{eval}", extract_fn(&script, "is_op_success")).replacen(
+                "if is_op_success(opcode)",
+                "if false",
+                1,
+            ),
             tapscript_op_success_query,
         ),
     ]
@@ -642,9 +648,7 @@ fn block_script_mask_query(src: &str) -> SatResult {
 }
 
 fn sigop_walk_query(src: &str) -> SatResult {
-    structural(
-        src.contains("i += 1 + len") && src.contains("(OP_1..=OP_16).contains(&prev_op)"),
-    )
+    structural(src.contains("i += 1 + len") && src.contains("(OP_1..=OP_16).contains(&prev_op)"))
 }
 
 fn hash_sequence_query(src: &str) -> SatResult {

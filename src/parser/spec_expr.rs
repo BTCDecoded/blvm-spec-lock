@@ -1802,20 +1802,16 @@ mod tests {
             "Under $total = base + wit$, when $0 \\leq base \\leq 4000000$, $3 \\times base + total = 4 \\times base + wit$.",
         );
         assert!(got.iter().any(|piece| piece == "total == base + wit"));
-        assert!(!got
-            .iter()
-            .any(|piece| piece.contains('3') && piece.contains("==")));
+        assert!(
+            !got.iter()
+                .any(|piece| piece.contains('3') && piece.contains("=="))
+        );
     }
 
     #[test]
     fn formula_paragraph_reads_a_requires_literal() {
-        let witness = when_assumptions(
-            "holds under `requires(height >= HALVING_INTERVAL * 33)`.",
-        );
-        assert_eq!(
-            witness,
-            vec!["height >= HALVING_INTERVAL * 33".to_string()]
-        );
+        let witness = when_assumptions("holds under `requires(height >= HALVING_INTERVAL * 33)`.");
+        assert_eq!(witness, vec!["height >= HALVING_INTERVAL * 33".to_string()]);
     }
 
     #[test]
@@ -1832,12 +1828,12 @@ mod tests {
         assert!(supply.contains(&format!("subsidy <= {}", protocol_u64("M_MAX"))));
         assert!(!supply.iter().any(|piece| piece.contains('+')));
 
-        let witness = when_assumptions(
-            "holds under `requires(height >= HALVING_INTERVAL * 33)`.",
+        let witness = when_assumptions("holds under `requires(height >= HALVING_INTERVAL * 33)`.");
+        assert!(
+            witness
+                .iter()
+                .any(|piece| piece == "height >= HALVING_INTERVAL * 33")
         );
-        assert!(witness
-            .iter()
-            .any(|piece| piece == "height >= HALVING_INTERVAL * 33"));
 
         let len = when_assumptions("when $2 \\leq len \\leq 100$.");
         assert_eq!(len, vec!["2 <= len".to_string(), "len <= 100".to_string()]);

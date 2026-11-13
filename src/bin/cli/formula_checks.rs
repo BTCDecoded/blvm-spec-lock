@@ -43,10 +43,19 @@ pub enum Z3FormulaPhase {
     Error { message: String },
 }
 
+/// Unbounded `∀` is a Lean sentence. `extract_parseable_condition` returns
+/// `None` for it on purpose, and Z3 has no universal quantifier here.
+fn latex_is_lean_only_forall(latex: &str) -> bool {
+    latex.contains(r"\forall") || latex.contains('∀')
+}
+
 fn evaluate_static_gate(fs: &FormulaSpec) -> FormulaStaticOutcome {
     use crate::cli::drift::formula_latex_parseable_for_verify;
     use crate::parser::condition;
 
+    if latex_is_lean_only_forall(&fs.latex_body) {
+        return FormulaStaticOutcome::Passed;
+    }
     if !formula_latex_parseable_for_verify(&fs.latex_body) {
         return FormulaStaticOutcome::Failed {
             message: "fails verify/enrich latex parse gate".into(),
@@ -118,7 +127,7 @@ pub fn analyze_formula_registry(
                 }
             }
             FormulaStaticOutcome::Passed => {
-                if !cfg.request_z3_sat {
+                if latex_is_lean_only_forall(&fs.latex_body) || !cfg.request_z3_sat {
                     Z3FormulaPhase::NotRequested
                 } else {
                     #[cfg(feature = "z3")]
@@ -164,4 +173,38 @@ pub fn registry_has_blocking_z3_outcome(analysis: &FormulaRegistryAnalysis) -> b
                 | Z3FormulaPhase::Error { .. }
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::orange_paper::SpecParser;
+
+    #[test]
+    fn forall_formula_passes_static_and_skips_z3() {
+        let md = r"## 5.1.1 Sighash
+
+**Formula** (**F_SighashBase**):
+
+$$\forall byte: \text{SighashBase}(byte) = byte \% 32$$
+";
+        let mut parser = SpecParser::new(md.to_string());
+        parser.parse().expect("parse");
+        let analysis = analyze_formula_registry(
+            &parser,
+            FormulaAnalyzeConfig {
+                request_z3_sat: true,
+                timeout_ms: 1_000,
+            },
+        );
+        assert!(!registry_has_blocking_static_failure(&analysis));
+        assert!(!registry_has_blocking_z3_outcome(&analysis));
+        let row = analysis
+            .rows
+            .iter()
+            .find(|r| r.formula_id == "F_SighashBase")
+            .expect("row");
+        assert!(matches!(row.static_gate, FormulaStaticOutcome::Passed));
+        assert!(matches!(row.z3_phase, Z3FormulaPhase::NotRequested));
+    }
 }

@@ -176,6 +176,8 @@ jobs:
 
       - name: Commit version bump
         if: steps.gate.outputs.do_release == 'true'
+        env:
+          REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -184,11 +186,35 @@ jobs:
             echo "No Cargo.toml changes to commit"
           else
             git commit -m "Bump version to ${{ steps.version.outputs.version }} for release [skip ci]"
-            if [ -n "${{ secrets.REPO_ACCESS_TOKEN }}" ]; then
-              git remote set-url origin "https://${{ secrets.REPO_ACCESS_TOKEN }}@github.com/${{ github.repository }}.git"
-              git push origin "HEAD:${{ github.ref_name }}"
+            if [ -n "${REPO_ACCESS_TOKEN}" ]; then
+              git remote set-url origin "https://${REPO_ACCESS_TOKEN}@github.com/${{ github.repository }}.git"
+              RELEASE_BRANCH="release/v${{ steps.version.outputs.version }}"
+              BASE="${{ github.ref_name }}"
+              git push origin "HEAD:${RELEASE_BRANCH}"
+              OWNER="${GITHUB_REPOSITORY%%/*}"
+              EXISTING=$(curl -sS -o /tmp/release-prs.json -w "%{http_code}" \
+                -H "Authorization: Bearer ${REPO_ACCESS_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls?head=${OWNER}:${RELEASE_BRANCH}&base=${BASE}&state=open" || echo "000")
+              if [ "${EXISTING}" = "200" ] && grep -q '"number"' /tmp/release-prs.json; then
+                echo "Pull request already open for ${RELEASE_BRANCH}"
+              else
+                PAYLOAD=$(printf '{"title":"Bump version to %s for release [skip ci]","head":"%s","base":"%s","body":"This pull request records the release version on main. It does not change consensus behavior. The title contains [skip ci] so merging it does not cut another release. The tag push is unchanged."}' "${{ steps.version.outputs.version }}" "${RELEASE_BRANCH}" "${BASE}")
+                CODE=$(curl -sS -o /tmp/release-pr.json -w "%{http_code}" \
+                  -X POST \
+                  -H "Authorization: Bearer ${REPO_ACCESS_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" \
+                  -d "${PAYLOAD}" || echo "000")
+                if [ "${CODE}" != "201" ]; then
+                  echo "::error::Version bump is on ${RELEASE_BRANCH} but the pull request was not opened (HTTP ${CODE})"
+                  exit 1
+                fi
+                echo "Opened pull request for ${RELEASE_BRANCH}"
+              fi
             else
-              echo "⚠️  REPO_ACCESS_TOKEN not set — cannot push version bump (set org/repo secret for auto bump on main)"
+              echo "⚠️  REPO_ACCESS_TOKEN not set — cannot open the version pull request"
+              exit 1
             fi
           fi
 
@@ -296,7 +322,7 @@ jobs:
           fi
 
       # Same as blvm-consensus "Create git tag": annotated v<version> after a successful publish.
-      # HEAD is the "Bump version" commit pushed above, i.e. the tree that was published.
+      # HEAD is the version-bump commit on the release branch, the tree that was published.
       - name: Create git tag
         if: steps.gate.outputs.do_release == 'true' && steps.publish.outputs.published == 'true'
         env:

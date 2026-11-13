@@ -524,6 +524,7 @@ fn connect_sentence_rows() -> Vec<LockRow> {
         "witness_stack.iter().take(witness_stack.len() - 1)",
         "witness_stack.iter()",
     );
+    let multisig = extract_fn(&script, "execute_opcode_with_context_full");
 
     vec![
         row(
@@ -574,7 +575,52 @@ fn connect_sentence_rows() -> Vec<LockRow> {
             &elem_predicate,
             witness_element_query,
         ),
+        row(
+            "checkmultisig_stack",
+            "multisig",
+            &multisig,
+            &multisig_boundary(&multisig),
+            &drop_executing_nulldummy(&multisig),
+            checkmultisig_stack_query,
+        ),
+        row(
+            "tapscript_op_success",
+            "opcode",
+            &format!("{}\n{eval}", extract_fn(&script, "is_op_success")),
+            &{
+                let mut body = format!("{}\n{eval}", extract_fn(&script, "is_op_success"));
+                body = body.replacen("187..=254", "188..=254", 1);
+                body
+            },
+            &format!("{}\n{eval}", extract_fn(&script, "is_op_success"))
+                .replacen("if is_op_success(opcode)", "if false", 1),
+            tapscript_op_success_query,
+        ),
     ]
+}
+
+fn drop_executing_nulldummy(src: &str) -> String {
+    let marker = "The extra element must be zero-length when NULLDUMMY is set.";
+    let Some(at) = src.find(marker) else {
+        return src.to_string();
+    };
+    let Some(rel) = src[at..].find("&& !dummy.is_empty()") else {
+        return src.to_string();
+    };
+    let start = at + rel;
+    let mut out = src.to_string();
+    out.replace_range(start..start + "&& !dummy.is_empty()".len(), "");
+    out
+}
+
+fn multisig_boundary(src: &str) -> String {
+    src.replacen("Pop n (number of public keys)", "POP_N_SLOT", 1)
+        .replacen(
+            "Pop m (number of required signatures)",
+            "Pop n (number of public keys)",
+            1,
+        )
+        .replacen("POP_N_SLOT", "Pop m (number of required signatures)", 1)
 }
 
 fn script_success_query(src: &str) -> SatResult {
@@ -609,6 +655,30 @@ fn script_code_suffix_query(src: &str) -> SatResult {
     structural(
         src.contains("code_separator_pos = i + 1")
             && src.matches("&script[code_separator_pos..]").count() == 2,
+    )
+}
+
+fn checkmultisig_stack_query(src: &str) -> SatResult {
+    let n = src.find("Pop n (number of public keys)");
+    let keys = src.find("Pop n public keys");
+    let m = src.find("Pop m (number of required signatures)");
+    let note = src.find("The extra element must be zero-length when NULLDUMMY is set.");
+    let empty = note.and_then(|at| src[at..].find("!dummy.is_empty()").map(|rel| at + rel));
+    structural(matches!(
+        (n, keys, m, note, empty),
+        (Some(n), Some(keys), Some(m), Some(note), Some(empty))
+            if n < keys && keys < m && m < note && note < empty
+    ))
+}
+
+fn tapscript_op_success_query(src: &str) -> SatResult {
+    structural(
+        src.contains("80 | 98")
+            && src.contains("126..=129")
+            && src.contains("187..=254")
+            && src.contains("if sigversion == SigVersion::Tapscript")
+            && src.contains("if is_op_success(opcode)")
+            && src.contains("opcode == crate::opcodes::OP_CHECKSIGFROMSTACK"),
     )
 }
 

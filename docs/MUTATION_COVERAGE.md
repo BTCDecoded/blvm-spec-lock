@@ -44,6 +44,8 @@ Unpatched production arms:
 | hash_sequence | sighash | UNSAT | SAT | SAT |
 | script_code_suffix | sighash | UNSAT | SAT | SAT |
 | witness_element_bound | witness | UNSAT | SAT | SAT |
+| checkmultisig_stack | multisig | UNSAT | SAT | SAT |
+| tapscript_op_success | opcode | UNSAT | SAT | SAT |
 | checkmultisig_window | multisig | UNSAT | SAT | SAT |
 | deserialize_transaction_with_witness | tx-version | UNSAT | SAT | SAT |
 | calculate_block_hash | reorg-undo | UNSAT | SAT | SAT |
@@ -86,7 +88,7 @@ Unpatched production arms:
 
 ## Coverage
 
-locked / (locked + unlocked) = 41 / 41
+locked / (locked + unlocked) = 43 / 43
 
 Spec-sourced clauses: 25 locked rows take every clause value from the spec parse (opcode table, section 4 constants, header equations, inclusive ranges, the subsidy shift, and the numeric atoms and concatenations the paper already writes).
 `validate_block_header_fields` still proves the null merkle root from the prover. Section 5.3.1 says the merkle root is not part of `ValidBlockHeader`. Timestamp ≠ 0 and bits ≠ 0 are the parsed header equations.
@@ -101,6 +103,8 @@ Residual, still locked: the verifier-call rows (`try_verify_p2pk_fast_path`, `tr
 - hash_sequence
 - script_code_suffix
 - witness_element_bound
+- checkmultisig_stack
+- tapscript_op_success
 - checkmultisig_window
 - deserialize_transaction_with_witness
 - calculate_block_hash

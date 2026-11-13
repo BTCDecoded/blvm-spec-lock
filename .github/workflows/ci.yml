@@ -3,8 +3,16 @@ name: CI
 on:
   push:
     branches: [ main, develop ]
+    paths-ignore:
+      - ".github/**"
+      - "docs/**"
+      - "**/*.md"
   pull_request:
     branches: [ main, develop ]
+    paths-ignore:
+      - ".github/**"
+      - "docs/**"
+      - "**/*.md"
   workflow_dispatch:
 
 permissions:
@@ -15,17 +23,22 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: '1'
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: Test
     runs-on: [self-hosted, Linux, X64, builds]
 
     if: |
-      github.event_name != 'push' ||
+      (github.event_name != 'pull_request' || (!contains(github.event.pull_request.title, '[skip ci]') && !contains(github.event.pull_request.title, '[ci skip]') && !contains(github.event.pull_request.title, '[no ci]'))) &&
+      (github.event_name != 'push' ||
       github.event.head_commit == null ||
       (!contains(github.event.head_commit.message, '[skip ci]') &&
        !contains(github.event.head_commit.message, '[ci skip]') &&
-       !contains(github.event.head_commit.message, '[no ci]'))
+       !contains(github.event.head_commit.message, '[no ci]')))
     steps:
       - uses: actions/checkout@v6
 
@@ -38,11 +51,13 @@ jobs:
       # Single job + no incremental: avoids flaky "could not parse/generate dep info" (.d missing)
       # on self-hosted runners (NFS / high parallelism / cache races).
       - name: Build cargo-spec-lock binary
+        if: github.event_name != 'pull_request'
         env:
           CARGO_INCREMENTAL: "0"
         run: cargo build --release -j 1 --bin cargo-spec-lock
 
       - name: Test
+        if: github.event_name != 'pull_request'
         run: cargo test --workspace --all-features
 
       - name: Clippy

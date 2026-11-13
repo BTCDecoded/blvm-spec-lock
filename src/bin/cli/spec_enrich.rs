@@ -807,7 +807,9 @@ $SMK = 7$
         let n = enrich_functions_with_spec(&mut functions, &[md_path]).expect("enrich");
         assert_eq!(n, 1);
         assert!(functions[0].contracts.is_empty());
-        assert!(!functions[0].parse_gap);
+        // The name is not in the section, so there is no contract to verify.
+        // That is a gap. It must not inherit GetBlockSubsidy's clause.
+        assert!(functions[0].parse_gap);
         assert_eq!(functions[1].contracts.len(), 1);
         assert!(
             functions[1].contracts[0]

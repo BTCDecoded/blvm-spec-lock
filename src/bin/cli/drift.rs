@@ -178,7 +178,8 @@ pub fn detect_drift(
                     })
                     .collect();
                 let covered = covering.iter().any(|m| {
-                    specs.iter()
+                    specs
+                        .iter()
                         .any(|s| contracts_similar(&s.condition, &m.condition))
                 });
                 if covered || covering.is_empty() {

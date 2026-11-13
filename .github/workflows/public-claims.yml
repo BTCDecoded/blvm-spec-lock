@@ -1,0 +1,17 @@
+name: Public claims
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  phrases:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Reject status phrases that have no evidence
+        run: python3 scripts/check-public-claims.py

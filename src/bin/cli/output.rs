@@ -145,6 +145,7 @@ pub fn format_verify_json_report(
         results,
         formula_registry,
         &crate::cli::lean_evidence::EvidenceOverlay::empty(),
+        None,
     )
 }
 
@@ -152,6 +153,7 @@ pub fn format_verify_json_report_with(
     results: &[(FunctionToVerify, VerificationResult)],
     formula_registry: Option<(&FormulaRegistryAnalysis, FormulaVerifyJsonFlags)>,
     overlay: &crate::cli::lean_evidence::EvidenceOverlay,
+    buckets: Option<&[crate::cli::mutation_gate::GateRow]>,
 ) -> String {
     use crate::cli::lean_evidence::{SLOTS, from_verify, tally};
     use serde_json::json;
@@ -171,7 +173,7 @@ pub fn format_verify_json_report_with(
 
     let mut json_results = Vec::new();
     let mut assigned = Vec::new();
-    for (func, result) in results {
+    for (index, (func, result)) in results.iter().enumerate() {
         let evidence = from_verify(func, result, overlay);
         assigned.push(evidence.clone());
         let mut result_obj = json!({
@@ -244,6 +246,12 @@ pub fn format_verify_json_report_with(
         result_obj["lean_declaration"] = json!(evidence.lean_declaration);
         result_obj["lean_classification"] = json!(evidence.lean_classification);
         result_obj["lean_covered"] = json!(evidence.lean_covered);
+        if let Some(rows) = buckets {
+            if let Some(row) = rows.get(index) {
+                result_obj["proof_bucket"] = json!(row.bucket.as_str());
+                result_obj["proof_bucket_reason"] = json!(row.reason);
+            }
+        }
 
         json_results.push(result_obj);
     }
@@ -287,6 +295,19 @@ pub fn format_verify_json_report_with(
         },
         "results": json_results,
     });
+
+    if let Some(rows) = buckets {
+        let mut proof_buckets = serde_json::Map::new();
+        for row in rows {
+            let key = row.bucket.as_str().to_string();
+            let count = proof_buckets
+                .get(&key)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            proof_buckets.insert(key, json!(count + 1));
+        }
+        output_val["summary"]["proof_buckets"] = json!(proof_buckets);
+    }
 
     if let Some((analysis, flags)) = formula_registry {
         if let Ok(nested) = serde_json::from_str::<serde_json::Value>(

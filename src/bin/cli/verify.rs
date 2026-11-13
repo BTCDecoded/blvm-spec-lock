@@ -287,7 +287,7 @@ fn parse_file_for_functions(file_path: &std::path::Path) -> Result<Vec<FunctionT
     Ok(functions)
 }
 
-fn make_function_to_verify(
+pub(crate) fn make_function_to_verify(
     file_path: &std::path::Path,
     function_name: &str,
     attrs: &[Attribute],

@@ -148,11 +148,20 @@ enum Commands {
         #[arg(long)]
         strict: bool,
 
+        /// Exit 1 when any result is Partial. Off unless set. `--strict` does not do this.
+        #[arg(long)]
+        reject_partial: bool,
+
+        /// Classify each passing function by body edits and write `proof_bucket` into the verify JSON.
+        /// Off unless set. Does not change the verify status and does not reject Partial.
+        #[arg(long)]
+        mutation_gate: bool,
+
         /// Path to Orange Paper (can pass multiple: --spec-path A B or --spec-path A,B)
         #[arg(long, num_args = 1.., value_delimiter = ',')]
         spec_path: Vec<PathBuf>,
 
-        /// Write verify JSON report (same as `--format json`, `report_format` 1) to PATH in addition to stdout (any `--format`, e.g. human + sidecar JSON for CI).
+        /// Write verify JSON report (`report_format` 2) to PATH in addition to stdout (any `--format`, e.g. human + sidecar JSON for CI).
         #[arg(long, value_name = "PATH")]
         json_out: Option<PathBuf>,
 
@@ -377,6 +386,8 @@ struct VerifyArgs {
     sections: Vec<String>,
     format: OutputFormat,
     strict: bool,
+    reject_partial: bool,
+    mutation_gate: bool,
     spec_paths: Vec<PathBuf>,
     timeout_secs: u64,
     json_out: Option<PathBuf>,
@@ -413,6 +424,8 @@ fn main() {
             timeout,
             verbose: _,
             strict,
+            reject_partial,
+            mutation_gate,
             spec_path,
             files,
             json_out,
@@ -425,6 +438,8 @@ fn main() {
             sections: section,
             format,
             strict,
+            reject_partial,
+            mutation_gate,
             spec_paths: resolve_spec_paths(spec_path),
             timeout_secs: timeout,
             json_out,
@@ -811,6 +826,8 @@ fn handle_verify(args: VerifyArgs) -> i32 {
         sections,
         format,
         strict: strict_cli,
+        reject_partial: reject_partial_cli,
+        mutation_gate: mutation_gate_cli,
         spec_paths,
         timeout_secs,
         json_out,
@@ -822,6 +839,14 @@ fn handle_verify(args: VerifyArgs) -> i32 {
             std::env::var("SPEC_LOCK_STRICT").as_deref(),
             Ok("1") | Ok("true") | Ok("yes")
         );
+    let flag = |name: &str| {
+        matches!(
+            std::env::var(name).as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        )
+    };
+    let reject_partial = reject_partial_cli || flag("SPEC_LOCK_REJECT_PARTIAL");
+    let mutation_gate = mutation_gate_cli || flag("SPEC_LOCK_MUTATION_GATE");
 
     // Richer / heavier Z3 obligations: raise timeout without changing CI invocations.
     // Overrides `--timeout` when set to a positive integer (seconds per function).
@@ -1043,12 +1068,23 @@ fn handle_verify(args: VerifyArgs) -> i32 {
     };
 
     let sentence_counts = sentence_counts_of(&spec_paths);
+    let buckets = if mutation_gate {
+        Some(
+            results
+                .iter()
+                .map(|(func, result)| cli::mutation_gate::classify(func, result, timeout_secs))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
     let printed = match format {
         OutputFormat::Json => {
             let raw = cli::output::format_verify_json_report_with(
                 &results,
                 formula_registry_for_json.as_ref().map(|(a, f)| (a, *f)),
                 &overlay,
+                buckets.as_deref(),
             );
             cli::output::set_sentence_counts(&raw, &sentence_counts)
         }
@@ -1062,6 +1098,7 @@ fn handle_verify(args: VerifyArgs) -> i32 {
                 &results,
                 formula_registry_for_json.as_ref().map(|(a, f)| (a, *f)),
                 &overlay,
+                buckets.as_deref(),
             ),
             &sentence_counts,
         );
@@ -1106,7 +1143,20 @@ fn handle_verify(args: VerifyArgs) -> i32 {
         }
     };
 
-    if has_failures || has_no_contracts || lean_failed.is_some() || sentence_failed {
+    let partial_rejected = reject_partial
+        && results
+            .iter()
+            .any(|(_, result)| matches!(result, cli::verify::VerificationResult::Partial { .. }));
+    if partial_rejected {
+        eprintln!("reject-partial: at least one result is Partial");
+    }
+
+    if has_failures
+        || has_no_contracts
+        || lean_failed.is_some()
+        || sentence_failed
+        || partial_rejected
+    {
         1
     } else {
         0

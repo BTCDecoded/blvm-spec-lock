@@ -156,28 +156,41 @@ pub fn detect_drift(
             .collect();
 
         if !manual.is_empty() && !spec.is_empty() {
+            // One handwritten clause that matches a spec clause covers that
+            // contract type. Extra bounds on the same type are not drift, and
+            // they are not printed against the first spec clause.
+            let mut seen = Vec::new();
             for m in &manual {
-                let has_match = spec.iter().any(|s| {
-                    s.contract_type == m.contract_type
-                        && contracts_similar(&s.condition, &m.condition)
+                if !seen.contains(&m.contract_type) {
+                    seen.push(m.contract_type);
+                }
+            }
+            for ty in seen {
+                let specs: Vec<_> = spec.iter().filter(|s| s.contract_type == ty).collect();
+                if specs.is_empty() {
+                    continue;
+                }
+                let covering: Vec<_> = manual
+                    .iter()
+                    .filter(|m| m.contract_type == ty)
+                    .filter(|m| {
+                        !is_implied_unsigned_nonneg(&m.condition, func.function_sig.as_ref())
+                    })
+                    .collect();
+                let covered = covering.iter().any(|m| {
+                    specs.iter()
+                        .any(|s| contracts_similar(&s.condition, &m.condition))
                 });
-                if !has_match {
-                    // A lone `x >= 0` / `0 <= x` on an unsigned witness variable
-                    // is implied by the Rust type, so a missing Orange Paper
-                    // lower bound is not drift. Signed or unresolvable types
-                    // still count as a mismatch.
-                    if is_implied_unsigned_nonneg(&m.condition, func.function_sig.as_ref()) {
-                        continue;
-                    }
-                    // Find the first spec contract of the same type for the mismatch report.
-                    if let Some(s) = spec.iter().find(|s| s.contract_type == m.contract_type) {
-                        mismatched_contracts.push(MismatchedContract {
-                            function: func.clone(),
-                            orange_paper_contract: s.condition.clone(),
-                            implementation_contract: m.condition.clone(),
-                            section: func.section.clone().unwrap_or_default(),
-                        });
-                    }
+                if covered || covering.is_empty() {
+                    continue;
+                }
+                if let (Some(s), Some(m)) = (specs.first(), covering.first()) {
+                    mismatched_contracts.push(MismatchedContract {
+                        function: func.clone(),
+                        orange_paper_contract: s.condition.clone(),
+                        implementation_contract: m.condition.clone(),
+                        section: func.section.clone().unwrap_or_default(),
+                    });
                 }
             }
         }
@@ -509,9 +522,10 @@ fn is_implied_unsigned_nonneg(condition: &str, func: Option<&syn::ItemFn>) -> bo
 
 /// Check if two contracts are similar (allows for minor formatting differences)
 fn contracts_similar(spec: &str, impl_contract: &str) -> bool {
-    // Normalize both contracts
-    let spec_norm = normalize_contract(spec);
-    let impl_norm = normalize_contract(impl_contract);
+    // Normalize both contracts, then fold identifier spelling that is the
+    // same predicate: `t_0`/`t0`, `|bytes|`/`len`, `|pk|`/`pk_len`.
+    let spec_norm = similarity_key(spec);
+    let impl_norm = similarity_key(impl_contract);
 
     // Spec `Defined: true` / literal true is the weakest postcondition — any tighter
     // inline #[ensures] on the implementation is a valid refinement, not drift.
@@ -556,6 +570,47 @@ fn bound_numeric_tokens(s: &str) -> String {
     }
     flush(&mut digits, &mut out);
     out
+}
+
+/// Comparison key. Underscores and absolute-value bars are dropped.
+/// `bytes` is `len`. An identifier ending in `len` (`pk_len`, `sig_len`) is its stem.
+fn similarity_key(contract: &str) -> String {
+    let normalized = normalize_contract(contract);
+    let mut out = String::new();
+    let mut ident = String::new();
+    let flush = |ident: &mut String, out: &mut String| {
+        if ident.is_empty() {
+            return;
+        }
+        out.push_str(&canonical_ident(ident));
+        ident.clear();
+    };
+    for c in normalized.chars() {
+        if c == '|' {
+            continue;
+        }
+        if c.is_ascii_alphanumeric() || c == '_' {
+            ident.push(c);
+        } else {
+            flush(&mut ident, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut ident, &mut out);
+    out
+}
+
+fn canonical_ident(ident: &str) -> String {
+    let stripped: String = ident.chars().filter(|c| *c != '_').collect();
+    if stripped == "bytes" {
+        return "len".to_string();
+    }
+    if let Some(stem) = stripped.strip_suffix("len") {
+        if !stem.is_empty() && stem.chars().all(|c| c.is_ascii_alphabetic()) {
+            return stem.to_string();
+        }
+    }
+    stripped
 }
 
 /// Normalize contract string for comparison
@@ -919,6 +974,23 @@ mod tests {
     fn shorter_literal_is_not_a_prefix_of_locktime_threshold() {
         assert!(!contracts_similar("x < 50000000", "x < LOCKTIME_THRESHOLD"));
         assert!(!contracts_similar("x < LOCKTIME_THRESHOLD", "x < 50000000"));
+    }
+
+    #[test]
+    fn spelling_of_the_same_predicate_matches() {
+        assert!(contracts_similar("t_0 <= t_1", "t0 <= t1"));
+        assert!(contracts_similar("bytes > 1", "len > 1"));
+        assert!(contracts_similar("|bytes| > 1", "len > 1"));
+        assert!(contracts_similar("pk > 0", "pk_len > 0"));
+        assert!(contracts_similar("sig == 0", "sig_len == 0"));
+    }
+
+    #[test]
+    fn a_halving_bound_is_not_the_epoch_index() {
+        assert!(!contracts_similar(
+            "k >= 33",
+            "height >= HALVING_INTERVAL * 33"
+        ));
     }
 
     #[test]

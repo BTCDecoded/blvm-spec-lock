@@ -641,6 +641,9 @@ pub struct SpecCoverageReport {
     pub unparseable_contracts: usize,
     pub impl_functions_with_contracts: usize,
     pub impl_functions_without_contracts: usize,
+    /// `#[spec_locked]` functions discovered in the crate. A parsed contract is
+    /// `impl_functions_with_contracts`. The rest are `impl_functions_without_contracts`.
+    pub total_spec_locked: usize,
     /// Same fields as [`CoverageStats`] — from one merged **`SpecParser`** pass (parse gate = **`check-drift`** formulas).
     pub formulas_defined: usize,
     pub formulas_parseable_body: usize,
@@ -738,6 +741,7 @@ pub fn generate_spec_coverage_report(
         unparseable_contracts,
         impl_functions_with_contracts: stats.with_contracts,
         impl_functions_without_contracts: stats.without_contracts,
+        total_spec_locked: stats.total_spec_locked,
         formulas_defined: stats.formulas_defined,
         formulas_parseable_body: stats.formulas_parseable_body,
         formulas_bound_to_rust: stats.formulas_bound_to_rust,
@@ -850,6 +854,7 @@ pub fn format_spec_coverage_json(report: &SpecCoverageReport) -> String {
         "parseable_percent": if report.total_contracts > 0 { 100.0 * report.parseable_contracts as f64 / report.total_contracts as f64 } else { 0.0 },
         "impl_with_contracts": report.impl_functions_with_contracts,
         "impl_without_contracts": report.impl_functions_without_contracts,
+        "total_spec_locked": report.total_spec_locked,
         "formulas_defined": report.formulas_defined,
         "formulas_parseable_body": report.formulas_parseable_body,
         "formulas_bound_to_rust": report.formulas_bound_to_rust,

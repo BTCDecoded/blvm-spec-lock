@@ -2428,14 +2428,16 @@ impl Z3Translator {
             }
             if args_are_int {
                 let applied = self.apply_int_fn(&slot, &arg_asts);
-                vars.insert(slot, applied.clone());
+                bind_known_call(vars, &name, &slot, applied.clone());
                 return Ok(applied);
             }
             let var = vars.entry(slot.clone()).or_insert_with(|| {
                 let symbol = z3::Symbol::String(slot.clone());
                 Int::new_const(&self.ctx, symbol).into()
             });
-            return Ok(var.clone());
+            let applied = var.clone();
+            bind_known_call(vars, &name, &slot, applied.clone());
+            return Ok(applied);
         }
         // Production locktime::locktime_types_match: (a < T) == (b < T).
         // Interpret it; a fresh UF makes check_bip65 type-level-only.
@@ -32969,6 +32971,23 @@ fn known_uninterpreted_function(name: &str) -> Option<(&'static str, Option<usiz
         "calculate_transaction_sighash_with_script_code" => Some(("sighash_script", None)),
         "build_time_context" => Some(("build_time_context", None)),
         _ => None,
+    }
+}
+
+/// `TotalSupply` is the Z3 function name. Callee postconditions look up
+/// `call_{fn}_result`, so that name has to point at the same term.
+#[cfg(feature = "z3")]
+fn bind_known_call<'a>(
+    vars: &mut Z3VarMap<'a>,
+    name: &str,
+    slot: &str,
+    applied: z3::ast::Dynamic<'a>,
+) {
+    vars.insert(slot.to_string(), applied.clone());
+    let base = name.split("::").last().unwrap_or(name);
+    let alias = format!("call_{base}_result");
+    if alias != slot {
+        vars.insert(alias, applied);
     }
 }
 

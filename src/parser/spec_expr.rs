@@ -1578,6 +1578,27 @@ pub fn when_assumptions(trailing: &str) -> Vec<String> {
                 out.push(piece.to_string());
             }
         }
+        // `$total = base + wit` is the witness antecedent. A product on either
+        // side (`3 * base + total = 4 * base + wit`) is the claim, not a requires.
+        if let Some(eq) = param_sum_equality(&substituted) {
+            if !out.iter().any(|seen| seen == &eq) {
+                out.push(eq);
+            }
+        }
+    }
+    // The formula prose names the witness antecedent in backticks:
+    // `requires(height >= HALVING_INTERVAL * 33)`.
+    let mut i = 0;
+    while let Some(rel) = trailing[i..].find("requires(") {
+        let start = i + rel + "requires(".len();
+        let Some(end_rel) = trailing[start..].find(')') else {
+            break;
+        };
+        let body = trailing[start..start + end_rel].trim();
+        if !body.is_empty() && !out.iter().any(|seen| seen == body) {
+            out.push(body.to_string());
+        }
+        i = start + end_rel + 1;
     }
     out
 }
@@ -1706,6 +1727,43 @@ fn split_chain(text: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// `total = base + wit` becomes `total == base + wit`. One side is a single
+/// parameter and the other is a sum of parameters. Anything with a coefficient
+/// is left alone.
+fn param_sum_equality(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut eq_at = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' {
+            let prev = i > 0 && matches!(bytes[i - 1], b'<' | b'>' | b'!' | b'=');
+            let next = i + 1 < bytes.len() && bytes[i + 1] == b'=';
+            if !prev && !next {
+                if eq_at.is_some() {
+                    return None;
+                }
+                eq_at = Some(i);
+            }
+            if next {
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    let at = eq_at?;
+    let left = text[..at].trim();
+    let right = text[at + 1..].trim();
+    let (param, sum) = if is_single_param(left) && right.contains('+') && is_param_sum(right) {
+        (left, right)
+    } else if is_single_param(right) && left.contains('+') && is_param_sum(left) {
+        (right, left)
+    } else {
+        return None;
+    };
+    Some(format!("{param} == {sum}"))
+}
+
 fn is_domain_comparison(text: &str) -> bool {
     let ops = comparison_ops(text);
     if ops.len() != 1 {
@@ -1739,6 +1797,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn formula_paragraph_reads_a_param_sum_equality() {
+        let got = when_assumptions(
+            "Under $total = base + wit$, when $0 \\leq base \\leq 4000000$, $3 \\times base + total = 4 \\times base + wit$.",
+        );
+        assert!(got.iter().any(|piece| piece == "total == base + wit"));
+        assert!(!got
+            .iter()
+            .any(|piece| piece.contains('3') && piece.contains("==")));
+    }
+
+    #[test]
+    fn formula_paragraph_reads_a_requires_literal() {
+        let witness = when_assumptions(
+            "holds under `requires(height >= HALVING_INTERVAL * 33)`.",
+        );
+        assert_eq!(
+            witness,
+            vec!["height >= HALVING_INTERVAL * 33".to_string()]
+        );
+    }
+
+    #[test]
     fn formula_paragraph_reads_section4_bounds() {
         if !consensus_workspace_present() {
             return;
@@ -1751,6 +1831,13 @@ mod tests {
         assert!(supply.contains(&format!("supply <= {}", protocol_u64("M_MAX"))));
         assert!(supply.contains(&format!("subsidy <= {}", protocol_u64("M_MAX"))));
         assert!(!supply.iter().any(|piece| piece.contains('+')));
+
+        let witness = when_assumptions(
+            "holds under `requires(height >= HALVING_INTERVAL * 33)`.",
+        );
+        assert!(witness
+            .iter()
+            .any(|piece| piece == "height >= HALVING_INTERVAL * 33"));
 
         let len = when_assumptions("when $2 \\leq len \\leq 100$.");
         assert_eq!(len, vec!["2 <= len".to_string(), "len <= 100".to_string()]);

@@ -455,11 +455,14 @@ pub fn enrich_functions_with_spec(
                 // Properties were found and none parsed. Partial, not `ensures(true)`.
                 func.parse_gap = true;
             }
+        } else if parser.find_section(section_ref).is_some() {
+            // The section exists and does not name this function. There is no
+            // contract to verify. A partial stays visible; it is not a hard failure.
+            func.parse_gap = true;
         }
 
-        // Leave an empty list only when the function was not found in the spec.
-        // An empty list there is "missing from spec". A found section with no
-        // parseable property is handled above.
+        // An unknown section stays an empty list. Drift reports that as missing
+        // from the spec. A found section with no parseable property is a gap.
     }
 
     Ok(enriched_count)
@@ -862,6 +865,28 @@ $SMK = 7$
         let n = enrich_functions_with_spec(&mut functions, &[md_path]).expect("enrich");
         assert_eq!(n, 0);
         assert!(functions[0].contracts.is_empty());
+    }
+
+    #[test]
+    fn named_lock_missing_from_an_existing_section_is_a_gap() {
+        let dir = std::env::temp_dir().join(format!(
+            "spec_lock_named_miss_{}_{}",
+            std::process::id(),
+            rand_unique()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let md_path = dir.join("reorg.md");
+        std::fs::write(
+            &md_path,
+            "## 11.3 Reorganize\n\n**ShouldReorganize**: $h \\to r$\n\n**Properties**:\n- Work: $result \\geq 0$\n",
+        )
+        .expect("write fixture");
+        let _cleanup_dir = TmpDirCleanup(dir);
+        let mut functions = vec![gap_fn("GetBlockProof", "11.3")];
+        let n = enrich_functions_with_spec(&mut functions, &[md_path]).expect("enrich");
+        assert_eq!(n, 0);
+        assert!(functions[0].contracts.is_empty());
+        assert!(functions[0].parse_gap);
     }
 
     #[test]

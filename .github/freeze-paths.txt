@@ -1,0 +1,2 @@
+# The checker. Bugfixes need the freeze marker and a green verify on the consensus crate.
+src/

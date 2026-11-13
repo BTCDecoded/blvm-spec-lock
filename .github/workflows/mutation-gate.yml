@@ -1,0 +1,50 @@
+# Manual. Not a required merge check. Partial stays a passing exit
+# unless the dispatch passes --reject-partial, which this workflow does not.
+name: Mutation gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Body-edit buckets
+    runs-on: [self-hosted, Linux, X64, builds]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/checkout@v6
+        with:
+          repository: BTCDecoded/blvm-consensus
+          path: blvm-consensus
+
+      - uses: actions/checkout@v6
+        with:
+          repository: BTCDecoded/blvm-spec
+          path: blvm-spec
+
+      - name: Install Rust
+        uses: BTCDecoded/rust-ci/install-rust-toolchain@main
+
+      - name: Verify and write proof buckets
+        env:
+          CARGO_INCREMENTAL: "0"
+          SPEC_LOCK_MUTATION_GATE: "1"
+        run: |
+          cargo run --release -j 1 --bin cargo-spec-lock -- verify \
+            --crate-path blvm-consensus \
+            --spec-path blvm-spec/PROTOCOL.md blvm-spec/ARCHITECTURE.md \
+            --timeout 15 \
+            --mutation-gate \
+            --json-out mutation-gate.json
+          python3 - << 'PY'
+          import json
+          report = json.load(open("mutation-gate.json"))
+          buckets = report["summary"]["proof_buckets"]
+          print(buckets)
+          counted = sum(buckets.values())
+          assert counted == report["summary"]["total"], (counted, report["summary"]["total"])
+          PY

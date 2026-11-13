@@ -203,8 +203,13 @@ cargo spec-lock summary --crate-path . --format badge
 # Basic verification (fail on any Failed)
 cargo spec-lock verify --spec-path ../blvm-spec/THE_ORANGE_PAPER.md --crate-path .
 
-# Partial exits 0. Reject it by checking .summary.partial, not --strict.
+# Partial exits 0. Reject it by checking .summary.partial, or pass --reject-partial.
+# --strict does not reject Partial.
 cargo spec-lock verify --spec-path ../blvm-spec/PROTOCOL.md ../blvm-spec/ARCHITECTURE.md --crate-path .
+
+# Proof buckets. A passing check is proved from the body only when two body edits fail it.
+# This does not change the exit code.
+cargo spec-lock verify --spec-path ../blvm-spec/PROTOCOL.md ../blvm-spec/ARCHITECTURE.md --crate-path . --mutation-gate --json-out verify.json
 
 # JUnit for CI reporting
 cargo spec-lock verify --spec-path ... --crate-path . --format junit > spec-lock.xml
@@ -212,9 +217,9 @@ cargo spec-lock verify --spec-path ... --crate-path . --format junit > spec-lock
 
 ## Lock Coverage
 
-| Crate | Locked | Notes |
+| Crate | What is counted | Notes |
 |-------|--------|-------|
-| blvm-consensus | 148 | 100% Z3 verified |
+| blvm-consensus | 13 functions proved from the body | The check passes, and two body edits make it fail. A passing check is not that count. See the README. |
 | blvm-node | 5 | Dandelion 10.6 |
 | blvm-protocol | 3 | UTXO commitments 11.4 |
 

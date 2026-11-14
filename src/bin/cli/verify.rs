@@ -6078,8 +6078,9 @@ mod compact_target_identity {
         let mant = "(bits % 8388608)";
         let right = scale_div(mant, "(3 - ((bits / 16777216) % 256))", 3);
         let left = scale_mul(mant, "(((bits / 16777216) % 256) - 3)", 32);
-        let err =
-            format!("{exp} < 3 || {exp} > 32 || ({mant} != 0 && {exp} > 3 && ({exp} - 3) >= 32)");
+        let err = format!(
+            "{mant} != 0 && ({exp} > 34 || ({mant} > 255 && {exp} > 33) || ({mant} > 65535 && {exp} > 32))"
+        );
         let identity = format!(
             "result_is_err == (if {err} {{ 1 }} else {{ 0 }}) && result == (if {err} {{ 0 }} else if {mant} == 0 {{ 0 }} else if {exp} <= 3 {{ {right} }} else {{ {left} }})"
         );
@@ -6112,10 +6113,8 @@ mod compact_target_identity {
         }
 
         let src = quote::quote!(#func).to_string();
-        let range = src
-            .replace("3 ..= 32", "4 ..= 32")
-            .replace("3..=32", "4..=32");
-        assert_ne!(range, src, "the exponent floor must change, got {src}");
+        let range = src.replace("exponent > 34", "exponent > 35");
+        assert_ne!(range, src, "the overflow bound must change, got {src}");
         let range: syn::ItemFn = syn::parse_str(&range).expect("range");
         let range_result = identity_query(&range);
         assert!(
@@ -6126,7 +6125,7 @@ mod compact_target_identity {
                     ..
                 }
             ),
-            "raising the exponent floor must flip the identity, got {range_result:?}"
+            "raising the overflow bound must flip the identity, got {range_result:?}"
         );
 
         let mask = src

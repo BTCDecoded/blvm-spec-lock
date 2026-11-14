@@ -3821,12 +3821,16 @@ impl Z3Translator {
         let right = exp.le(&bias);
         let right_k = bias.clone() - exp.clone();
         let left_k = exp.clone() - bias;
-        let too_big = left_k.ge(&Int::from_i64(&self.ctx, parsed.byte_limit));
         let right_val = self.scale_div(&mant, &right_k, parsed.bias);
         let left_val = self.scale_mul(&mant, &left_k, parsed.byte_limit);
         let zero_i = Int::from_i64(&self.ctx, 0);
         let one = Int::from_i64(&self.ctx, 1);
-        let is_err = in_range.not() | (zero.not() & right.not() & too_big);
+        let past = exp.gt(&Int::from_i64(&self.ctx, parsed.over_exp));
+        let mid = mant.gt(&Int::from_i64(&self.ctx, parsed.mid_mant))
+            & exp.gt(&Int::from_i64(&self.ctx, parsed.mid_exp));
+        let low = mant.gt(&Int::from_i64(&self.ctx, parsed.low_mant))
+            & exp.gt(&Int::from_i64(&self.ctx, parsed.low_exp));
+        let is_err = in_range.not() | (zero.not() & (past | mid | low));
         let value = zero.ite(&zero_i, &right.ite(&right_val, &left_val));
         Some(flag._eq(&is_err.ite(&one, &zero_i)) & result._eq(&is_err.ite(&zero_i, &value)))
     }
@@ -7347,12 +7351,11 @@ impl Z3Translator {
     }
 
     /// Difficulty adjustment for `get_next_work_required` and its internal
-    /// body. Too few headers, reversed timestamps, a zero expanded target, a
-    /// product that does not fit, a zero divided target, and a zero compressed
-    /// result are errors. The timespan is clamped, then the expanded target is
-    /// multiplied and divided. `expand_target` and `compress_target` stay
-    /// uninterpreted. The census edits are the floor divisor and the corrected
-    /// flag passed by the wrapper.
+    /// body. Too few headers, a zero expanded target, a zero divided target,
+    /// and a zero compressed result are errors. An inverted period is a zero
+    /// span, which the floor clamp raises. The product keeps the low 256 bits.
+    /// `expand_target` and `compress_target` stay uninterpreted. The census
+    /// edits are the floor divisor and the corrected flag passed by the wrapper.
     fn try_work_required<'a>(&'a self, block: &Block, vars: &mut Z3VarMap<'a>) -> Option<Bool<'a>> {
         let parsed = parse_work_adjust(block)?;
         let result = vars.get("result")?.as_int()?;
@@ -7382,17 +7385,21 @@ impl Z3Translator {
             .clone()
             .div(&Int::from_i64(&self.ctx, parsed.floor_div));
         let ceil = expected.clone() * Int::from_i64(&self.ctx, parsed.ceil_mul);
-        let span = last_time.clone() - first_time.clone();
+        let raw_span = last_time.clone() - first_time.clone();
+        let span = last_time
+            .clone()
+            .lt(&first_time)
+            .ite(&zero, &raw_span);
         let above = span.clone().lt(&floor).ite(&floor, &span);
         let clamped = above.gt(&ceil).ite(&ceil, &above);
         let raw_target = self.uninterpreted_int("expand_target", &[previous_bits.clone()]);
         let old_target = raw_target.lt(&zero).ite(&zero, &raw_target);
-        let product = old_target.clone() * clamped;
+        let wide = old_target.clone() * clamped;
         let two256 = Int::from_str(
             &self.ctx,
             "115792089237316195423570985008687907853269984665640564039457584007913129639936",
         )?;
-        let overflow = product.ge(&two256);
+        let product = wide.rem(&two256);
         let safe_expected = expected._eq(&zero).ite(&one, &expected);
         let divided = product.div(&safe_expected);
         let compressed = self.uninterpreted_int("compress_target", &[divided.clone()]);
@@ -7404,11 +7411,9 @@ impl Z3Translator {
         let divided_ok = divided._eq(&zero).ite(&err, &capped);
         let compressed_ok = compress_ok.ite(&divided_ok, &err);
         let capped_ok = capped._eq(&zero).ite(&err, &compressed_ok);
-        let fitted = overflow.ite(&previous_bits, &capped_ok);
-        let old_ok = old_target._eq(&zero).ite(&err, &fitted);
+        let old_ok = old_target._eq(&zero).ite(&err, &capped_ok);
         let expanded = expand_ok.ite(&old_ok, &err);
-        let ordered = last_time.lt(&first_time).ite(&err, &expanded);
-        let enough = count.lt(&two).ite(&err, &ordered);
+        let enough = count.lt(&two).ite(&err, &expanded);
         Some(result._eq(&enough))
     }
 
@@ -11084,6 +11089,11 @@ struct CompactTarget {
     hi: i64,
     bias: i64,
     byte_limit: i64,
+    over_exp: i64,
+    mid_mant: i64,
+    mid_exp: i64,
+    low_mant: i64,
+    low_exp: i64,
 }
 
 fn parse_compact_target(block: &Block) -> Option<CompactTarget> {
@@ -11098,6 +11108,7 @@ fn parse_compact_target(block: &Block) -> Option<CompactTarget> {
     let mut bias = None;
     let mut byte_mul = None;
     let mut bit_limit = None;
+    let mut overflow = None;
     for stmt in &block.stmts {
         if let Stmt::Local(local) = stmt {
             let name = local_name(&local.pat)?;
@@ -11136,6 +11147,9 @@ fn parse_compact_target(block: &Block) -> Option<CompactTarget> {
             byte_mul = Some(mul);
             bit_limit = Some(limit);
         }
+        if let Some(bounds) = overflow_bounds(if_expr, &exponent, &mantissa) {
+            overflow = Some(bounds);
+        }
     }
     let byte_mul = byte_mul?;
     let bit_limit = bit_limit?;
@@ -11150,18 +11164,83 @@ fn parse_compact_target(block: &Block) -> Option<CompactTarget> {
     if mask <= 0 || !((mask as u64).wrapping_add(1)).is_power_of_two() {
         return None;
     }
-    let lo = lo?;
-    let hi = hi?;
+    let (over_exp, mid_mant, mid_exp, low_mant, low_exp) = overflow?;
     Some(CompactTarget {
         bits: bits?,
         exp_shift: exp_shift?,
         exp_bits: exp_bits?,
         mask,
-        lo,
-        hi,
+        lo: lo.unwrap_or(0),
+        hi: hi.unwrap_or(255),
         bias: bias?,
         byte_limit,
+        over_exp,
+        mid_mant,
+        mid_exp,
+        low_mant,
+        low_exp,
     })
+}
+
+fn overflow_bounds(
+    if_expr: &syn::ExprIf,
+    exponent: &str,
+    mantissa: &str,
+) -> Option<(i64, i64, i64, i64, i64)> {
+    if !returns_err(&if_expr.then_branch) {
+        return None;
+    }
+    let Expr::Binary(and) = peel_paren(&if_expr.cond) else {
+        return None;
+    };
+    if !matches!(and.op, syn::BinOp::And(_)) || !nonzero_named(&and.left, mantissa) {
+        return None;
+    }
+    let Expr::Binary(top) = peel_paren(&and.right) else {
+        return None;
+    };
+    if !matches!(top.op, syn::BinOp::Or(_)) {
+        return None;
+    }
+    let Expr::Binary(left) = peel_paren(&top.left) else {
+        return None;
+    };
+    if !matches!(left.op, syn::BinOp::Or(_)) {
+        return None;
+    }
+    let over_exp = gt_named(&left.left, exponent)?;
+    let (mid_mant, mid_exp) = gt_and(&left.right, mantissa, exponent)?;
+    let (low_mant, low_exp) = gt_and(&top.right, mantissa, exponent)?;
+    Some((over_exp, mid_mant, mid_exp, low_mant, low_exp))
+}
+
+fn nonzero_named(expr: &Expr, name: &str) -> bool {
+    let Expr::Binary(bin) = peel_paren(expr) else {
+        return false;
+    };
+    matches!(bin.op, syn::BinOp::Ne(_))
+        && path_is(&bin.left, name)
+        && extract_int_literal(&bin.right) == Some(0)
+}
+
+fn gt_named(expr: &Expr, name: &str) -> Option<i64> {
+    let Expr::Binary(bin) = peel_paren(expr) else {
+        return None;
+    };
+    if !matches!(bin.op, syn::BinOp::Gt(_)) || !path_is(&bin.left, name) {
+        return None;
+    }
+    extract_int_literal(&bin.right)
+}
+
+fn gt_and(expr: &Expr, left_name: &str, right_name: &str) -> Option<(i64, i64)> {
+    let Expr::Binary(bin) = peel_paren(expr) else {
+        return None;
+    };
+    if !matches!(bin.op, syn::BinOp::And(_)) {
+        return None;
+    }
+    Some((gt_named(&bin.left, left_name)?, gt_named(&bin.right, right_name)?))
 }
 
 pub(crate) struct CompressTarget {
@@ -25285,33 +25364,32 @@ fn parse_work_adjust(block: &Block) -> Option<WorkAdjust> {
         || !let_field(stmts.get(3)?, "previous_bits", "last_header", "bits")
         || !is_first_time(stmts.get(4)?)
         || !let_field(stmts.get(5)?, "last_timestamp", "last_header", "timestamp")
-        || !time_order_err(stmts.get(6)?)
-        || !is_time_span(stmts.get(7)?)
-        || !is_expected(stmts.get(8)?)
+        || !is_time_span(stmts.get(6)?)
+        || !is_expected(stmts.get(7)?)
+        || !is_debug_assert(stmts.get(9)?)
         || !is_debug_assert(stmts.get(10)?)
-        || !is_debug_assert(stmts.get(11)?)
-        || !is_expand(stmts.get(12)?)
-        || !is_zero_err(stmts.get(13)?, "old_target")
-        || !is_mul_match(stmts.get(14)?)
-        || !is_debug_assert(stmts.get(15)?)
-        || !is_div_target(stmts.get(16)?)
-        || !is_zero_err(stmts.get(17)?, "new_target")
-        || !is_compress(stmts.get(18)?)
-        || bits_cap(stmts.get(19)?).is_none()
+        || !is_expand(stmts.get(11)?)
+        || !is_zero_err(stmts.get(12)?, "old_target")
+        || !is_mul_match(stmts.get(13)?)
+        || !is_debug_assert(stmts.get(14)?)
+        || !is_div_target(stmts.get(15)?)
+        || !is_zero_err(stmts.get(16)?, "new_target")
+        || !is_compress(stmts.get(17)?)
+        || bits_cap(stmts.get(18)?).is_none()
+        || !is_debug_assert(stmts.get(19)?)
         || !is_debug_assert(stmts.get(20)?)
-        || !is_debug_assert(stmts.get(21)?)
-        || !is_bits_zero(stmts.get(22)?)
-        || !is_ok_path(stmts.get(23)?, "clamped_bits")
-        || stmts.len() != 24
+        || !is_bits_zero(stmts.get(21)?)
+        || !is_ok_path(stmts.get(22)?, "clamped_bits")
+        || stmts.len() != 23
     {
         return None;
     }
-    let (floor_div, ceil_mul) = clamp_factors(stmts.get(9)?)?;
+    let (floor_div, ceil_mul) = clamp_factors(stmts.get(8)?)?;
     Some(WorkAdjust {
         corrected,
         floor_div,
         ceil_mul,
-        cap_min: bits_cap(stmts.get(19)?)?,
+        cap_min: bits_cap(stmts.get(18)?)?,
     })
 }
 
@@ -25410,33 +25488,46 @@ fn is_first_time(stmt: &Stmt) -> bool {
     path_is(&index.expr, "prev_headers") && lit_i64(&index.index) == Some(0)
 }
 
-fn time_order_err(stmt: &Stmt) -> bool {
-    let Some(expr) = stmt_expr(stmt) else {
+fn is_time_span(stmt: &Stmt) -> bool {
+    let Some(init) = let_named(stmt, "time_span") else {
         return false;
     };
-    let Expr::If(gate) = peel_paren(expr) else {
+    let Expr::If(gate) = peel_paren(init) else {
         return false;
     };
     let Expr::Binary(bin) = peel_paren(&gate.cond) else {
         return false;
     };
-    matches!(bin.op, syn::BinOp::Lt(_))
-        && path_is(&bin.left, "last_timestamp")
-        && path_is(&bin.right, "first_timestamp")
-        && err_block(&gate.then_branch)
-        && gate.else_branch.is_none()
-}
-
-fn is_time_span(stmt: &Stmt) -> bool {
-    let Some(init) = let_named(stmt, "time_span") else {
+    if !matches!(bin.op, syn::BinOp::Ge(_))
+        || !path_is(&bin.left, "last_timestamp")
+        || !path_is(&bin.right, "first_timestamp")
+    {
+        return false;
+    }
+    let Some(then_expr) = gate.then_branch.stmts.first().and_then(stmt_expr) else {
         return false;
     };
-    let Expr::Binary(bin) = peel_paren(init) else {
+    let Expr::Binary(sub) = peel_paren(then_expr) else {
         return false;
     };
-    matches!(bin.op, syn::BinOp::Sub(_))
-        && path_is(&bin.left, "last_timestamp")
-        && path_is(&bin.right, "first_timestamp")
+    if !matches!(sub.op, syn::BinOp::Sub(_))
+        || !path_is(&sub.left, "last_timestamp")
+        || !path_is(&sub.right, "first_timestamp")
+    {
+        return false;
+    }
+    let Some((_, else_expr)) = &gate.else_branch else {
+        return false;
+    };
+    let Expr::Block(block) = peel_paren(else_expr) else {
+        return false;
+    };
+    block
+        .block
+        .stmts
+        .first()
+        .and_then(stmt_expr)
+        .is_some_and(|expr| lit_i64(peel_paren(expr)) == Some(0))
 }
 
 fn is_expected(stmt: &Stmt) -> bool {
@@ -25606,57 +25697,13 @@ fn is_mul_match(stmt: &Stmt) -> bool {
     let Some(init) = let_named(stmt, "multiplied_target") else {
         return false;
     };
-    let Expr::Match(mat) = peel_paren(init) else {
+    let Expr::MethodCall(call) = peel_paren(init) else {
         return false;
     };
-    let Expr::MethodCall(call) = peel_paren(&mat.expr) else {
-        return false;
-    };
-    if call.method != "checked_mul_u64"
-        || call.args.len() != 1
-        || !path_is(&call.receiver, "old_target")
-        || !path_is(&call.args[0], "clamped_timespan")
-        || mat.arms.len() != 2
-    {
-        return false;
-    }
-    let syn::Pat::TupleStruct(pat) = &mat.arms[0].pat else {
-        return false;
-    };
-    if path_to_string(&pat.path) != "Some" || pat.elems.len() != 1 {
-        return false;
-    }
-    let syn::Pat::Ident(ident) = &pat.elems[0] else {
-        return false;
-    };
-    ident.ident == "t"
-        && path_is(&mat.arms[0].body, "t")
-        && pat_is_none(&mat.arms[1].pat)
-        && is_ok_return(&mat.arms[1].body, "previous_bits")
-}
-
-fn is_ok_return(expr: &Expr, name: &str) -> bool {
-    let expr = peel_paren(expr);
-    let ret = if let Expr::Block(block) = expr {
-        let [stmt] = block.block.stmts.as_slice() else {
-            return false;
-        };
-        let Stmt::Expr(Expr::Return(ret), _) = stmt else {
-            return false;
-        };
-        ret
-    } else {
-        let Expr::Return(ret) = expr else {
-            return false;
-        };
-        ret
-    };
-    ret.expr.as_ref().is_some_and(|inner| {
-        let Expr::Call(call) = peel_paren(inner) else {
-            return false;
-        };
-        path_ends(&call.func, "Ok") && call.args.len() == 1 && path_is(&call.args[0], name)
-    })
+    call.method == "wrapping_mul_u64"
+        && call.args.len() == 1
+        && path_is(&call.receiver, "old_target")
+        && path_is(&call.args[0], "clamped_timespan")
 }
 
 fn is_div_target(stmt: &Stmt) -> bool {

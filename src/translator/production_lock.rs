@@ -1238,11 +1238,20 @@ fn shl_mantissa(mantissa: u32, shift: u32) -> [u64; 4] {
 fn spec_expand(bits: u64) -> Result<[u64; 4], ()> {
     let exponent = ((bits >> 24) & 0xff) as u32;
     let mantissa = (bits & 0x007f_ffff) as u32;
-    if !(3..=32).contains(&exponent) {
+    if mantissa != 0
+        && (exponent > 34
+            || (mantissa > 0xff && exponent > 33)
+            || (mantissa > 0xffff && exponent > 32))
+    {
         return Err(());
     }
     if mantissa == 0 {
         return Ok([0; 4]);
+    }
+    if exponent <= 3 {
+        let shift = 8 * (3 - exponent);
+        let word = if shift >= 32 { 0 } else { mantissa >> shift };
+        return Ok([u64::from(word), 0, 0, 0]);
     }
     Ok(shl_mantissa(mantissa, 8 * (exponent - 3)))
 }
@@ -4779,25 +4788,17 @@ mod tests {
         }
         assert_eq!(expand_target_query(&src, 0x0200_0001), SatResult::Unsat);
         assert_eq!(expand_target_query(&src, 0x2100_0001), SatResult::Unsat);
+        assert_eq!(expand_target_query(&src, 0x2300_0001), SatResult::Unsat);
         assert_eq!(
             expand_target_query(&src, (0x104 << 24) | 1),
             SatResult::Unsat
         );
         assert_eq!(expand_target_query(&src, 0x0380_0000), SatResult::Unsat);
         assert_eq!(
-            expand_target_query(&src.replace("3..=32", "4..=32"), 0x0300_0001),
-            SatResult::Sat
-        );
-        assert_eq!(
-            expand_target_query(&src.replace("3..=32", "3..=31"), 0x2000_0001),
-            SatResult::Sat
-        );
-        assert_eq!(
-            expand_target_query(&src.replace("3..=32", "2..=32"), 0x0200_0001),
-            SatResult::Sat
-        );
-        assert_eq!(
-            expand_target_query(&src.replace("3..=32", "3..=33"), 0x2100_0001),
+            expand_target_query(
+                &src.replace("mantissa > 0xffff", "mantissa > 0xffffff"),
+                0x2101_0000
+            ),
             SatResult::Sat
         );
         assert_eq!(

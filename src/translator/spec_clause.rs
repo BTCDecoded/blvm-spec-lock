@@ -66,10 +66,9 @@ pub fn retarget_query(src: &str) -> SatResult {
         src,
         &[
             "prev_headers.len() < 2",
-            "return Ok(previous_bits)",
             "time_span.max(expected_time / 4)",
             "expand_target(previous_bits)",
-            "old_target.checked_mul_u64(",
+            "old_target.wrapping_mul_u64(",
             "product >> 64",
             "(remainder << 64) | (self.0[3] as u128)",
             "compress_target(&new_target)",
@@ -211,7 +210,7 @@ mod tests {
 
         let retarget = retarget_source();
         assert_eq!(retarget_query(&retarget), SatResult::Unsat);
-        let outside = retarget.replace("old_target.checked_mul_u64(", "old_target.other_mul(");
+        let outside = retarget.replace("old_target.wrapping_mul_u64(", "old_target.other_mul(");
         assert_eq!(retarget_query(&outside), SatResult::Sat);
         let clamped = formula_body("F_NextWorkClamped").expect("F_NextWorkClamped");
         assert!(text_usable(&clamped));

@@ -7386,10 +7386,7 @@ impl Z3Translator {
             .div(&Int::from_i64(&self.ctx, parsed.floor_div));
         let ceil = expected.clone() * Int::from_i64(&self.ctx, parsed.ceil_mul);
         let raw_span = last_time.clone() - first_time.clone();
-        let span = last_time
-            .clone()
-            .lt(&first_time)
-            .ite(&zero, &raw_span);
+        let span = last_time.clone().lt(&first_time).ite(&zero, &raw_span);
         let above = span.clone().lt(&floor).ite(&floor, &span);
         let clamped = above.gt(&ceil).ite(&ceil, &above);
         let raw_target = self.uninterpreted_int("expand_target", &[previous_bits.clone()]);
@@ -11240,7 +11237,10 @@ fn gt_and(expr: &Expr, left_name: &str, right_name: &str) -> Option<(i64, i64)> 
     if !matches!(bin.op, syn::BinOp::And(_)) {
         return None;
     }
-    Some((gt_named(&bin.left, left_name)?, gt_named(&bin.right, right_name)?))
+    Some((
+        gt_named(&bin.left, left_name)?,
+        gt_named(&bin.right, right_name)?,
+    ))
 }
 
 pub(crate) struct CompressTarget {

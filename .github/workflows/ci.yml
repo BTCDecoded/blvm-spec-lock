@@ -51,6 +51,102 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+  production-lock:
+    name: Production lock
+    runs-on: [self-hosted, Linux, X64, builds]
+
+    if: |
+      github.event_name != 'push' ||
+      github.event.head_commit == null ||
+      (!contains(github.event.head_commit.message, '[skip ci]') &&
+       !contains(github.event.head_commit.message, '[ci skip]') &&
+       !contains(github.event.head_commit.message, '[no ci]'))
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: blvm-spec-lock
+
+      # production_lock tests no-op through consensus_workspace_present() unless
+      # blvm-spec, blvm-primitives, and blvm-consensus sit next to this repo.
+      # Several of those tests also read blvm-secp256k1. Check the siblings out
+      # at their default branch so the locks float against current sources.
+      # These checkouts live under this job's workspace; the Test job is unchanged.
+      - uses: actions/checkout@v6
+        with:
+          repository: BTCDecoded/blvm-consensus
+          path: blvm-consensus
+
+      - uses: actions/checkout@v6
+        with:
+          repository: BTCDecoded/blvm-primitives
+          path: blvm-primitives
+
+      - uses: actions/checkout@v6
+        with:
+          repository: BTCDecoded/blvm-spec
+          path: blvm-spec
+
+      - uses: actions/checkout@v6
+        with:
+          repository: BTCDecoded/blvm-secp256k1
+          path: blvm-secp256k1
+
+      - name: Require sibling sources
+        run: |
+          set -euo pipefail
+          missing=0
+          for path in \
+            blvm-spec/PROTOCOL.md \
+            blvm-primitives/src/constants.rs \
+            blvm-consensus/src \
+            blvm-secp256k1/src/taproot.rs
+          do
+            if [ ! -e "$path" ]; then
+              echo "missing sibling path: $path"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "production-lock siblings are required; refusing to no-op"
+            exit 1
+          fi
+
+      - name: Install Rust
+        uses: BTCDecoded/rust-ci/install-rust-toolchain@main
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: blvm-spec-lock
+
+      - name: Production-lock tests
+        working-directory: blvm-spec-lock
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -euo pipefail
+          cargo test --all-features --lib translator::production_lock | tee production-lock-test.log
+          line=$(grep -E '^test result:' production-lock-test.log | tail -1)
+          echo "parsed: $line"
+          case "$line" in
+            "test result: ok."*)
+              ;;
+            *)
+              echo "production-lock tests did not report ok"
+              exit 1
+              ;;
+          esac
+          passed=$(printf '%s\n' "$line" | sed -E 's/^test result: ok\. ([0-9]+) passed;.*/\1/')
+          if ! printf '%s\n' "$passed" | grep -Eq '^[0-9]+$'; then
+            echo "could not parse passed count from: $line"
+            exit 1
+          fi
+          if [ "$passed" -lt 68 ]; then
+            echo "expected at least 68 passed, got $passed (a no-op or filtered run is a failure)"
+            exit 1
+          fi
+
+
   publish:
     name: Release & publish
     needs: test

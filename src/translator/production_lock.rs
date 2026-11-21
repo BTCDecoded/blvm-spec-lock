@@ -742,6 +742,24 @@ pub fn header_version_query(src: &str, version: u64) -> SatResult {
     })
 }
 
+/// `check_bip90` must enforce MinVersion floors from the spec (BIP65/66/34).
+/// There is no constant pre-BIP34 floor; the otherwise case is not a numeric cut.
+fn bip90_enforces_floors(src: &str, bip65: i64, bip66: i64, bip34: i64) -> bool {
+    let has = |fork: &str, floor: i64| {
+        src.contains(&format!("ForkId::{fork}"))
+            && src.contains(&format!("block_version < {floor}"))
+    };
+    has("Bip65", bip65) && has("Bip66", bip66) && has("Bip34", bip34)
+}
+
+/// Unsat when `check_bip90` still has the three MinVersion floors. Sat when a floor is gone.
+pub fn bip90_min_version_query(src: &str, bip65: i64, bip66: i64, bip34: i64) -> SatResult {
+    let differ = !bip90_enforces_floors(src, bip65, bip66, bip34);
+    check(|ctx, solver| {
+        solver.assert(&Bool::from_bool(ctx, differ));
+    })
+}
+
 fn future_rejects<'a>(src: &str, ts: &BV<'a>, max_ts: &BV<'a>) -> Option<Bool<'a>> {
     let body = ast_body::analyze(src);
     if !body.time_context_present {
@@ -4289,6 +4307,21 @@ mod tests {
         std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
     }
 
+    /// Count `spec_locked(` markers in source, covering both `#[spec_locked(` and
+    /// `#[cfg_attr(..., spec_locked(` forms. Line comments and the `use` import
+    /// (no parenthesis) are not counted.
+    fn spec_locked_count(src: &str) -> usize {
+        src.lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//")
+                    && !trimmed.starts_with("/*")
+                    && !trimmed.starts_with('*')
+            })
+            .map(|line| line.matches("spec_locked(").count())
+            .sum()
+    }
+
     fn extract_struct(src: &str, name: &str) -> String {
         let marker = format!("struct {name}");
         let start = src
@@ -4536,11 +4569,11 @@ mod tests {
         );
 
         let mempool = consensus_file("mempool.rs");
-        assert_eq!(mempool.matches("#[spec_locked").count(), 2);
+        assert_eq!(spec_locked_count(&mempool), 2);
         assert!(mempool.contains("fn is_final_tx("));
         let mining = consensus_file("mining.rs");
-        assert!(!mining.contains("#[spec_locked(\"12."));
-        assert_eq!(mining.matches("#[spec_locked").count(), 4);
+        assert!(!mining.contains("spec_locked(\"12."));
+        assert_eq!(spec_locked_count(&mining), 4);
         assert!(mining.contains("merkle_tree_from_hashes"));
         let lib = consensus_file("lib.rs");
         assert!(!lib.contains("AcceptToMemoryPool"));
@@ -4550,22 +4583,6 @@ mod tests {
 
         let header = consensus_file("block/header.rs");
         let valid = extract_fn(&header, "validate_block_header");
-        assert_eq!(header_version_query(&valid, 0), SatResult::Unsat);
-        assert_eq!(header_version_query(&valid, 1), SatResult::Unsat);
-        assert_eq!(
-            header_version_query(
-                &valid.replace("header.version < 1", "header.version < 0"),
-                0
-            ),
-            SatResult::Sat
-        );
-        assert_eq!(
-            header_version_query(
-                &valid.replace("header.version < 1", "header.version <= 1"),
-                1
-            ),
-            SatResult::Sat
-        );
         assert_eq!(header_rejects_zero(&valid, "timestamp"), SatResult::Unsat);
         assert_eq!(header_rejects_zero(&valid, "bits"), SatResult::Unsat);
         assert_eq!(
@@ -4599,6 +4616,37 @@ mod tests {
                 "if let Some(ctx) = time_context",
                 "if let None = time_context"
             )),
+            SatResult::Sat
+        );
+    }
+
+    #[test]
+    fn header_bip90_min_version_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let (bip65, bip66, bip34, _) = crate::parser::spec_expr::min_version_floors();
+        let src = extract_fn(&consensus_file("bip_validation.rs"), "check_bip90");
+        assert_eq!(
+            bip90_min_version_query(&src, bip65, bip66, bip34),
+            SatResult::Unsat
+        );
+        let weakened = src.replace(
+            &format!("block_version < {bip65}"),
+            &format!("block_version < {}", bip65 - 1),
+        );
+        assert_ne!(weakened, src);
+        assert_eq!(
+            bip90_min_version_query(&weakened, bip65, bip66, bip34),
+            SatResult::Sat
+        );
+        let dropped = src.replace(
+            &format!("activation.is_fork_active(ForkId::Bip65, height) && block_version < {bip65}"),
+            "false",
+        );
+        assert_ne!(dropped, src);
+        assert_eq!(
+            bip90_min_version_query(&dropped, bip65, bip66, bip34),
             SatResult::Sat
         );
     }
@@ -8394,8 +8442,8 @@ mod tests {
         sat(body.replace("output.value < 0", "false"), &[-1]);
         sat(
             body.replace(
-                ".checked_add(output.value)\n            .ok_or_else(|| ConsensusError::TransactionValidation(\"Output value overflow\".into()))?",
-                ".saturating_add(output.value)",
+                "total = match total.checked_add(output.value) {\n            Some(sum) => sum,\n            None => {\n                return Ok(Err(ValidationResult::Invalid(\n                    \"Output value sum overflow\".to_string(),\n                )));\n            }\n        };",
+                "total = total.saturating_add(output.value);",
             ),
             &[i64::MAX, 1],
         );
@@ -9109,6 +9157,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "FORMAL_VERIFICATION_PLAN.md is not in any BTCDecoded repo; the live formal-verification page does not hold this gate table"]
     fn published_gate_matches_the_table() {
         if !crate::parser::spec_expr::consensus_workspace_present() {
             return;

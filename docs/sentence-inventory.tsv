@@ -80,6 +80,7 @@ PROTOCOL.md#Formula:F_FalseResultEmpty	PROTOCOL.md	F_FalseResultEmpty	unsupporte
 PROTOCOL.md#Formula:F_FeeArithmeticBounded	PROTOCOL.md	F_FeeArithmeticBounded	unsupported	model_unwritten
 PROTOCOL.md#Formula:F_FeeArithmeticNonNeg	PROTOCOL.md	F_FeeArithmeticNonNeg	unsupported	model_unwritten
 PROTOCOL.md#Formula:F_FeeNonNeg	PROTOCOL.md	F_FeeNonNeg	unsupported	model_unwritten
+PROTOCOL.md#Formula:F_FindAndDelete	PROTOCOL.md	F_FindAndDelete	unsupported	model_unwritten
 PROTOCOL.md#Formula:F_HeaderBitsFloor	PROTOCOL.md	F_HeaderBitsFloor	unsupported	model_unwritten
 PROTOCOL.md#Formula:F_HeaderBitsMatchRequired	PROTOCOL.md	F_HeaderBitsMatchRequired	unsupported	model_unwritten
 PROTOCOL.md#Formula:F_HeaderTimestampAfterMtp	PROTOCOL.md	F_HeaderTimestampAfterMtp	unsupported	model_unwritten
@@ -112,6 +113,7 @@ PROTOCOL.md#Formula:F_SequenceLockTimeMask	PROTOCOL.md	F_SequenceLockTimeMask	un
 PROTOCOL.md#Formula:F_SequenceTimeEncoding	PROTOCOL.md	F_SequenceTimeEncoding	unsupported	model_unwritten
 PROTOCOL.md#Formula:F_SequenceTypeHeightWhenBit22Clear	PROTOCOL.md	F_SequenceTypeHeightWhenBit22Clear	unsupported	model_unwritten
 PROTOCOL.md#Formula:F_SequenceTypeTimeWhenBit22Set	PROTOCOL.md	F_SequenceTypeTimeWhenBit22Set	unsupported	model_unwritten
+PROTOCOL.md#Formula:F_SighashBase	PROTOCOL.md	F_SighashBase	lean_statement	
 PROTOCOL.md#Formula:F_SigopCountPushOpcode	PROTOCOL.md	F_SigopCountPushOpcode	unsupported	model_unwritten
 PROTOCOL.md#Formula:F_SpecLockWitness	PROTOCOL.md	F_SpecLockWitness	unsupported	model_unwritten
 PROTOCOL.md#Formula:F_StackCombinedFail	PROTOCOL.md	F_StackCombinedFail	unsupported	model_unwritten

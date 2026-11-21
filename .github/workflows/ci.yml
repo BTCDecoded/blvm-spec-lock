@@ -53,6 +53,8 @@ jobs:
 
   production-lock:
     name: Production lock
+    # Run after Test so the two release builds do not share a runner and run out of memory.
+    needs: test
     runs-on: [self-hosted, Linux, X64, builds]
 
     if: |

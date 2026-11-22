@@ -4442,8 +4442,8 @@ impl Z3Translator {
         let mtp_ok = mtps_some & idx.lt(&mtps_len) & mtp.ge(&zero) & mtp.le(&i64_max);
         let overflow_t = (mtp.clone() + seconds.clone()).gt(&i64_max);
         let overflow_h = (height.clone() + value.clone()).gt(&i64_max);
-        let req_t = mtp + seconds - one.clone();
-        let req_h = height + value - one.clone();
+        let req_t = mtp + seconds - Int::from_i64(&self.ctx, parsed.time_sub);
+        let req_h = height + value - Int::from_i64(&self.ctx, parsed.height_sub);
         let opened = in_range.clone() & disabled.not();
         let bad = opened.clone()
             & (height_ok.not()
@@ -4453,7 +4453,13 @@ impl Z3Translator {
         let contrib_t = opened & height_ok & timed & mtp_ok & overflow_t.not();
         let any_bad = z3::ast::exists_const(&self.ctx, &[&idx], &[], &bad);
         let mismatch = heights_len._eq(&n).not();
-        let enforce = version.ge(&Int::from_i64(&self.ctx, 2)) & self.byte_bit(&flags, masks.flag);
+        let two = Int::from_i64(&self.ctx, 2);
+        let version_word = if parsed.enforce_as_u32 {
+            self.as_u32(&version)
+        } else {
+            version
+        };
+        let enforce = version_word.ge(&two) & self.byte_bit(&flags, masks.flag);
         let early = mismatch.not() & enforce.not();
         let ran = mismatch.not() & enforce & any_bad.not();
         let failed = early.not() & ran.not();
@@ -6901,7 +6907,12 @@ impl Z3Translator {
         } else {
             self.bit_set(&input_value, 1_i64 << 31)
         };
-        let old_version = tx_version.lt(&Int::from_i64(&self.ctx, 2));
+        let two = Int::from_i64(&self.ctx, 2);
+        let old_version = if parsed.version_as_u32 {
+            self.as_u32(&tx_version).lt(&two)
+        } else {
+            tx_version.lt(&two)
+        };
         let bip112_fail = self.bip112_holds(&sequence_value, &input_value).not();
         let ok_true = self.csv_pack(&result, &err_flag, &code, true, 0, 0);
         let ok_false = self.csv_pack(&result, &err_flag, &code, false, 0, 0);
@@ -24860,7 +24871,6 @@ fn parse_checkmultisig(block: &Block) -> Option<MultiSig> {
         || !found.legacy_sighash
         || !found.nullfail
         || !found.bool_push
-        || !found.empty_while
         || !found.empty_continue
         || found.pops < 3
     {
@@ -24948,6 +24958,7 @@ impl<'ast> syn::visit::Visit<'ast> for MultiFind {
             }
             Expr::Call(call) => {
                 if call_ends(&call.func, "batch_verify_signatures")
+                    || call_ends(&call.func, "batch_compute_legacy_sighashes")
                     || call_ends(&call.func, "batch_gone_signatures")
                 {
                     self.batch = Some(call_suffix(&call.func));
@@ -25492,6 +25503,13 @@ fn is_time_span(stmt: &Stmt) -> bool {
     let Some(init) = let_named(stmt, "time_span") else {
         return false;
     };
+    // Current source floors an inverted period with saturating_sub (pow.rs:86).
+    if let Expr::MethodCall(call) = peel_paren(init) {
+        return call.method == "saturating_sub"
+            && call.args.len() == 1
+            && path_is(&call.receiver, "last_timestamp")
+            && path_is(&call.args[0], "first_timestamp");
+    }
     let Expr::If(gate) = peel_paren(init) else {
         return false;
     };
@@ -25824,6 +25842,7 @@ fn err_mentions(stmt: &Stmt, text: &str) -> bool {
 struct CsvParsed {
     short_len2: bool,
     disabled_gone: bool,
+    version_as_u32: bool,
 }
 
 fn parse_csv(block: &Block) -> Option<CsvParsed> {
@@ -25845,9 +25864,7 @@ fn parse_csv(block: &Block) -> Option<CsvParsed> {
         return None;
     }
     let stack_gone = csv_disabled_call(&stmts[10], "sequence_value", true)?;
-    if !csv_version(&stmts[11]) {
-        return None;
-    }
+    let version_as_u32 = csv_version(&stmts[11])?;
     let input_gone = csv_disabled_call(&stmts[12], "input_sequence", false)?;
     if stack_gone != input_gone || !csv_bip112(&stmts[13]) || !csv_ok_true(&stmts[14]) {
         return None;
@@ -25855,6 +25872,7 @@ fn parse_csv(block: &Block) -> Option<CsvParsed> {
     Some(CsvParsed {
         short_len2,
         disabled_gone: stack_gone,
+        version_as_u32,
     })
 }
 
@@ -26054,19 +26072,38 @@ fn csv_disabled_call(stmt: &Stmt, arg: &str, ok_true: bool) -> Option<bool> {
     }
 }
 
-fn csv_version(stmt: &Stmt) -> bool {
-    let Some(iff) = csv_if(stmt) else {
-        return false;
-    };
+/// Some(true) when the arm uses `version_enforces_relative_lock` (truncate
+/// to u32). Some(false) for the older `tx.version < 2` comparison, which
+/// is left unbounded. None if neither form is present.
+fn csv_version(stmt: &Stmt) -> Option<bool> {
+    let iff = csv_if(stmt)?;
     if !returns_ok_bool(&iff.then_branch, false) {
-        return false;
+        return None;
+    }
+    // Current source: !version_enforces_relative_lock(tx.version)
+    // (script/mod.rs:7845-7846). The helper is (version as u32) >= 2.
+    if let Expr::Unary(not_) = peel_paren(&iff.cond) {
+        if matches!(not_.op, syn::UnOp::Not(_)) {
+            if let Expr::Call(call) = peel_paren(&not_.expr) {
+                if call_ends(&call.func, "version_enforces_relative_lock")
+                    && call.args.len() == 1
+                    && field_of(&call.args[0], "tx", "version")
+                {
+                    return Some(true);
+                }
+            }
+        }
     }
     let Expr::Binary(bin) = peel_paren(&iff.cond) else {
-        return false;
+        return None;
     };
-    matches!(bin.op, syn::BinOp::Lt(_))
+    if matches!(bin.op, syn::BinOp::Lt(_))
         && field_of(&bin.left, "tx", "version")
         && lit_is(&bin.right, 2)
+    {
+        return Some(false);
+    }
+    None
 }
 
 fn csv_bip112(stmt: &Stmt) -> bool {
@@ -29570,6 +29607,9 @@ struct SequenceLocks {
     init_height: i64,
     init_time: i64,
     shift: u32,
+    height_sub: i64,
+    time_sub: i64,
+    enforce_as_u32: bool,
 }
 
 struct SequenceMasks {
@@ -29645,6 +29685,8 @@ struct SeqSeen {
     init_height: Option<i64>,
     init_time: Option<i64>,
     shift: Option<u32>,
+    height_sub: Option<i64>,
+    time_sub: Option<i64>,
     len_err: bool,
     enforce: bool,
     early_ok: bool,
@@ -29660,6 +29702,7 @@ struct SeqSeen {
     final_ok: bool,
     for_inputs: bool,
     granularity: Option<u32>,
+    enforce_as_u32: bool,
 }
 
 /// The whole `calculate_sequence_locks` body, including the input fold.
@@ -29668,6 +29711,8 @@ fn parse_sequence_locks(block: &Block) -> Option<SequenceLocks> {
         init_height: None,
         init_time: None,
         shift: None,
+        height_sub: None,
+        time_sub: None,
         len_err: false,
         enforce: false,
         early_ok: false,
@@ -29683,6 +29728,7 @@ fn parse_sequence_locks(block: &Block) -> Option<SequenceLocks> {
         final_ok: false,
         for_inputs: false,
         granularity: None,
+        enforce_as_u32: false,
     };
     walk_seq_block(block, &mut seen);
     if let Some(Stmt::Expr(tail, None)) = block.stmts.last() {
@@ -29715,6 +29761,9 @@ fn parse_sequence_locks(block: &Block) -> Option<SequenceLocks> {
         init_height: seen.init_height?,
         init_time: seen.init_time?,
         shift,
+        height_sub: seen.height_sub?,
+        time_sub: seen.time_sub?,
+        enforce_as_u32: seen.enforce_as_u32,
     })
 }
 
@@ -29744,9 +29793,17 @@ fn walk_seq_block(block: &Block, seen: &mut SeqSeen) {
                                 seen.granularity = gran;
                             }
                         }
+                        "required_height" => {
+                            seen.height_sub = trailing_checked_sub(&init.expr);
+                        }
+                        "required_time" => {
+                            seen.time_sub = trailing_checked_sub(&init.expr);
+                        }
                         "enforce_bip68" => {
                             seen.enforce = seq_mentions(&init.expr, "LOCKTIME_VERIFY_SEQUENCE")
                                 && mentions_ge_two(&init.expr);
+                            // The helper is (version as u32) >= 2 (sequence_locks.rs:28-30).
+                            seen.enforce_as_u32 = mentions_version_helper(&init.expr);
                         }
                         _ => {}
                     }
@@ -29943,12 +30000,53 @@ fn path_shift(expr: &Expr) -> Option<u32> {
     u32::try_from(gran).ok()
 }
 
+fn trailing_checked_sub(expr: &Expr) -> Option<i64> {
+    match peel_paren(expr) {
+        Expr::MethodCall(call) if call.method == "and_then" && call.args.len() == 1 => {
+            let Expr::Closure(closure) = peel_paren(&call.args[0]) else {
+                return None;
+            };
+            trailing_checked_sub(&closure.body)
+        }
+        Expr::MethodCall(call) if call.method == "checked_sub" && call.args.len() == 1 => {
+            lit_i64(&call.args[0])
+        }
+        Expr::MethodCall(call) => trailing_checked_sub(&call.receiver),
+        Expr::Try(try_expr) => trailing_checked_sub(&try_expr.expr),
+        Expr::Block(block) => block.block.stmts.last().and_then(|stmt| match stmt {
+            Stmt::Expr(expr, _) => trailing_checked_sub(expr),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn mentions_version_helper(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(call) if path_ends(&call.func, "version_enforces_relative_lock") => true,
+        Expr::Call(call) => {
+            mentions_version_helper(&call.func) || call.args.iter().any(mentions_version_helper)
+        }
+        Expr::Binary(bin) => {
+            mentions_version_helper(&bin.left) || mentions_version_helper(&bin.right)
+        }
+        Expr::Paren(paren) => mentions_version_helper(&paren.expr),
+        Expr::Group(group) => mentions_version_helper(&group.expr),
+        Expr::Unary(unary) => mentions_version_helper(&unary.expr),
+        _ => false,
+    }
+}
+
 fn mentions_ge_two(expr: &Expr) -> bool {
     match expr {
         Expr::Binary(bin) if matches!(bin.op, syn::BinOp::Ge(_)) => {
             seq_mentions(&bin.left, "version") && lit_i64(&bin.right) == Some(2)
         }
         Expr::Binary(bin) => mentions_ge_two(&bin.left) || mentions_ge_two(&bin.right),
+        // Current source uses this helper, which is (version as u32) >= 2
+        // (sequence_locks.rs:28-30).
+        Expr::Call(call) if path_ends(&call.func, "version_enforces_relative_lock") => true,
+        Expr::Call(call) => mentions_ge_two(&call.func) || call.args.iter().any(mentions_ge_two),
         Expr::Paren(paren) => mentions_ge_two(&paren.expr),
         Expr::Group(group) => mentions_ge_two(&group.expr),
         Expr::Unary(unary) => mentions_ge_two(&unary.expr),

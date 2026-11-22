@@ -3397,9 +3397,12 @@ mod transaction_weight_identity {
 
 #[cfg(all(test, feature = "z3"))]
 mod get_block_subsidy_identity {
-    use super::{FailureKind, VerificationResult, make_function_to_verify, verify_function};
+    use super::{
+        Contract, ContractType, FailureKind, VerificationResult, make_function_to_verify,
+        verify_function,
+    };
     use crate::parser::spec_expr::{
-        consensus_workspace_present, initial_subsidy, protocol_u64, subsidy_shift_guard,
+        consensus_workspace_present, impl_u64, initial_subsidy, protocol_u64, subsidy_shift_guard,
     };
     use std::path::PathBuf;
 
@@ -3518,6 +3521,375 @@ mod get_block_subsidy_identity {
             ),
             ">= 65 must not prove the later shift is below 64, got {weakened_result:?}"
         );
+    }
+
+    fn subsidy_src() -> String {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        std::fs::read_to_string(root.join("blvm-consensus/src/economic.rs")).expect("economic.rs")
+    }
+
+    fn slice_fn<'a>(src: &'a str, marker: &str) -> &'a str {
+        let start = src.find(marker).unwrap_or_else(|| panic!("{marker}"));
+        let after = &src[start..];
+        let open = after.find('{').expect("function body");
+        let mut depth = 0usize;
+        for (i, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[start..start + open + i + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced {marker}");
+    }
+
+    fn must_replace_in_subsidy(src: &str, from: &str, to: &str) -> String {
+        let marker = "pub fn get_block_subsidy(";
+        let slice = slice_fn(src, marker);
+        let start = src.find(marker).expect(marker);
+        let end = start + slice.len();
+        let edited = slice.replace(from, to);
+        assert_ne!(
+            edited, slice,
+            "{from} must change inside production get_block_subsidy"
+        );
+        let mut out = src.to_string();
+        out.replace_range(start..end, &edited);
+        out
+    }
+
+    fn subsidy_fn_from(src: &str) -> syn::ItemFn {
+        let file = syn::parse_file(src).expect("parse economic.rs");
+        file.items
+            .into_iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(f) if f.sig.ident == "get_block_subsidy" => Some(f),
+                _ => None,
+            })
+            .expect("get_block_subsidy")
+    }
+
+    fn is_shift_guard_return(stmt: &syn::Stmt) -> bool {
+        let syn::Stmt::Expr(syn::Expr::If(if_expr), _) = stmt else {
+            return false;
+        };
+        if if_expr.else_branch.is_some() {
+            return false;
+        }
+        if_expr.then_branch.stmts.iter().any(|stmt| {
+            let syn::Stmt::Expr(syn::Expr::Return(ret), _) = stmt else {
+                return false;
+            };
+            let Some(expr) = &ret.expr else {
+                return false;
+            };
+            matches!(
+                &**expr,
+                syn::Expr::Lit(lit)
+                    if matches!(&lit.lit, syn::Lit::Int(n) if n.base10_digits() == "0")
+            )
+        })
+    }
+
+    fn local_ident(pat: &syn::Pat) -> Option<String> {
+        match pat {
+            syn::Pat::Ident(ident) => Some(ident.ident.to_string()),
+            syn::Pat::Type(ty) => local_ident(&ty.pat),
+            _ => None,
+        }
+    }
+
+    fn subst_path(expr: &syn::Expr, subst: &[(String, syn::Expr)]) -> syn::Expr {
+        match expr {
+            syn::Expr::Path(path) if path.path.segments.len() == 1 => {
+                let name = path.path.segments[0].ident.to_string();
+                if let Some((_, value)) = subst.iter().rev().find(|(n, _)| n == &name) {
+                    return value.clone();
+                }
+                expr.clone()
+            }
+            syn::Expr::Paren(paren) => {
+                let inner = subst_path(&paren.expr, subst);
+                syn::parse_quote!((#inner))
+            }
+            syn::Expr::Binary(bin) => {
+                let left = subst_path(&bin.left, subst);
+                let right = subst_path(&bin.right, subst);
+                let op = &bin.op;
+                syn::parse_quote!(#left #op #right)
+            }
+            syn::Expr::Unary(unary) => {
+                let inner = subst_path(&unary.expr, subst);
+                let op = &unary.op;
+                syn::parse_quote!(#op #inner)
+            }
+            _ => expr.clone(),
+        }
+    }
+
+    /// Inline the statements after the shift guard into one expression.
+    ///
+    /// `translate_if_expr_to_dynamic` (`z3_translator.rs:10842-10848`) only
+    /// translates the last expression of an if-else and does not bind lets
+    /// in that block, so `let base_subsidy = INITIAL_SUBSIDY; let subsidy =
+    /// base_subsidy >> halving_period; subsidy` would leave `subsidy` free.
+    /// The alias lets are substituted; `debug_assert!` is dropped (it is not
+    /// part of the subsidy value). The shift and the `height / HALVING_INTERVAL`
+    /// binding stay the production operators.
+    fn inline_subsidy_value(stmts: &[syn::Stmt]) -> syn::Expr {
+        let mut subst: Vec<(String, syn::Expr)> = Vec::new();
+        let mut last: Option<syn::Expr> = None;
+        for stmt in stmts {
+            match stmt {
+                syn::Stmt::Macro(_) => {}
+                syn::Stmt::Local(local) => {
+                    let name = local_ident(&local.pat)
+                        .expect("subsidy let after the guard must be a simple binding");
+                    let init = local
+                        .init
+                        .as_ref()
+                        .expect("subsidy let after the guard must have an initializer");
+                    assert!(
+                        init.diverge.is_none(),
+                        "subsidy let after the guard must not use let-else"
+                    );
+                    let expr = subst_path(&init.expr, &subst);
+                    subst.push((name, expr));
+                }
+                syn::Stmt::Expr(expr, _) => {
+                    last = Some(subst_path(expr, &subst));
+                }
+                other => panic!("unexpected statement after the subsidy shift guard: {other:?}"),
+            }
+        }
+        let expr = last.expect("get_block_subsidy must return the subsidy after the guard");
+        let text = quote::quote!(#expr).to_string();
+        assert!(
+            text.contains(">>") && text.contains("halving_period"),
+            "inlined else must keep the production shift, got {text}"
+        );
+        expr
+    }
+
+    /// Two copies of the real production body, combined as
+    /// `GetBlockSubsidy(h + H) - (GetBlockSubsidy(h) >> 1)` with
+    /// `Ensures result == 0`. The offset uses the protocol literal `H`,
+    /// not the `HALVING_INTERVAL` name from a mutated body, so an interval
+    /// or division edit can flip the relation.
+    ///
+    /// Query-side lowerings:
+    /// - Each copy keeps the production `let halving_period = height /
+    ///   HALVING_INTERVAL` and the early `if halving_period >= 64 { return
+    ///   … }` form, so `note_shift_guard` / `exact_shift_guard`
+    ///   (`z3_translator.rs:1516`, `:13057`) close the variable-shift bound.
+    ///   A value if-else for the same guard is not recorded as a shift path.
+    /// - The first early return is the production `return 0` (both eras
+    ///   are past 64). The second is `return 0 - (first_subsidy >> 1)`:
+    ///   the production would return 0 for the later height, and the
+    ///   query identity is `second - (first >> 1)`.
+    /// - The `let base_subsidy = INITIAL_SUBSIDY; let subsidy = base_subsidy
+    ///   >> halving_period; subsidy` alias is inlined to
+    ///   `INITIAL_SUBSIDY >> halving_period` (or the mutated shift).
+    ///   `debug_assert!` is dropped. A bare `(first, second)` tuple return
+    ///   is not used: `Expr::Tuple` keeps only the first element
+    ///   (`z3_translator.rs:692`).
+    /// - `Requires height <= u64::MAX - H` so `height + H` stays in `Natural`.
+    /// - This does not lock `get_block_subsidy_for_network` or the regtest
+    ///   interval.
+    /// - A uniform `>> (halving_period + 1)` on both copies preserves
+    ///   FloorHalf (the same extra shift on both sides). That mutant is
+    ///   locked by the piecewise identity, not by this relation.
+    fn stitch_floor_half(func: &syn::ItemFn, interval: u64) -> syn::ItemFn {
+        let stmts = &func.block.stmts;
+        let idx = stmts
+            .iter()
+            .position(is_shift_guard_return)
+            .expect("get_block_subsidy must keep `if halving_period >= 64 { return 0; }`");
+        let syn::Stmt::Expr(syn::Expr::If(if_expr), _) = &stmts[idx] else {
+            unreachable!("is_shift_guard_return");
+        };
+        assert!(
+            if_expr.else_branch.is_none(),
+            "shift guard must be a bare early return"
+        );
+        let cond = &if_expr.cond;
+        let prefix = &stmts[..idx];
+        let shift = inline_subsidy_value(&stmts[idx + 1..]);
+        let interval_lit: syn::LitInt =
+            syn::parse_str(&interval.to_string()).expect("halving interval literal");
+        syn::parse_quote! {
+            fn get_block_subsidy_floor_half(height: Natural) -> Integer {
+                #(#prefix)*
+                if #cond {
+                    return 0;
+                }
+                let first_subsidy = #shift;
+                let height_next = height + #interval_lit;
+                let height = height_next;
+                #(#prefix)*
+                if #cond {
+                    return 0 - (first_subsidy >> 1);
+                }
+                let second_subsidy = #shift;
+                second_subsidy - (first_subsidy >> 1)
+            }
+        }
+    }
+
+    fn query_clause(
+        func: &syn::ItemFn,
+        name: &str,
+        clause: &str,
+        requires: &[&str],
+    ) -> VerificationResult {
+        let mut function = make_function_to_verify(
+            std::path::Path::new("src/economic.rs"),
+            name,
+            &func.attrs,
+            func,
+        );
+        let mut contracts: Vec<Contract> = requires
+            .iter()
+            .map(|req| Contract {
+                contract_type: ContractType::Requires,
+                condition: (*req).to_string(),
+                expr: syn::parse_str(req).ok(),
+                is_spec_derived: true,
+            })
+            .collect();
+        contracts.push(Contract {
+            contract_type: ContractType::Ensures,
+            condition: clause.to_string(),
+            expr: syn::parse_str(clause).ok(),
+            is_spec_derived: true,
+        });
+        function.contracts = contracts;
+        verify_function(&function, 10, &[])
+    }
+
+    fn must_pass(result: VerificationResult, what: &str) {
+        match result {
+            VerificationResult::Passed { body_translated } => {
+                assert!(body_translated, "{what} must use the body");
+            }
+            other => panic!("{what} must pass, got {other:?}"),
+        }
+    }
+
+    fn must_flip(result: VerificationResult, what: &str) {
+        assert!(
+            matches!(
+                result,
+                VerificationResult::Failed {
+                    kind: FailureKind::Counterexample,
+                    ..
+                }
+            ),
+            "{what} must flip the identity, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn piecewise_interval_and_floor_half_pass_and_edits_flip() {
+        if !consensus_workspace_present() {
+            return;
+        }
+        let interval = protocol_u64("H");
+        assert_eq!(
+            interval,
+            impl_u64("HALVING_INTERVAL"),
+            "protocol H must match production HALVING_INTERVAL"
+        );
+        let initial = initial_subsidy();
+        let guard = subsidy_shift_guard();
+        let src = subsidy_src();
+        let func = subsidy_fn_from(&src);
+
+        // Non-vacuity: a wrong expected shift must not pass the real body.
+        let wrong_piecewise = format!(
+            "result == if (height / {interval}) >= {guard} {{ 0 }} else {{ {initial} >> ((height / {interval}) + 1) }}"
+        );
+        must_flip(
+            identity_query_clause(&func, &wrong_piecewise),
+            "wrong piecewise expected value",
+        );
+
+        // Interval / division mutant on the real body, against the full
+        // piecewise formula already used by `shift_and_guard_pass_and_both_edits_flip`.
+        let interval_src = must_replace_in_subsidy(
+            &src,
+            "height / HALVING_INTERVAL",
+            "height / (HALVING_INTERVAL + 1)",
+        );
+        let interval_fn = subsidy_fn_from(&interval_src);
+        must_flip(
+            identity_query(&interval_fn),
+            "halving-interval division edit",
+        );
+
+        let height_max = u64::MAX - interval;
+        let requires = [format!("height <= {height_max}")];
+        let require_refs: Vec<&str> = requires.iter().map(String::as_str).collect();
+        let floor_clause = "result == 0";
+        let stitched = stitch_floor_half(&func, interval);
+        must_pass(
+            query_clause(
+                &stitched,
+                "get_block_subsidy_floor_half",
+                floor_clause,
+                &require_refs,
+            ),
+            "unpatched floor-half stitch",
+        );
+
+        // Non-vacuity: a wrong expected difference must not pass.
+        must_flip(
+            query_clause(
+                &stitched,
+                "get_block_subsidy_floor_half",
+                "result == 1",
+                &require_refs,
+            ),
+            "wrong floor-half expected value",
+        );
+
+        let interval_stitched = stitch_floor_half(&interval_fn, interval);
+        must_flip(
+            query_clause(
+                &interval_stitched,
+                "get_block_subsidy_floor_half",
+                floor_clause,
+                &require_refs,
+            ),
+            "halving-interval division edit on floor-half",
+        );
+
+        // Shift-amount mutant on the real body flips the piecewise
+        // identity. A uniform `>> (halving_period + 1)` on both FloorHalf
+        // copies would still satisfy the relation, but the extra amount
+        // is not the guarded `halving_period`, so the shift-bound check
+        // stays open (`record_shift_bound` at z3_translator.rs:1532).
+        // That mutant is therefore locked by the piecewise identity, not
+        // by this relation.
+        let shift_src = must_replace_in_subsidy(
+            &src,
+            "base_subsidy >> halving_period",
+            "base_subsidy >> (halving_period + 1)",
+        );
+        let shift_fn = subsidy_fn_from(&shift_src);
+        must_flip(
+            identity_query(&shift_fn),
+            "shift-amount edit on the piecewise identity",
+        );
+    }
+
+    fn identity_query_clause(func: &syn::ItemFn, identity: &str) -> VerificationResult {
+        query_clause(func, "get_block_subsidy", identity, &[])
     }
 }
 

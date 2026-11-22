@@ -64,6 +64,10 @@ pub struct Z3Translator {
     byte_lens: std::cell::RefCell<std::collections::HashMap<String, u32>>,
     /// Parameter name to its Rust type name, references stripped.
     param_type_names: std::cell::RefCell<std::collections::HashMap<String, String>>,
+    /// True while translating an ensures or requires clause, so an
+    /// unguarded variable shift can be warned about without changing
+    /// the verification result.
+    translating_contract: std::cell::RefCell<bool>,
 }
 
 #[cfg(feature = "z3")]
@@ -95,6 +99,7 @@ impl Z3Translator {
             value_alias: std::cell::RefCell::new(std::collections::HashMap::new()),
             byte_lens: std::cell::RefCell::new(std::collections::HashMap::new()),
             param_type_names: std::cell::RefCell::new(std::collections::HashMap::new()),
+            translating_contract: std::cell::RefCell::new(false),
         }
     }
 
@@ -1534,11 +1539,16 @@ impl Z3Translator {
     ) {
         let width = Int::from_i64(&self.ctx, 64);
         let in_range = amount.lt(&width);
-        let obligation = amount_name
+        let path = amount_name
             .and_then(|name| vars.get(&format!("__shift_path_{name}")))
-            .and_then(|v| v.as_bool())
-            .map(|path| path.implies(&in_range))
-            .unwrap_or(in_range);
+            .and_then(|v| v.as_bool());
+        if path.is_none() && *self.translating_contract.borrow() {
+            // Diagnostic only: SMT still uses 0-at->=64. The result is unchanged.
+            eprintln!(
+                "Warning: contract has a variable-amount shift with no guard; SMT treats a shift of 64 or more as 0"
+            );
+        }
+        let obligation = path.map(|path| path.implies(&in_range)).unwrap_or(in_range);
         let n = vars
             .keys()
             .filter(|name| name.starts_with("__shift_bound_"))
@@ -3005,7 +3015,7 @@ impl Z3Translator {
         return_type: Option<&syn::Type>,
     ) -> Result<(z3::ast::Dynamic<'_>, Vec<z3::ast::Bool<'_>>), TranslationError> {
         let (mut vars, type_constraints) = self.build_shared_vars(param_types, return_type);
-        let expr = self.translate_expr_with_vars(&contract.condition, &mut vars)?;
+        let expr = self.translate_contract_expr(&contract.condition, &mut vars)?;
         Ok((expr, type_constraints))
     }
 
@@ -3021,7 +3031,18 @@ impl Z3Translator {
         contract: &Contract,
         vars: &mut Z3VarMap<'a>,
     ) -> Result<z3::ast::Dynamic<'a>, TranslationError> {
-        self.translate_expr_with_vars(&contract.condition, vars)
+        self.translate_contract_expr(&contract.condition, vars)
+    }
+
+    fn translate_contract_expr<'a>(
+        &'a self,
+        expr: &Expr,
+        vars: &mut Z3VarMap<'a>,
+    ) -> Result<z3::ast::Dynamic<'a>, TranslationError> {
+        *self.translating_contract.borrow_mut() = true;
+        let result = self.translate_expr_with_vars(expr, vars);
+        *self.translating_contract.borrow_mut() = false;
+        result
     }
 
     /// Build a shared `Z3VarMap` (parameter variables + "result") and the
@@ -10403,6 +10424,62 @@ impl Z3Translator {
             None => return Ok(None),
         };
 
+        // Then-branch `let`s must not leak into the guard path or the
+        // continuation. Snapshot the pre-branch vars and restore them
+        // before returning to the caller (`note_shift_guard` reads the
+        // guard ident from this map). Re-insert any then-branch
+        // obligation keys, renumbered, under `cond_bool`.
+        let snapshot = vars.clone();
+        let found = self.translate_if_early_return_lets(if_expr, vars, cond_bool.clone())?;
+        let new_obligations = Self::then_branch_obligations(vars, &snapshot);
+        *vars = snapshot;
+        self.reinsert_then_branch_obligations(vars, &cond_bool, new_obligations);
+        Ok(found)
+    }
+
+    /// Obligation keys the then-branch newly recorded. The verifier
+    /// currently reads only `__shift_bound_*` after the body
+    /// (`shift_bounds_hold`). `__shift_path_*` is a path for later
+    /// shifts in the same branch and is already baked into the bound;
+    /// re-inserting it would leak into the continuation. `__arr_*` is
+    /// then-branch array storage, not a post-body obligation. No
+    /// overflow or division obligations are stored as var-map keys.
+    fn then_branch_obligations<'a>(vars: &Z3VarMap<'a>, snapshot: &Z3VarMap<'a>) -> Vec<Bool<'a>> {
+        vars.iter()
+            .filter(|(name, _)| name.starts_with("__shift_bound_"))
+            .filter(|(name, _)| !snapshot.contains_key(*name))
+            .filter_map(|(_, value)| value.as_bool())
+            .collect()
+    }
+
+    /// Re-insert then-branch obligations after the snapshot restore,
+    /// renumbered so they do not collide, as `cond ⇒ obligation`.
+    fn reinsert_then_branch_obligations<'a>(
+        &'a self,
+        vars: &mut Z3VarMap<'a>,
+        cond_bool: &Bool<'a>,
+        obligations: Vec<Bool<'a>>,
+    ) {
+        for obligation in obligations {
+            let n = vars
+                .keys()
+                .filter(|name| name.starts_with("__shift_bound_"))
+                .count();
+            vars.insert(
+                format!("__shift_bound_{n}"),
+                cond_bool.implies(&obligation).into(),
+            );
+        }
+    }
+
+    /// Translate then-branch lets and a possible early return, writing
+    /// into `vars`. The caller restores the pre-branch snapshot.
+    fn translate_if_early_return_lets<'a>(
+        &'a self,
+        if_expr: &syn::ExprIf,
+        vars: &mut Z3VarMap<'a>,
+        cond_bool: Bool<'a>,
+    ) -> Result<Option<(z3::ast::Bool<'a>, z3::ast::Bool<'a>)>, TranslationError> {
         for stmt in &if_expr.then_branch.stmts {
             match stmt {
                 Stmt::Local(local) => {
@@ -33865,6 +33942,193 @@ mod tests {
             &[],
             "i64",
             "result == 2",
+        );
+    }
+
+    #[test]
+    fn then_branch_let_does_not_change_shift_guard_path() {
+        let tr = Z3Translator::new(10000);
+        let func: syn::ItemFn = syn::parse_str(
+            r#"
+            fn f(s: u64, x: u64) -> u64 {
+                if s >= 64 {
+                    let s = 0;
+                    return 0;
+                }
+                x >> s
+            }
+            "#,
+        )
+        .unwrap();
+        let mut param_types = std::collections::HashMap::new();
+        param_types.insert("s".to_string(), syn::parse_str::<syn::Type>("u64").unwrap());
+        param_types.insert("x".to_string(), syn::parse_str::<syn::Type>("u64").unwrap());
+        let return_type: syn::Type = syn::parse_str("u64").unwrap();
+        let (mut vars, type_constraints) = tr.build_shared_vars(&param_types, Some(&return_type));
+        tr.translate_function_body(&func, &mut vars)
+            .unwrap()
+            .expect("body");
+        let path = vars
+            .get("__shift_path_s")
+            .and_then(|v| v.as_bool())
+            .expect("shift guard path for s");
+        let s = vars.get("s").and_then(|v| v.as_int()).expect("s");
+        let ctx = tr.context();
+        // The path must still be `s < 64`, not the then-branch `let s = 0`.
+        let solver = Solver::new(ctx);
+        for c in &type_constraints {
+            solver.assert(c);
+        }
+        solver.assert(&s._eq(&Int::from_i64(ctx, 64)));
+        solver.assert(&path);
+        assert_eq!(
+            solver.check(),
+            SatResult::Unsat,
+            "then-branch let s = 0 must not make the guard path tautological"
+        );
+        let solver = Solver::new(ctx);
+        for c in &type_constraints {
+            solver.assert(c);
+        }
+        solver.assert(&s._eq(&Int::from_i64(ctx, 0)));
+        solver.assert(&path);
+        assert_eq!(solver.check(), SatResult::Sat, "s = 0 is below the guard");
+
+        prove_ensures(
+            r#"
+            fn f(s: u64, x: u64) -> u64 {
+                if s >= 64 {
+                    let s = 0;
+                    return 0;
+                }
+                x >> s
+            }
+            "#,
+            &[("s", "u64"), ("x", "u64")],
+            "u64",
+            "result == if s >= 64 { 0 } else { x >> s }",
+        );
+    }
+
+    fn shift_bounds_are_tautologies(ctx: &Context, vars: &Z3VarMap<'_>) -> bool {
+        let bounds: Vec<_> = vars
+            .iter()
+            .filter(|(name, _)| name.starts_with("__shift_bound_"))
+            .filter_map(|(_, value)| value.as_bool())
+            .collect();
+        if bounds.is_empty() {
+            return true;
+        }
+        for bound in bounds {
+            let solver = Solver::new(ctx);
+            solver.assert(&bound.not());
+            if solver.check() != SatResult::Unsat {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn unguarded_shift_in_early_return_still_open() {
+        let tr = Z3Translator::new(10000);
+        let func: syn::ItemFn = syn::parse_str(
+            r#"
+            fn f(c: bool, s: u64, x: u64) -> u64 {
+                if c {
+                    return x >> s;
+                }
+                0
+            }
+            "#,
+        )
+        .unwrap();
+        let mut param_types = std::collections::HashMap::new();
+        param_types.insert(
+            "c".to_string(),
+            syn::parse_str::<syn::Type>("bool").unwrap(),
+        );
+        param_types.insert("s".to_string(), syn::parse_str::<syn::Type>("u64").unwrap());
+        param_types.insert("x".to_string(), syn::parse_str::<syn::Type>("u64").unwrap());
+        let return_type: syn::Type = syn::parse_str("u64").unwrap();
+        let (mut vars, _type_constraints) = tr.build_shared_vars(&param_types, Some(&return_type));
+        tr.translate_function_body(&func, &mut vars)
+            .unwrap()
+            .expect("body");
+        assert!(
+            vars.keys().any(|name| name.starts_with("__shift_bound_")),
+            "the then-branch shift bound must survive the snapshot restore"
+        );
+        assert!(
+            !shift_bounds_are_tautologies(tr.context(), &vars),
+            "an unguarded x >> s in `if c {{ return x >> s; }}` must stay open"
+        );
+
+        let mut verifier = crate::translator::z3_verifier::Z3Verifier::new(10000);
+        let ensures: syn::Expr = syn::parse_str("result == if c { x >> s } else { 0 }").unwrap();
+        let contract = Contract {
+            contract_type: crate::parser::contracts::ContractType::Ensures,
+            condition: ensures,
+            comment: None,
+        };
+        match verifier.verify_contract_with_context(&contract, Some(&func), &[], &[]) {
+            crate::translator::z3_verifier::VerificationResult::Unknown { reason } => {
+                assert!(
+                    reason.contains("shift amount is not below 64"),
+                    "expected open shift bound, got {reason}"
+                );
+            }
+            other => panic!("unguarded then-branch shift must be Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guarded_shift_in_early_return_is_not_over_strict() {
+        let tr = Z3Translator::new(10000);
+        let func: syn::ItemFn = syn::parse_str(
+            r#"
+            fn f(c: bool, s: u64, x: u64) -> u64 {
+                if s < 64 && c {
+                    return x >> s;
+                }
+                0
+            }
+            "#,
+        )
+        .unwrap();
+        let mut param_types = std::collections::HashMap::new();
+        param_types.insert(
+            "c".to_string(),
+            syn::parse_str::<syn::Type>("bool").unwrap(),
+        );
+        param_types.insert("s".to_string(), syn::parse_str::<syn::Type>("u64").unwrap());
+        param_types.insert("x".to_string(), syn::parse_str::<syn::Type>("u64").unwrap());
+        let return_type: syn::Type = syn::parse_str("u64").unwrap();
+        let (mut vars, _type_constraints) = tr.build_shared_vars(&param_types, Some(&return_type));
+        tr.translate_function_body(&func, &mut vars)
+            .unwrap()
+            .expect("body");
+        assert!(
+            vars.keys().any(|name| name.starts_with("__shift_bound_")),
+            "the guarded then-branch shift bound must survive the snapshot restore"
+        );
+        assert!(
+            shift_bounds_are_tautologies(tr.context(), &vars),
+            "`if s < 64 && c {{ return x >> s; }}` must not be over-strict"
+        );
+
+        prove_ensures(
+            r#"
+            fn f(c: bool, s: u64, x: u64) -> u64 {
+                if s < 64 && c {
+                    return x >> s;
+                }
+                0
+            }
+            "#,
+            &[("c", "bool"), ("s", "u64"), ("x", "u64")],
+            "u64",
+            "result == if s < 64 && c { x >> s } else { 0 }",
         );
     }
 }

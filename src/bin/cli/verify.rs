@@ -19692,6 +19692,9 @@ mod p2sh_fast_identity {
     /// STRICTENC/BIP66, and ECDSA are not modeled: after the gates, the query
     /// returns the production `signature::verify_signature(...)` call from
     /// `verify_p2sh_p2pkh_redeem` (2027-2036) as an uninterpreted Int.
+    /// Presence of that call is asserted as text, not by a rename mutation.
+    /// The two mutations lock the length gate (`len() != 23` vs `!= 24`) and
+    /// that `OP_EQUAL` is checked at template index 22, not 21 (mod.rs:2126).
     /// Named consts are replaced by literals parsed from flags.rs / opcodes.rs
     /// because those paths are not in the translator's const files.
     const P2SH_LEN: &str = "script_pubkey.len() != 23";
@@ -19820,8 +19823,7 @@ mod p2sh_fast_identity {
 
     fn verify_signature_call(fn_src: &str) -> String {
         let at = fn_src
-            .find("verify_signature_skipped(")
-            .or_else(|| fn_src.find(VERIFY_CALL))
+            .find(VERIFY_CALL)
             .expect("production redeem must call verify_signature");
         let start = fn_src[..at].rfind("signature::").unwrap_or(at);
         let paren = fn_src[at..].find('(').expect("call paren") + at;
@@ -19958,6 +19960,11 @@ mod p2sh_fast_identity {
         for gate in [P2SH_FLAG, P2SH_LEN, P2SH_HASH160, P2SH_PUSH20, P2SH_EQUAL] {
             assert!(fast.contains(gate), "production must contain {gate}");
         }
+        let redeem = slice_fn(&script, "fn verify_p2sh_p2pkh_redeem(");
+        assert!(
+            redeem.contains(VERIFY_CALL),
+            "production redeem must call verify_signature"
+        );
         let (src, clause) = query_src(&script, &flags, &opcodes);
         must_pass(
             identity_query(&extract(&src), &clause),
@@ -19974,16 +19981,16 @@ mod p2sh_fast_identity {
             identity_query(&extract(&boundary_src), &clause),
             "moving the P2SH length gate",
         );
-        let skipped = must_replace_in(
+        let equal = must_replace_in(
             &script,
-            "verify_p2sh_p2pkh_redeem",
-            VERIFY_CALL,
-            "verify_signature_skipped(",
+            "try_verify_p2sh_fast_path",
+            P2SH_EQUAL,
+            "script_pubkey[21] != OP_EQUAL",
         );
-        let (skipped_src, _) = query_src(&skipped, &flags, &opcodes);
+        let (equal_src, _) = query_src(&equal, &flags, &opcodes);
         must_flip(
-            identity_query(&extract(&skipped_src), &clause),
-            "renaming verify_signature",
+            identity_query(&extract(&equal_src), &clause),
+            "moving the P2SH OP_EQUAL index",
         );
     }
 }
@@ -19999,6 +20006,9 @@ mod p2wpkh_fast_identity {
     /// Pubkey-hash, BIP143, STRICTENC/BIP66, and ECDSA are not modeled: after
     /// the gates, the query returns the production `signature::verify_signature(...)`
     /// call from `finish_p2wpkh_ecdsa` (2384-2393) as an uninterpreted Int.
+    /// Presence of that call is asserted as text, not by a rename mutation.
+    /// The two mutations lock the length gate (`len() != 22` vs `!= 23`) and
+    /// the witness-count gate (`witness.len() != 2` vs `!= 3`, mod.rs:2588).
     /// Named consts are replaced by literals parsed from flags.rs / opcodes.rs.
     const P2WPKH_LEN: &str = "script_pubkey.len() != 22";
     const P2WPKH_FLAG: &str = "flags & crate::script::flags::SCRIPT_VERIFY_WITNESS";
@@ -20133,8 +20143,7 @@ mod p2wpkh_fast_identity {
 
     fn verify_signature_call(fn_src: &str) -> String {
         let at = fn_src
-            .find("verify_signature_skipped(")
-            .or_else(|| fn_src.find(VERIFY_CALL))
+            .find(VERIFY_CALL)
             .expect("production finish_p2wpkh_ecdsa must call verify_signature");
         let start = fn_src[..at].rfind("signature::").unwrap_or(at);
         let paren = fn_src[at..].find('(').expect("call paren") + at;
@@ -20275,6 +20284,11 @@ mod p2wpkh_fast_identity {
         ] {
             assert!(fast.contains(gate), "production must contain {gate}");
         }
+        let finish = slice_fn(&script, "fn finish_p2wpkh_ecdsa(");
+        assert!(
+            finish.contains(VERIFY_CALL),
+            "production finish_p2wpkh_ecdsa must call verify_signature"
+        );
         let (src, clause) = query_src(&script, &flags, &opcodes);
         must_pass(
             identity_query(&extract(&src), &clause),
@@ -20291,16 +20305,16 @@ mod p2wpkh_fast_identity {
             identity_query(&extract(&boundary_src), &clause),
             "moving the P2WPKH length gate",
         );
-        let skipped = must_replace_in(
+        let witness = must_replace_in(
             &script,
-            "finish_p2wpkh_ecdsa",
-            VERIFY_CALL,
-            "verify_signature_skipped(",
+            "try_verify_p2wpkh_fast_path",
+            "witness.len() != 2",
+            "witness.len() != 3",
         );
-        let (skipped_src, _) = query_src(&skipped, &flags, &opcodes);
+        let (witness_src, _) = query_src(&witness, &flags, &opcodes);
         must_flip(
-            identity_query(&extract(&skipped_src), &clause),
-            "renaming verify_signature",
+            identity_query(&extract(&witness_src), &clause),
+            "moving the P2WPKH witness-count gate",
         );
     }
 }

@@ -445,7 +445,7 @@ impl Z3Verifier {
                         let known_names: std::collections::HashSet<&str> = param_types
                             .keys()
                             .map(|s| s.as_str())
-                            .chain(std::iter::once("result"))
+                            .chain(["result", "result_is_err"])
                             .collect();
                         ce.assignments.keys().any(|k| {
                             let bare = k

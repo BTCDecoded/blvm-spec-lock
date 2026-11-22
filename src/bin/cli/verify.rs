@@ -18153,7 +18153,11 @@ mod weight_limit_identity {
     }
 
     fn stitch(body: &str) -> syn::ItemFn {
-        let src = format!("fn connect_block_inner(block: &Block) -> i64 {{\n{body}\n}}\n");
+        // Bool parameters so the postconditions and try_weight_limit share
+        // the same invented flags (they are not fields of `block`).
+        let src = format!(
+            "fn connect_block_inner(block: &Block, block_weight: i64, script_sig_len: i64, total_sigop_cost: i64, finality_bad: bool, height_bad: bool, witness_len_bad: bool, tx_empty: bool, too_many_tx: bool, header_bad: bool, bits_bad: bool, difficulty_bad: bool, timewarp94_bad: bool, pow_bad: bool, bip54_time_bad: bool, version_bad: bool, bip90_bad: bool, merkle_bad: bool, merkle_mutated: bool, bip30_bad: bool, bip34_bad: bool, bip54_coin_bad: bool, bip54_size_bad: bool, assume_valid_bad: bool, relative_lock_bad: bool, extra_coinbase: bool, production_bad: bool, not_coinbase: bool, subsidy_over: bool, witness_unexpected: bool, witness_missing: bool, witness_commit_bad: bool, signet_bad: bool) -> i64 {{\n{body}\n}}\n"
+        );
         let file = syn::parse_file(&src).unwrap_or_else(|err| panic!("parse weight: {err}"));
         match &file.items[0] {
             syn::Item::Fn(func) => func.clone(),
@@ -18177,6 +18181,13 @@ mod weight_limit_identity {
         verify_function(&function, 30, &[])
     }
 
+    /// Other `try_weight_limit` rejects besides the bound under test.
+    /// `finality_bad` is the opaque input used when `is_final_tx` is not in
+    /// the stitched `connect_block_inner` body.
+    fn other_bads() -> &'static str {
+        "finality_bad || height_bad || witness_len_bad || tx_empty || too_many_tx || header_bad || bits_bad || difficulty_bad || timewarp94_bad || pow_bad || bip54_time_bad || version_bad || bip90_bad || merkle_bad || merkle_mutated || bip30_bad || bip34_bad || bip54_coin_bad || bip54_size_bad || assume_valid_bad || relative_lock_bad || extra_coinbase || production_bad || not_coinbase || subsidy_over || witness_unexpected || witness_missing || witness_commit_bad || signet_bad"
+    }
+
     #[test]
     fn block_weight_limit_passes_and_both_edits_flip() {
         if !consensus_workspace_present() {
@@ -18187,8 +18198,15 @@ mod weight_limit_identity {
         let src = std::fs::read_to_string(&path).expect("connect.rs");
         let body = fn_body(&src, "connect_block_inner");
         let func = stitch(&body);
-        let block = func.block.clone();
-        let clause = quote::quote!(#block).to_string();
+        // Weight cap (connect.rs:3411-3421): a block is invalid when
+        // block_weight > MAX_BLOCK_WEIGHT (4_000_000, constants.rs:16).
+        // At exactly the cap the `>` check does not reject. Zero (3401-3403)
+        // and the *2 DoS bound (3404-3410) do not fire at that weight.
+        // Other connect rejects are listed so the cap is the remaining cause.
+        let clause = format!(
+            "result < 0 || {} || script_sig_len < 2 || script_sig_len > 100 || total_sigop_cost > 80000 || block_weight != 4_000_000 || result > 0",
+            other_bads()
+        );
         match identity_query(&func, &clause) {
             VerificationResult::Passed { body_translated } => {
                 assert!(body_translated, "block_weight_limit must use the body");
@@ -18196,10 +18214,12 @@ mod weight_limit_identity {
             other => panic!("unpatched block_weight_limit must pass, got {other:?}"),
         }
         let needle = "block_weight > crate::constants::MAX_BLOCK_WEIGHT as u64 {";
-        let boundary = stitch(&body.replace(
+        let boundary_src = body.replace(
             needle,
             "block_weight >= crate::constants::MAX_BLOCK_WEIGHT as u64 {",
-        ));
+        );
+        assert_ne!(boundary_src, body, "the weight cap must change");
+        let boundary = stitch(&boundary_src);
         let boundary_result = identity_query(&boundary, &clause);
         assert!(
             matches!(
@@ -18235,16 +18255,32 @@ mod weight_limit_identity {
         let src = std::fs::read_to_string(&path).expect("connect.rs");
         let body = fn_body(&src, "connect_block_inner");
         let func = stitch(&body);
-        let block = func.block.clone();
-        let clause = quote::quote!(#block).to_string();
+        // Sigop cap (connect.rs:4080-4086): a block is invalid when
+        // total_sigop_cost > MAX_BLOCK_SIGOPS_COST (80_000, constants.rs:115).
+        // At exactly the cap the `>` check does not reject. The same
+        // predicate appears on the non-production profile path at 3755-3764;
+        // both must stay the same relation or the body specializer drops.
+        let clause = format!(
+            "result < 0 || {} || script_sig_len < 2 || script_sig_len > 100 || block_weight < 1 || block_weight > 4_000_000 || total_sigop_cost != 80_000 || result > 0",
+            other_bads()
+        );
         match identity_query(&func, &clause) {
             VerificationResult::Passed { body_translated } => {
                 assert!(body_translated, "block_sigop_limit must use the body");
             }
             other => panic!("unpatched block_sigop_limit must pass, got {other:?}"),
         }
-        let needle = "total_sigop_cost > MAX_BLOCK_SIGOPS_COST";
-        let boundary = stitch(&body.replace(needle, "total_sigop_cost >= MAX_BLOCK_SIGOPS_COST"));
+        let boundary_src = body
+            .replace(
+                "total_sigop_cost > crate::constants::MAX_BLOCK_SIGOPS_COST",
+                "total_sigop_cost >= crate::constants::MAX_BLOCK_SIGOPS_COST",
+            )
+            .replace(
+                "total_sigop_cost > MAX_BLOCK_SIGOPS_COST",
+                "total_sigop_cost >= MAX_BLOCK_SIGOPS_COST",
+            );
+        assert_ne!(boundary_src, body, "the sigop cap must change");
+        let boundary = stitch(&boundary_src);
         let boundary_result = identity_query(&boundary, &clause);
         assert!(
             matches!(
@@ -18256,7 +18292,17 @@ mod weight_limit_identity {
             ),
             "accepting the sigop cap must flip the identity, got {boundary_result:?}"
         );
-        let predicate = stitch(&body.replace(needle, "total_sigop_cost > 1"));
+        let predicate_src = body
+            .replace(
+                "total_sigop_cost > crate::constants::MAX_BLOCK_SIGOPS_COST",
+                "total_sigop_cost > 1",
+            )
+            .replace(
+                "total_sigop_cost > MAX_BLOCK_SIGOPS_COST",
+                "total_sigop_cost > 1",
+            );
+        assert_ne!(predicate_src, body, "the sigop predicate must change");
+        let predicate = stitch(&predicate_src);
         let predicate_result = identity_query(&predicate, &clause);
         assert!(
             matches!(
@@ -18280,8 +18326,14 @@ mod weight_limit_identity {
         let src = std::fs::read_to_string(&path).expect("connect.rs");
         let body = fn_body(&src, "connect_block_inner");
         let func = stitch(&body);
-        let block = func.block.clone();
-        let clause = quote::quote!(#block).to_string();
+        // Coinbase scriptSig length (connect.rs:3997-4009): invalid unless
+        // 2 <= script_sig_len <= 100. When other connect rejects are off,
+        // lengths in that inclusive range succeed and lengths outside it
+        // return result == 0.
+        let clause = format!(
+            "result < 0 || {} || block_weight < 1 || block_weight > 4_000_000 || total_sigop_cost > 80000 || (script_sig_len >= 2 && script_sig_len <= 100 && result > 0) || ((script_sig_len < 2 || script_sig_len > 100) && result == 0)",
+            other_bads()
+        );
         match identity_query(&func, &clause) {
             VerificationResult::Passed { body_translated } => {
                 assert!(body_translated, "coinbase_scriptsig_len must use the body");
@@ -18289,7 +18341,9 @@ mod weight_limit_identity {
             other => panic!("unpatched coinbase_scriptsig_len must pass, got {other:?}"),
         }
         let needle = "(2..=100)";
-        let boundary = stitch(&body.replace(needle, "(1..=100)"));
+        let boundary_src = body.replace(needle, "(1..=100)");
+        assert_ne!(boundary_src, body, "the scriptSig lower bound must change");
+        let boundary = stitch(&boundary_src);
         let boundary_result = identity_query(&boundary, &clause);
         assert!(
             matches!(
@@ -18301,7 +18355,9 @@ mod weight_limit_identity {
             ),
             "accepting a 1-byte coinbase scriptSig must flip the identity, got {boundary_result:?}"
         );
-        let predicate = stitch(&body.replace(needle, "(2..=101)"));
+        let predicate_src = body.replace(needle, "(2..=101)");
+        assert_ne!(predicate_src, body, "the scriptSig upper bound must change");
+        let predicate = stitch(&predicate_src);
         let predicate_result = identity_query(&predicate, &clause);
         assert!(
             matches!(

@@ -22157,7 +22157,8 @@ fn parse_weight_limit(block: &Block) -> Option<WeightLimit> {
         || !found.saw_weight_fn
         || !found.saw_zero
         || !found.saw_double
-        || !found.saw_version
+        // `header.version < 1` is gone; BIP90 now decides version floors
+        // (connect.rs:3440-3449). saw_bip90 still required.
         || !found.saw_bip90
         || !found.saw_merkle
         || !found.saw_bip30

@@ -64,6 +64,10 @@ pub struct Z3Translator {
     byte_lens: std::cell::RefCell<std::collections::HashMap<String, u32>>,
     /// Parameter name to its Rust type name, references stripped.
     param_type_names: std::cell::RefCell<std::collections::HashMap<String, String>>,
+    /// True while translating an ensures or requires clause, so an
+    /// unguarded variable shift can be warned about without changing
+    /// the verification result.
+    translating_contract: std::cell::RefCell<bool>,
 }
 
 #[cfg(feature = "z3")]
@@ -95,6 +99,7 @@ impl Z3Translator {
             value_alias: std::cell::RefCell::new(std::collections::HashMap::new()),
             byte_lens: std::cell::RefCell::new(std::collections::HashMap::new()),
             param_type_names: std::cell::RefCell::new(std::collections::HashMap::new()),
+            translating_contract: std::cell::RefCell::new(false),
         }
     }
 
@@ -1534,11 +1539,16 @@ impl Z3Translator {
     ) {
         let width = Int::from_i64(&self.ctx, 64);
         let in_range = amount.lt(&width);
-        let obligation = amount_name
+        let path = amount_name
             .and_then(|name| vars.get(&format!("__shift_path_{name}")))
-            .and_then(|v| v.as_bool())
-            .map(|path| path.implies(&in_range))
-            .unwrap_or(in_range);
+            .and_then(|v| v.as_bool());
+        if path.is_none() && *self.translating_contract.borrow() {
+            // Diagnostic only: SMT still uses 0-at->=64. The result is unchanged.
+            eprintln!(
+                "Warning: contract has a variable-amount shift with no guard; SMT treats a shift of 64 or more as 0"
+            );
+        }
+        let obligation = path.map(|path| path.implies(&in_range)).unwrap_or(in_range);
         let n = vars
             .keys()
             .filter(|name| name.starts_with("__shift_bound_"))
@@ -3005,7 +3015,7 @@ impl Z3Translator {
         return_type: Option<&syn::Type>,
     ) -> Result<(z3::ast::Dynamic<'_>, Vec<z3::ast::Bool<'_>>), TranslationError> {
         let (mut vars, type_constraints) = self.build_shared_vars(param_types, return_type);
-        let expr = self.translate_expr_with_vars(&contract.condition, &mut vars)?;
+        let expr = self.translate_contract_expr(&contract.condition, &mut vars)?;
         Ok((expr, type_constraints))
     }
 
@@ -3021,7 +3031,18 @@ impl Z3Translator {
         contract: &Contract,
         vars: &mut Z3VarMap<'a>,
     ) -> Result<z3::ast::Dynamic<'a>, TranslationError> {
-        self.translate_expr_with_vars(&contract.condition, vars)
+        self.translate_contract_expr(&contract.condition, vars)
+    }
+
+    fn translate_contract_expr<'a>(
+        &'a self,
+        expr: &Expr,
+        vars: &mut Z3VarMap<'a>,
+    ) -> Result<z3::ast::Dynamic<'a>, TranslationError> {
+        *self.translating_contract.borrow_mut() = true;
+        let result = self.translate_expr_with_vars(expr, vars);
+        *self.translating_contract.borrow_mut() = false;
+        result
     }
 
     /// Build a shared `Z3VarMap` (parameter variables + "result") and the

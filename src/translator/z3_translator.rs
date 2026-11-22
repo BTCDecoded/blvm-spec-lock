@@ -25278,6 +25278,52 @@ fn is_bit_if(stmt: &Stmt) -> bool {
 }
 
 fn is_signalling_bit(expr: &Expr) -> bool {
+    // version_bits.rs:142-144: bit < 29, BIP9 prefix, and the bit itself.
+    let mut parts = Vec::new();
+    flatten_and(expr, &mut parts);
+    parts.len() == 3
+        && is_deployment_bit_range(parts[0])
+        && is_versionbits_prefix(parts[1])
+        && is_deployment_bit_set(parts[2])
+}
+
+fn flatten_and<'a>(expr: &'a Expr, parts: &mut Vec<&'a Expr>) {
+    let expr = peel_paren(expr);
+    if let Expr::Binary(bin) = expr {
+        if matches!(bin.op, syn::BinOp::And(_)) {
+            flatten_and(&bin.left, parts);
+            flatten_and(&bin.right, parts);
+            return;
+        }
+    }
+    parts.push(expr);
+}
+
+fn is_deployment_bit_range(expr: &Expr) -> bool {
+    let Expr::Binary(bin) = peel_paren(expr) else {
+        return false;
+    };
+    matches!(bin.op, syn::BinOp::Lt(_))
+        && field_of(&bin.left, "deployment", "bit")
+        && lit_i64(&bin.right) == Some(29)
+}
+
+fn is_versionbits_prefix(expr: &Expr) -> bool {
+    let Expr::Binary(eq) = peel_paren(expr) else {
+        return false;
+    };
+    if !matches!(eq.op, syn::BinOp::Eq(_)) || !path_is(&eq.right, "VERSIONBITS_TOP_BITS") {
+        return false;
+    }
+    let Expr::Binary(and) = peel_paren(&eq.left) else {
+        return false;
+    };
+    matches!(and.op, syn::BinOp::BitAnd(_))
+        && path_is(&and.left, "v")
+        && path_is(&and.right, "VERSIONBITS_TOP_MASK")
+}
+
+fn is_deployment_bit_set(expr: &Expr) -> bool {
     let Expr::Binary(ne) = peel_paren(expr) else {
         return false;
     };

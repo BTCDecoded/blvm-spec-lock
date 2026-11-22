@@ -17587,8 +17587,33 @@ mod activation_identity {
         panic!("unclosed activation");
     }
 
-    fn signed(func: &str) -> String {
-        func.replacen("-> Option<u64>", "-> i64", 1)
+    fn inner(func: &str) -> String {
+        let brace = func.find('{').expect("brace");
+        let mut depth = 0i32;
+        for (i, byte) in func[brace..].bytes().enumerate() {
+            if byte == b'{' {
+                depth += 1;
+            } else if byte == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    return func[brace + 1..brace + i].to_string();
+                }
+            }
+        }
+        panic!("unclosed inner");
+    }
+
+    /// `Option<u64>` is encoded as `i64`: `result == -1` means `None`, and a
+    /// non-negative result is `Some(result)`. The wrapper parameters are the
+    /// invented inputs `try_activation` already uses (z3_translator.rs:7595-7644).
+    fn stitch(func: &str) -> String {
+        format!(
+            "fn activation_height_from_headers(current_height: u64, current_time: u64, deployment_start: u64, deployment_timeout: u64, headers_len: u64, signal_count: u64) -> i64 {{
+{}
+}}
+",
+            inner(func)
+        )
     }
 
     fn decode(src: &str) -> syn::ItemFn {
@@ -17631,36 +17656,53 @@ mod activation_identity {
             return;
         }
         let src = read("../blvm-consensus/src/version_bits.rs");
-        let plain = signed(&extract(&src));
-        assert_eq!(plain.matches("(period_index + 2)").count(), 2);
+        let extracted = extract(&src);
+        assert_eq!(extracted.matches("(period_index + 2)").count(), 2);
         assert_eq!(
-            plain.matches("current_time >= deployment.timeout").count(),
+            extracted
+                .matches("current_time >= deployment.timeout")
+                .count(),
             1
         );
+        let plain = stitch(&extracted);
         let func = decode(&plain);
-        let block = func.block.clone();
-        let clause = quote::quote!(#block).to_string();
-        match identity_query(&func, &clause) {
+        // ActivationHeightFromVersionBits (version_bits.rs:121-162).
+        // `result == -1` is `None`; a non-negative result is `Some(result)`.
+        // Disabled window (127-129): start_time >= timeout => None.
+        // Time window (130-132): current_time < start_time or
+        // current_time >= timeout (inclusive) => None.
+        // Short header window (133-135): headers_len < LOCK_IN_PERIOD
+        // (2016, line 12) => None.
+        // Threshold (149-151): signal_count < ACTIVATION_THRESHOLD
+        // (1916, line 15) => None.
+        // Period offset (157-162): period_end is current_height.saturating_sub(1)
+        // (0 at height 0), period_index = period_end / 2016, and
+        // activation = (period_index + 2) * 2016. checked_mul overflow
+        // (159-160) only happens above i64::MAX, which a contract literal
+        // cannot name as u64::MAX, so those heights are excluded rather
+        // than approximated.
+        let clause = "current_height > 9223372036854775807 || result == if deployment_start >= deployment_timeout || current_time < deployment_start || current_time >= deployment_timeout || headers_len < 2016 || signal_count < 1916 { -1 } else { ((if current_height == 0 { 0 } else { current_height - 1 }) / 2016 + 2) * 2016 }";
+        match identity_query(&func, clause) {
             VerificationResult::Passed { body_translated } => {
                 assert!(body_translated, "activation height must use the body");
             }
             other => panic!("unpatched activation height must pass, got {other:?}"),
         }
-        let offset = signed(&extract(
+        let offset = stitch(&extract(
             &src.replace("(period_index + 2)", "(period_index + 1)"),
         ));
         assert_ne!(offset, plain);
-        let offset_result = identity_query(&decode(&offset), &clause);
+        let offset_result = identity_query(&decode(&offset), clause);
         assert!(
             counterexample(&offset_result),
             "one fewer period must flip the identity, got {offset_result:?}"
         );
-        let timeout = signed(&extract(&src.replace(
+        let timeout = stitch(&extract(&src.replace(
             "current_time >= deployment.timeout",
             "current_time > deployment.timeout",
         )));
         assert_ne!(timeout, plain);
-        let timeout_result = identity_query(&decode(&timeout), &clause);
+        let timeout_result = identity_query(&decode(&timeout), clause);
         assert!(
             counterexample(&timeout_result),
             "a strict timeout must flip the identity, got {timeout_result:?}"
@@ -18333,6 +18375,29 @@ mod weight_limit_identity {
                 }
             ),
             "rejecting every sigop cost above 1 must flip the identity, got {predicate_result:?}"
+        );
+        // `> MAX_BLOCK_SIGOPS_COST + 1` must not be parsed as the cap (`> MAX`).
+        // Both sites (connect.rs:3755, with the `crate::constants::` path, and
+        // :4080, with the imported name) must change, matching the live spelling.
+        let plus_one_src = body
+            .replace(
+                "total_sigop_cost > crate::constants::MAX_BLOCK_SIGOPS_COST",
+                "total_sigop_cost > crate::constants::MAX_BLOCK_SIGOPS_COST + 1",
+            )
+            .replace(
+                "total_sigop_cost > MAX_BLOCK_SIGOPS_COST",
+                "total_sigop_cost > MAX_BLOCK_SIGOPS_COST + 1",
+            );
+        assert_ne!(plus_one_src, body, "the shifted sigop cap must change");
+        let plus_one_result = identity_query(&stitch(&plus_one_src), &clause);
+        assert!(
+            !matches!(
+                plus_one_result,
+                VerificationResult::Passed {
+                    body_translated: true
+                }
+            ),
+            "> MAX_BLOCK_SIGOPS_COST + 1 must not parse as the sigop cap, got {plus_one_result:?}"
         );
     }
 

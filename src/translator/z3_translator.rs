@@ -10403,6 +10403,24 @@ impl Z3Translator {
             None => return Ok(None),
         };
 
+        // Then-branch `let`s must not leak into the guard path or the
+        // continuation. Snapshot the pre-branch vars and restore them
+        // before returning to the caller (`note_shift_guard` reads the
+        // guard ident from this map).
+        let snapshot = vars.clone();
+        let found = self.translate_if_early_return_lets(if_expr, vars, cond_bool)?;
+        *vars = snapshot;
+        return Ok(found);
+    }
+
+    /// Translate then-branch lets and a possible early return, writing
+    /// into `vars`. The caller restores the pre-branch snapshot.
+    fn translate_if_early_return_lets<'a>(
+        &'a self,
+        if_expr: &syn::ExprIf,
+        vars: &mut Z3VarMap<'a>,
+        cond_bool: Bool<'a>,
+    ) -> Result<Option<(z3::ast::Bool<'a>, z3::ast::Bool<'a>)>, TranslationError> {
         for stmt in &if_expr.then_branch.stmts {
             match stmt {
                 Stmt::Local(local) => {
@@ -33865,6 +33883,71 @@ mod tests {
             &[],
             "i64",
             "result == 2",
+        );
+    }
+
+    #[test]
+    fn then_branch_let_does_not_change_shift_guard_path() {
+        let tr = Z3Translator::new(10000);
+        let func: syn::ItemFn = syn::parse_str(
+            r#"
+            fn f(s: u64, x: u64) -> u64 {
+                if s >= 64 {
+                    let s = 0;
+                    return 0;
+                }
+                x >> s
+            }
+            "#,
+        )
+        .unwrap();
+        let mut param_types = std::collections::HashMap::new();
+        param_types.insert("s".to_string(), syn::parse_str::<syn::Type>("u64").unwrap());
+        param_types.insert("x".to_string(), syn::parse_str::<syn::Type>("u64").unwrap());
+        let return_type: syn::Type = syn::parse_str("u64").unwrap();
+        let (mut vars, type_constraints) = tr.build_shared_vars(&param_types, Some(&return_type));
+        tr.translate_function_body(&func, &mut vars)
+            .unwrap()
+            .expect("body");
+        let path = vars
+            .get("__shift_path_s")
+            .and_then(|v| v.as_bool())
+            .expect("shift guard path for s");
+        let s = vars.get("s").and_then(|v| v.as_int()).expect("s");
+        let ctx = tr.context();
+        // The path must still be `s < 64`, not the then-branch `let s = 0`.
+        let solver = Solver::new(ctx);
+        for c in &type_constraints {
+            solver.assert(c);
+        }
+        solver.assert(&s._eq(&Int::from_i64(ctx, 64)));
+        solver.assert(&path);
+        assert_eq!(
+            solver.check(),
+            SatResult::Unsat,
+            "then-branch let s = 0 must not make the guard path tautological"
+        );
+        let solver = Solver::new(ctx);
+        for c in &type_constraints {
+            solver.assert(c);
+        }
+        solver.assert(&s._eq(&Int::from_i64(ctx, 0)));
+        solver.assert(&path);
+        assert_eq!(solver.check(), SatResult::Sat, "s = 0 is below the guard");
+
+        prove_ensures(
+            r#"
+            fn f(s: u64, x: u64) -> u64 {
+                if s >= 64 {
+                    let s = 0;
+                    return 0;
+                }
+                x >> s
+            }
+            "#,
+            &[("s", "u64"), ("x", "u64")],
+            "u64",
+            "result == if s >= 64 { 0 } else { x >> s }",
         );
     }
 }

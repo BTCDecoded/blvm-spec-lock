@@ -34246,7 +34246,11 @@ mod tests {
 
     fn must_replace(src: &str, from: &str, to: &str) -> String {
         assert_ne!(from, to);
-        assert_eq!(src.matches(from).count(), 1, "needle must be unique: {from}");
+        assert_eq!(
+            src.matches(from).count(),
+            1,
+            "needle must be unique: {from}"
+        );
         let out = src.replace(from, to);
         assert_ne!(out, src);
         out
@@ -34267,11 +34271,7 @@ mod tests {
         assert_eq!(parsed.height_sub, 1);
         assert_eq!(parsed.time_sub, 1);
 
-        let dropped = must_replace(
-            &src,
-            HEIGHT_ADD_NEEDLE,
-            "                .checked_sub(1)",
-        );
+        let dropped = must_replace(&src, HEIGHT_ADD_NEEDLE, "                .checked_sub(1)");
         let dropped_parsed = parse_sequence_locks(&calculate_sequence_locks_fn(&dropped).block)
             .expect("dropping the height addend must still parse");
         assert_eq!(
@@ -34312,11 +34312,7 @@ mod tests {
             "unpatched production must prove height + lock - 1 at (0, 1), got {production:?}"
         );
 
-        let dropped = must_replace(
-            &src,
-            HEIGHT_ADD_NEEDLE,
-            "                .checked_sub(1)",
-        );
+        let dropped = must_replace(&src, HEIGHT_ADD_NEEDLE, "                .checked_sub(1)");
         let mutant = check_sequence_locks_ensures(&dropped, clause);
         assert_ne!(
             mutant,

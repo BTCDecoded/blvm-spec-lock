@@ -7431,6 +7431,41 @@ mod calculate_sequence_identity {
             ),
             "dropping the height-add -1 must flip the identity, got {dropped_minus_result:?}"
         );
+        // Time branch (sequence_locks.rs:102-151): required_time =
+        // coin_time + (locktime_value << SEQUENCE_LOCKTIME_GRANULARITY) - 1
+        // (124, 136-138). The granularity is 9 (19), so a single time-based
+        // input on a v2 transaction with MTP 0 and lock value 1 yields
+        // required_time == 511. min_height stays at the -1 initializer.
+        // Version is pinned to 2 so a wrapping u32 cast cannot disable
+        // BIP68 in the body while the clause still treats it as active.
+        // Dropping the << 9 must flip that to 0 + 1 - 1 == 0.
+        let time_add = "result_is_err != 0 || input_len != 1 || heights_len != 1 || version != 2 || (flags & 1) == 0 || (seq_words[0] & 0x80000000) != 0 || (seq_words[0] & 0x00400000) == 0 || seq_mtps[0] != 0 || (seq_words[0] & 0x0000ffff) != 1 || (result_0 == -1 && result_1 == 511)";
+        match identity_query(&func, time_add) {
+            VerificationResult::Passed { body_translated } => {
+                assert!(
+                    body_translated,
+                    "the time-branch identity must use the body"
+                );
+            }
+            other => panic!("unpatched time branch must pass, got {other:?}"),
+        }
+        let unshifted = src.replacen(
+            "locktime_value << SEQUENCE_LOCKTIME_GRANULARITY",
+            "locktime_value",
+            1,
+        );
+        assert_ne!(unshifted, src, "the granularity shift must change");
+        let unshifted_result = identity_query(&decode_fn_from(&unshifted), time_add);
+        assert!(
+            matches!(
+                unshifted_result,
+                VerificationResult::Failed {
+                    kind: FailureKind::Counterexample,
+                    ..
+                }
+            ),
+            "dropping the granularity shift must flip the identity, got {unshifted_result:?}"
+        );
         // version 2^32+1 is 1 as u32, so version_enforces_relative_lock is
         // false (sequence_locks.rs:28-30). A single height-based lock of 1
         // at height 0 would raise min_height to 0 if BIP68 were enforced on

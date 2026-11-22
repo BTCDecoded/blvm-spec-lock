@@ -12,7 +12,7 @@ use syn::visit::Visit;
 
 use super::ast_body::{self, CmpOp};
 use super::sample_eval::{self, Val};
-use z3::ast::{Array, Ast, BV, Bool, exists_const};
+use z3::ast::{Ast, BV, Bool};
 use z3::{Config, Context, SatResult, Solver, Sort};
 
 pub fn retain_production(mut func: syn::ItemFn) -> syn::ItemFn {
@@ -364,52 +364,45 @@ pub fn negative_rejected_query(facts: &ProductionFacts) -> SatResult {
     })
 }
 
-fn exists_prevout_pair<'a>(
-    ctx: &'a Context,
-    n: &BV<'a>,
-    txid: &Array<'a>,
-    vout: &Array<'a>,
-    full: bool,
-    tag: &str,
-) -> Bool<'a> {
-    let i = BV::new_const(ctx, format!("i_{tag}"), 32);
-    let j = BV::new_const(ctx, format!("j_{tag}"), 32);
-    let in_range = i.bvult(n) & j.bvult(n) & i._eq(&j).not();
-    let txid_eq = txid
-        .select(&i)
-        .as_bv()
-        .unwrap()
-        ._eq(&txid.select(&j).as_bv().unwrap());
-    let vout_eq = vout
-        .select(&i)
-        .as_bv()
-        .unwrap()
-        ._eq(&vout.select(&j).as_bv().unwrap());
-    let key_eq = if full { txid_eq & vout_eq } else { txid_eq };
-    exists_const(ctx, &[&i, &j], &[], &(in_range & key_eq))
-}
-
-pub fn dup_query(facts: &ProductionFacts) -> SatResult {
+/// `body ∧ ¬clause` on a concrete two-input pair.
+///
+/// `same_txid && !same_vout` is the distinguishing witness for a txid-only
+/// key (M2 and M13): production keys on the full outpoint, so that pair is
+/// accepted, while the mutant rejects it. A same-outpoint pair is not a
+/// witness for those mutants — both keys reject it.
+fn dup_query_pair(facts: &ProductionFacts, same_txid: bool, same_vout: bool) -> SatResult {
     check(|ctx, solver| {
-        let idx = Sort::bitvector(ctx, 32);
-        let word = Sort::bitvector(ctx, 32);
-        let n = BV::new_const(ctx, "n_inputs", 32);
-        let max = BV::from_u64(ctx, 100_000, 32);
-        solver.assert(&n.bvule(&max));
-        solver.assert(&n.bvuge(&BV::from_u64(ctx, 2, 32)));
-        let txid = Array::new_const(ctx, "txid", &idx, &word);
-        let vout = Array::new_const(ctx, "vout", &idx, &word);
-        let full = exists_prevout_pair(ctx, &n, &txid, &vout, true, "full");
+        let txid0 = BV::from_u64(ctx, 1, 32);
+        let txid1 = BV::from_u64(ctx, if same_txid { 1 } else { 2 }, 32);
+        let vout0 = BV::from_u64(ctx, 0, 32);
+        let vout1 = BV::from_u64(ctx, if same_vout { 0 } else { 1 }, 32);
+        let full = txid0._eq(&txid1) & vout0._eq(&vout1);
         let rejected = if !facts.dup.present {
             Bool::from_bool(ctx, false)
         } else if facts.dup.full_prevout {
             full.clone()
         } else {
-            exists_prevout_pair(ctx, &n, &txid, &vout, false, "txid")
+            txid0._eq(&txid1)
         };
-        // Clause: rejected iff some i ≠ j share the full prevout.
+        // Clause: rejected iff the two inputs share the full prevout.
         solver.assert(&rejected.iff(&full).not());
     })
+}
+
+pub fn dup_query(facts: &ProductionFacts) -> SatResult {
+    if !facts.dup.present {
+        // M1 deletes the duplicate check; that is visible on a same-outpoint pair.
+        dup_query_pair(facts, true, true)
+    } else {
+        // Unpatched (UNSAT) and M2/M13 (SAT): n = 2, same txid, different vout.
+        // A quantified exists over n <= 100_000 timed out at 5s and returned Unknown.
+        dup_query_pair(facts, true, false)
+    }
+}
+
+/// Same-outpoint sanity: production and a txid-only key both reject this pair.
+pub fn dup_same_outpoint_query(facts: &ProductionFacts) -> SatResult {
+    dup_query_pair(facts, true, true)
 }
 
 pub fn overflow_query(facts: &ProductionFacts) -> SatResult {

@@ -7381,6 +7381,18 @@ mod calculate_sequence_identity {
             .expect("calculate_sequence_locks")
     }
 
+    fn must_replace(src: &str, from: &str, to: &str) -> String {
+        assert_ne!(from, to, "needle and replacement must differ");
+        let count = src.matches(from).count();
+        assert_eq!(
+            count, 1,
+            "needle must occur exactly once in production, got {count}: {from}"
+        );
+        let out = src.replace(from, to);
+        assert_ne!(out, src, "the production needle must change");
+        out
+    }
+
     fn identity_query(func: &syn::ItemFn, clause: &str) -> VerificationResult {
         let mut function = make_function_to_verify(
             std::path::Path::new("src/sequence_locks.rs"),
@@ -7388,12 +7400,15 @@ mod calculate_sequence_identity {
             &func.attrs,
             func,
         );
-        function.contracts = vec![super::Contract {
-            contract_type: super::ContractType::Ensures,
-            condition: clause.to_string(),
-            expr: syn::parse_str(clause).ok(),
-            is_spec_derived: true,
-        }];
+        function.contracts =
+            vec![super::Contract {
+                contract_type: super::ContractType::Ensures,
+                condition: clause.to_string(),
+                expr: Some(syn::parse_str(clause).unwrap_or_else(|err| {
+                    panic!("sequence-lock clause must parse: {err}: {clause}")
+                })),
+                is_spec_derived: true,
+            }];
         verify_function(&function, 30, &[])
     }
 
@@ -7447,36 +7462,75 @@ mod calculate_sequence_identity {
             ),
             "raising the time initializer must flip the identity, got {raised_time_result:?}"
         );
-        // F_SequenceLockHeightAdd: required_height = coin_height + locktime_value - 1
-        // (sequence_locks.rs:163-172). Dropping that -1 must flip this tighter
-        // postcondition: a single height-based input with coin height 0 and
-        // lock value 0 yields required_height == -1, so min_height stays -1.
-        let height_add = "result_is_err != 0 || input_len != 1 || heights_len != 1 || (version as u32) < 2 || (flags & 1) == 0 || (seq_words[0] & 0x80000000) != 0 || (seq_words[0] & 0x00400000) != 0 || seq_heights[0] != 0 || (seq_words[0] & 0x0000ffff) != 0 || (result_0 == -1 && result_1 == -1)";
+        // F_SequenceLockHeightAdd / Thm 5.5.1: required_height =
+        // coin_height + locktime_value - 1 (sequence_locks.rs:163-172), then
+        // min_height = min_height.max(required_height) (180). The earlier
+        // single-point check (height 0, lock 0, result_0 == -1, mutation
+        // checked_sub(1) -> checked_sub(0)) is superseded. At (0, 0) the
+        // clamp hides checked_sub(2) (production -1 and mutant -2 both
+        // become -1) and also hides dropping +locktime_value (both sides
+        // stay -1 when the lock is 0).
+        //
+        // This clause uses a symbolic bounded coin height and the 16-bit
+        // lock. It is vacuous unless version is 2 (the time-branch clause
+        // already pins version this way; u32 truncation of other values
+        // stays on that existing clause), flags has LOCKTIME_VERIFY_SEQUENCE,
+        // the disable bit is clear, the lock is height-based, there is a
+        // single input, and the query is on an Ok path. seq_words[0] is
+        // bounded to 0..=u32::MAX because production sequences are u32;
+        // the specializer uses Int rem for the 16-bit value, which can
+        // disagree with bitand on a negative word, and that disagreement
+        // is not this lock. seq_heights[0] is bounded to
+        // 0..=i64::MAX-65535 so i64::try_from succeeds and
+        // checked_add(locktime_value) cannot overflow. Overflow and
+        // try_from failure come from checked_add / checked_sub / try_from
+        // Err and are not this lock (those paths are result_is_err != 0,
+        // or are skipped by the bound). Under that bound the claimed
+        // sum is always >= -1 (the minimum is 0 + 0 - 1); the
+        // clamp-to--1 branch is included because that is the honest
+        // statement of line 180, even though it is not reached for
+        // non-negative heights. Multi-input maxima are not locked here
+        // (input_len is pinned to 1). Time-branch granularity and u32
+        // version truncation stay on their existing clauses.
+        let height_add = "result_is_err != 0 || input_len != 1 || heights_len != 1 || version != 2 || (flags & 1) == 0 || seq_words[0] < 0 || seq_words[0] > 4294967295 || (seq_words[0] & 0x80000000) != 0 || (seq_words[0] & 0x00400000) != 0 || seq_heights[0] < 0 || seq_heights[0] > 9223372036854710272 || (seq_heights[0] + (seq_words[0] & 0x0000ffff) - 1 >= -1 && result_0 == seq_heights[0] + (seq_words[0] & 0x0000ffff) - 1 && result_1 == -1) || (seq_heights[0] + (seq_words[0] & 0x0000ffff) - 1 < -1 && result_0 == -1 && result_1 == -1)";
         match identity_query(&func, height_add) {
             VerificationResult::Passed { body_translated } => {
                 assert!(body_translated, "the height-add identity must use the body");
             }
             other => panic!("unpatched height add must pass, got {other:?}"),
         }
-        let dropped_minus = src.replace(
-            "let required_height = coin_height
-                .checked_add(locktime_value)
-                .and_then(|sum| sum.checked_sub(1))",
-            "let required_height = coin_height
-                .checked_add(locktime_value)
-                .and_then(|sum| sum.checked_sub(0))",
+        // Unique to the height branch (the time branch adds
+        // locktime_seconds). First mutation: checked_sub(1) ->
+        // checked_sub(2). Second: drop checked_add(locktime_value) so
+        // required_height is coin_height.checked_sub(1) (min_h = ph - 1).
+        const HEIGHT_ADD_NEEDLE: &str = "                .checked_add(locktime_value)\n                .and_then(|sum| sum.checked_sub(1))";
+        let sub_two = must_replace(
+            &src,
+            HEIGHT_ADD_NEEDLE,
+            "                .checked_add(locktime_value)\n                .and_then(|sum| sum.checked_sub(2))",
         );
-        assert_ne!(dropped_minus, src, "the height-add -1 must change");
-        let dropped_minus_result = identity_query(&decode_fn_from(&dropped_minus), height_add);
+        let sub_two_result = identity_query(&decode_fn_from(&sub_two), height_add);
         assert!(
             matches!(
-                dropped_minus_result,
+                sub_two_result,
                 VerificationResult::Failed {
                     kind: FailureKind::Counterexample,
                     ..
                 }
             ),
-            "dropping the height-add -1 must flip the identity, got {dropped_minus_result:?}"
+            "checked_sub(1) -> checked_sub(2) must flip the height-add identity, got {sub_two_result:?}"
+        );
+        let dropped_lock = must_replace(&src, HEIGHT_ADD_NEEDLE, "                .checked_sub(1)");
+        let dropped_lock_result = identity_query(&decode_fn_from(&dropped_lock), height_add);
+        assert!(
+            matches!(
+                dropped_lock_result,
+                VerificationResult::Failed {
+                    kind: FailureKind::Counterexample,
+                    ..
+                }
+            ),
+            "dropping +locktime_value (min_h = ph - 1) must flip the height-add identity, got {dropped_lock_result:?}"
         );
         // Time branch (sequence_locks.rs:102-151): required_time =
         // coin_time + (locktime_value << SEQUENCE_LOCKTIME_GRANULARITY) - 1

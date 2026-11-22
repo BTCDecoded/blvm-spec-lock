@@ -5511,7 +5511,7 @@ mod header_identity {
     }
 
     fn identity_query(func: &syn::ItemFn) -> VerificationResult {
-        let identity = "result == (header.version >= 1 && header.timestamp != 0 && header.bits != 0 && header.merkle_root != 0 && (!time_context_is_some || header.timestamp <= time_context.network_time.saturating_add(7200)) && (!time_context_is_some || header.timestamp > time_context.median_time_past))";
+        let identity = "result == (header.timestamp != 0 && header.bits != 0 && header.merkle_root != 0 && (!time_context_is_some || header.timestamp <= time_context.network_time.saturating_add(7200)) && (!time_context_is_some || header.timestamp > time_context.median_time_past))";
         let mut function = make_function_to_verify(
             std::path::Path::new("src/block/header.rs"),
             "validate_block_header",
@@ -5528,7 +5528,7 @@ mod header_identity {
     }
 
     #[test]
-    fn header_passes_and_both_version_edits_flip() {
+    fn header_passes_without_a_version_floor() {
         if !consensus_workspace_present() {
             return;
         }
@@ -5539,42 +5539,9 @@ mod header_identity {
             }
             other => panic!("unpatched header check must pass, got {other:?}"),
         }
-
-        let boundary_src = quote::quote!(#func)
-            .to_string()
-            .replace("version < 1", "version < 0");
-        assert!(
-            boundary_src.contains("version < 0"),
-            "the version floor must drop, got {boundary_src}"
-        );
-        let boundary: syn::ItemFn = syn::parse_str(&boundary_src).expect("boundary");
-        let boundary_result = identity_query(&boundary);
-        assert!(
-            matches!(
-                boundary_result,
-                VerificationResult::Failed {
-                    kind: FailureKind::Counterexample,
-                    ..
-                }
-            ),
-            "dropping the version floor must flip the identity, got {boundary_result:?}"
-        );
-
-        let predicate_src = quote::quote!(#func)
-            .to_string()
-            .replace("version < 1", "version <= 1");
-        let predicate: syn::ItemFn = syn::parse_str(&predicate_src).expect("predicate");
-        let predicate_result = identity_query(&predicate);
-        assert!(
-            matches!(
-                predicate_result,
-                VerificationResult::Failed {
-                    kind: FailureKind::Counterexample,
-                    ..
-                }
-            ),
-            "rejecting version 1 must flip the identity, got {predicate_result:?}"
-        );
+        // H01: no version floor here; version 0 is valid before BIP34.
+        // Version edits belong on check_bip90. Field edits are in
+        // header_fields_edits_flip_the_same_body.
     }
 
     #[test]
@@ -16429,7 +16396,7 @@ mod csv_identity {
         assert_eq!(body.matches("is_sequence_disabled(").count(), 2);
         assert_eq!(body.matches("stack.is_empty()").count(), 1);
         assert!(body.contains("check_bip112(sequence_value, input_sequence)"));
-        assert!(body.contains("tx.version < 2"));
+        assert!(body.contains("version_enforces_relative_lock(tx.version)"));
         let func = decode(&body);
         let block = func.block.clone();
         let clause = quote::quote!(#block).to_string();
@@ -17747,7 +17714,7 @@ mod checkmultisig_identity {
                     depth -= 1;
                     if depth == 0 {
                         let inner = rest[brace + 1..brace + i].to_string();
-                        if inner.contains("batch_verify_signatures(")
+                        if inner.contains("batch_compute_legacy_sighashes(")
                             && inner.contains("stack.len() < 2")
                             && inner.contains("failed_multisig_nullfail(")
                         {

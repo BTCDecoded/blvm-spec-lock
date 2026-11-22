@@ -17707,6 +17707,46 @@ mod activation_identity {
             counterexample(&timeout_result),
             "a strict timeout must flip the identity, got {timeout_result:?}"
         );
+        // The body specializer requires the full BIP9 conjunction
+        // (version_bits.rs:142-144). Dropping either conjunct must not
+        // still parse as activation_height_from_headers.
+        let signal = "if deployment.bit < 29\n            && (v & VERSIONBITS_TOP_MASK) == VERSIONBITS_TOP_BITS\n            && ((v >> deployment.bit) & 1) != 0";
+        let bit_range_src = src.replace(
+            signal,
+            "if (v & VERSIONBITS_TOP_MASK) == VERSIONBITS_TOP_BITS\n            && ((v >> deployment.bit) & 1) != 0",
+        );
+        assert_ne!(
+            bit_range_src, src,
+            "the deployment.bit < 29 conjunct must change"
+        );
+        let bit_range_result = identity_query(&decode(&stitch(&extract(&bit_range_src))), clause);
+        assert!(
+            !matches!(
+                bit_range_result,
+                VerificationResult::Passed {
+                    body_translated: true
+                }
+            ),
+            "dropping deployment.bit < 29 must not parse as the activation body, got {bit_range_result:?}"
+        );
+        let prefix_src = src.replace(
+            signal,
+            "if deployment.bit < 29\n            && ((v >> deployment.bit) & 1) != 0",
+        );
+        assert_ne!(
+            prefix_src, src,
+            "the VERSIONBITS_TOP_BITS prefix conjunct must change"
+        );
+        let prefix_result = identity_query(&decode(&stitch(&extract(&prefix_src))), clause);
+        assert!(
+            !matches!(
+                prefix_result,
+                VerificationResult::Passed {
+                    body_translated: true
+                }
+            ),
+            "dropping the BIP9 prefix check must not parse as the activation body, got {prefix_result:?}"
+        );
     }
 }
 
@@ -18198,7 +18238,7 @@ mod weight_limit_identity {
         // Bool parameters so the postconditions and try_weight_limit share
         // the same invented flags (they are not fields of `block`).
         let src = format!(
-            "fn connect_block_inner(block: &Block, block_weight: i64, script_sig_len: i64, total_sigop_cost: i64, finality_bad: bool, height_bad: bool, witness_len_bad: bool, tx_empty: bool, too_many_tx: bool, header_bad: bool, bits_bad: bool, difficulty_bad: bool, timewarp94_bad: bool, pow_bad: bool, bip54_time_bad: bool, version_bad: bool, bip90_bad: bool, merkle_bad: bool, merkle_mutated: bool, bip30_bad: bool, bip34_bad: bool, bip54_coin_bad: bool, bip54_size_bad: bool, assume_valid_bad: bool, relative_lock_bad: bool, extra_coinbase: bool, production_bad: bool, not_coinbase: bool, subsidy_over: bool, witness_unexpected: bool, witness_missing: bool, witness_commit_bad: bool, signet_bad: bool) -> i64 {{\n{body}\n}}\n"
+            "fn connect_block_inner(block: &Block, block_weight: i64, script_sig_len: i64, total_sigop_cost: i64, finality_bad: bool, height_bad: bool, witness_len_bad: bool, tx_empty: bool, too_many_tx: bool, header_bad: bool, bits_bad: bool, difficulty_bad: bool, timewarp94_bad: bool, pow_bad: bool, bip54_time_bad: bool, version_bad: bool, bip90_bad: bool, merkle_bad: bool, merkle_mutated: bool, bip30_bad: bool, bip34_bad: bool, bip54_coin_bad: bool, bip54_size_bad: bool, assume_valid_bad: bool, relative_lock_bad: bool, extra_coinbase: bool, production_bad: bool, not_coinbase: bool, subsidy_over: bool, witness_unexpected: bool, witness_missing: bool, witness_commit_bad: bool, signet_bad: bool, bip112_active: bool, final_at_mtp: bool, final_at_header: bool, median_time: u64, header_time: u64) -> i64 {{\n{body}\n}}\n"
         );
         let file = syn::parse_file(&src).unwrap_or_else(|err| panic!("parse weight: {err}"));
         match &file.items[0] {
@@ -18470,8 +18510,26 @@ mod weight_limit_identity {
             fn_body(&src, "enforce_tx_finality")
         );
         let func = stitch(&body);
-        let block = func.block.clone();
-        let clause = quote::quote!(#block).to_string();
+        // enforce_tx_finality (connect.rs:130-151), called from
+        // connect_block_inner at 3258. CSV is ForkId::Bip112 (135). When
+        // it is active and median_time_past > 0, the nLockTime cutoff is
+        // MTP; otherwise it is the header timestamp (137-145). A
+        // non-final transaction at that cutoff returns an error (147-149),
+        // which try_weight_limit models as result == 0.
+        // The invented flags are wrapper parameters so they stay Bool
+        // and remain registered when the is_final_tx check is dropped.
+        // When median_time == header_time, the specializer requires
+        // final_at_mtp == final_at_header (z3_translator.rs:8786-8787)
+        // and otherwise does not treat the tx as non-final; those
+        // inconsistent inputs are excluded rather than written into
+        // the source rule.
+        let not_final = "(bip112_active && median_time > 0 && !final_at_mtp) || (!(bip112_active && median_time > 0) && !final_at_header)";
+        let clause = format!(
+            "result < 0 || {} || script_sig_len < 2 || script_sig_len > 100 || block_weight < 1 || block_weight > 4_000_000 || total_sigop_cost > 80000 || (median_time == header_time && final_at_mtp != final_at_header) || (({not_final}) && result == 0) || (!({not_final}) && result > 0)",
+            other_bads()
+                .strip_prefix("finality_bad || ")
+                .expect("finality_bad leads other_bads"),
+        );
         match identity_query(&func, &clause) {
             VerificationResult::Passed { body_translated } => {
                 assert!(body_translated, "enforce_tx_finality must use the body");

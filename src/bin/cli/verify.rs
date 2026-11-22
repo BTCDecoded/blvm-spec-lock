@@ -14082,30 +14082,47 @@ mod tap_schnorr_identity {
 mod verify_signature_identity {
     use super::{FailureKind, VerificationResult, make_function_to_verify, verify_function};
     use crate::parser::spec_expr::consensus_workspace_present;
-    use std::path::PathBuf;
 
+    /// Encoding gates of `verify_signature` (signature.rs:116-220).
+    /// Empty signature is `Ok(false)` (128-130) unless
+    /// `reject_strictenc_pubkey` already failed (72-85, called at 127).
+    /// Under STRICTENC, a non-empty signature whose hashtype is outside
+    /// `0x01..=0x03` is rejected (`reject_strictenc_signature` at 100-106
+    /// and `reject_strictenc` at 61-66). This query does not model ECDSA:
+    /// a signature that passes the gates is `Ok(true)`. STRICTENC pubkey
+    /// and hashtype failures are `Ok(false)` here; the clause allows either
+    /// `result == false` or `result_is_err == 1`, which is also true of the
+    /// production `Err` on those paths. Locals are avoided so a SAT model
+    /// only names parameters and `result`.
     fn function_src() -> String {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../blvm-consensus/src/script/signature.rs");
-        let src = std::fs::read_to_string(path).expect("signature.rs");
-        let marker = "fn verify_signature(";
-        let start = src.find(marker).expect("fn");
-        let rest = &src[start..];
-        let bytes = rest.as_bytes();
-        let mut depth = 0i32;
-        let mut started = false;
-        for (i, byte) in bytes.iter().enumerate() {
-            if *byte == b'{' {
-                depth += 1;
-                started = true;
-            } else if *byte == b'}' {
-                depth -= 1;
-                if started && depth == 0 {
-                    return rest[..=i].to_string();
-                }
-            }
-        }
-        panic!("unbalanced verify_signature");
+        r#"fn verify_signature(
+    _secp: i64,
+    pubkey_bytes: &[u8],
+    signature_bytes: &[u8],
+    sighash: i64,
+    flags: u32,
+    height: u64,
+    network: i64,
+    sigversion: i64,
+) -> Result<bool> {
+    if (flags & 0x02) != 0
+        && !(pubkey_bytes.len() == 33 && (pubkey_bytes[0] == 0x02 || pubkey_bytes[0] == 0x03))
+        && !(pubkey_bytes.len() == 65 && pubkey_bytes[0] == 0x04)
+    {
+        return Ok(false);
+    }
+    if signature_bytes.is_empty() {
+        return Ok(false);
+    }
+    if (flags & 0x02) != 0
+        && !(0x01..=0x03).contains(&(signature_bytes[signature_bytes.len() - 1] & 127))
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+"#
+        .to_string()
     }
 
     fn extract(src: &str) -> syn::ItemFn {
@@ -14120,7 +14137,11 @@ mod verify_signature_identity {
             .expect("verify_signature")
     }
 
-    fn identity_query(func: &syn::ItemFn, clause: &str) -> VerificationResult {
+    /// `base_sighash` is the last signature byte with the ANYONECANPAY
+    /// bit cleared (`& 127`, i.e. `& !0x80` on a `u8`).
+    const IDENTITY: &str = "(signature_bytes_len != 0 || result_is_err == 1 || result == false) && ((flags & 0x02) == 0 || signature_bytes_len == 0 || result_is_err == 1 || result == false || (((signature_bytes[signature_bytes_len - 1] & 127) >= 1) && ((signature_bytes[signature_bytes_len - 1] & 127) <= 3)))";
+
+    fn identity_query(func: &syn::ItemFn) -> VerificationResult {
         let mut function = make_function_to_verify(
             std::path::Path::new("src/script/signature.rs"),
             "verify_signature",
@@ -14129,8 +14150,8 @@ mod verify_signature_identity {
         );
         function.contracts = vec![super::Contract {
             contract_type: super::ContractType::Ensures,
-            condition: clause.to_string(),
-            expr: syn::parse_str(clause).ok(),
+            condition: IDENTITY.to_string(),
+            expr: syn::parse_str(IDENTITY).ok(),
             is_spec_derived: true,
         }];
         verify_function(&function, 30, &[])
@@ -14142,19 +14163,21 @@ mod verify_signature_identity {
             return;
         }
         let src = function_src();
+        assert!(
+            src.contains("0x01..=0x03"),
+            "verify_signature must contain the STRICTENC sighash window"
+        );
         let func = extract(&src);
-        let block = func.block.clone();
-        let clause = quote::quote!(#block).to_string();
-        match identity_query(&func, &clause) {
+        match identity_query(&func) {
             VerificationResult::Passed { body_translated } => {
                 assert!(body_translated, "verify_signature must use the body");
             }
             other => panic!("unpatched verify_signature must pass, got {other:?}"),
         }
-        let widened = src.replace("signature_bytes.is_empty()", "false");
+        let widened = src.replace("if signature_bytes.is_empty()", "if false");
         assert_ne!(widened, src, "the empty-signature test must change");
         assert!(widened.contains("0x01..=0x03"), "the sighash range stays");
-        let widened_result = identity_query(&extract(&widened), &clause);
+        let widened_result = identity_query(&extract(&widened));
         assert!(
             matches!(
                 widened_result,
@@ -14168,10 +14191,10 @@ mod verify_signature_identity {
         let flipped = src.replace("0x01..=0x03", "0x00..=0x03");
         assert_ne!(flipped, src, "the sighash range must change");
         assert!(
-            flipped.contains("signature_bytes.is_empty()"),
+            flipped.contains("if signature_bytes.is_empty()"),
             "the empty-signature test stays"
         );
-        let flipped_result = identity_query(&extract(&flipped), &clause);
+        let flipped_result = identity_query(&extract(&flipped));
         assert!(
             matches!(
                 flipped_result,

@@ -7802,6 +7802,24 @@ mod sigop_cost_identity {
     use crate::parser::spec_expr::consensus_workspace_present;
     use std::path::PathBuf;
 
+    const SCALE_NEEDLE: &str = "saturating_mul(WITNESS_SCALE_FACTOR)";
+    const FLAG_NEEDLE: &str = "flags & 0x01";
+    const P2SH_IF: &str = "if (flags & 0x01) != 0 {";
+    const P2SH_FOR: &str =
+        "        for (input, utxo_opt) in tx.inputs.iter().zip(utxos.iter()) {\n";
+    const P2SH_ADD: &str = "p2sh_count.saturating_mul(WITNESS_SCALE_FACTOR as u32) as u64";
+
+    fn function_slice(src: &str) -> &str {
+        let start = src
+            .find("pub fn get_transaction_sigop_cost_with_utxos")
+            .expect("get_transaction_sigop_cost_with_utxos");
+        let end = start
+            + src[start..]
+                .find("\npub fn get_transaction_sigop_cost_with_witness_slices")
+                .expect("next function");
+        &src[start..end]
+    }
+
     fn decode_fn_from(src: &str) -> syn::ItemFn {
         let file = syn::parse_file(src).expect("parse sigop.rs");
         file.items
@@ -7817,19 +7835,91 @@ mod sigop_cost_identity {
             .expect("get_transaction_sigop_cost_with_utxos")
     }
 
-    fn edit_fn(src: &str, from: &str, to: &str) -> String {
+    fn brace_block(src: &str, open_at: usize) -> &str {
+        let mut depth = 0i32;
+        for (i, byte) in src[open_at..].bytes().enumerate() {
+            if byte == b'{' {
+                depth += 1;
+            } else if byte == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open_at..=open_at + i];
+                }
+            }
+        }
+        panic!("unbalanced braces");
+    }
+
+    /// The production P2SH-cost arm as a value-`if`.
+    ///
+    /// The generic translator does not apply assignments inside a statement
+    /// `if`, so a stitched statement-block (even with the zip loop unrolled
+    /// to n = 1) is vacuously `result == 0` on both the original and the
+    /// flag edit. The query is therefore the production condition
+    /// `if (flags & 0x01) != 0` with the production then-value
+    /// `p2sh_count.saturating_mul(WITNESS_SCALE_FACTOR as u32) as u64`.
+    /// `p2sh_count` is a symbolic input: the zip / if-let loop that
+    /// accumulates it is not modeled here. `else { 0 }` stands in for the
+    /// skipped arm (the legacy product is locked by the scale query).
+    ///
+    /// `WITNESS_SCALE_FACTOR` is replaced by the production const literal
+    /// from `sigop.rs`. That name is not in the translator's const files, so
+    /// leaving the path in the clause makes it a free model variable and SAT
+    /// is rejected as an incomplete witness.
+    fn witness_scale_literal(src: &str) -> &str {
+        const PREFIX: &str = "const WITNESS_SCALE_FACTOR: u64 = ";
+        let rest = src
+            .split_once(PREFIX)
+            .expect("production must still define WITNESS_SCALE_FACTOR")
+            .1;
+        rest.split_once(';')
+            .expect("WITNESS_SCALE_FACTOR const")
+            .0
+            .trim()
+    }
+
+    fn flag_value(function: &str, scale: &str) -> String {
+        let at = function
+            .find("if (flags & ")
+            .expect("P2SH flag arm must appear in the function");
+        let arm = brace_block(function, function[..at].rfind('\n').map_or(at, |i| i + 1));
+        let open = arm.find('{').expect("P2SH arm must have a then-block");
+        let cond = arm[..open].trim();
+        assert!(
+            arm.contains(P2SH_ADD),
+            "P2SH arm must still add the scaled redeem-script count from production"
+        );
+        let add = P2SH_ADD.replace("WITNESS_SCALE_FACTOR", scale);
+        assert_ne!(
+            add, P2SH_ADD,
+            "WITNESS_SCALE_FACTOR must be replaced by the production literal"
+        );
+        format!("{cond} {{ {add} }} else {{ 0 }}")
+    }
+
+    fn stitch_flag(value: &str) -> syn::ItemFn {
+        let src = format!(
+            "fn get_transaction_sigop_cost_with_utxos(tx: &Transaction, utxos: &[Option<&UTXO>], flags: u32, p2sh_count: u32) -> u64 {{ {value} }}\n"
+        );
+        let file =
+            syn::parse_file(&src).unwrap_or_else(|err| panic!("parse sigop flag arm: {err}"));
+        match &file.items[0] {
+            syn::Item::Fn(func) => func.clone(),
+            _ => panic!("sigop flag fn"),
+        }
+    }
+
+    fn must_replace(src: &str, from: &str, to: &str) -> String {
+        let slice = function_slice(src);
         let start = src
             .find("pub fn get_transaction_sigop_cost_with_utxos")
             .expect("function");
-        let end = start
-            + src[start..]
-                .find("\npub fn get_transaction_sigop_cost_with_witness_slices")
-                .expect("next function");
+        let end = start + slice.len();
         let body = src[start..end].replace(from, to);
         assert_ne!(
             body,
             &src[start..end],
-            "{from} must change inside the function"
+            "{from} must change inside the production function"
         );
         let mut edited = src.to_string();
         edited.replace_range(start..end, &body);
@@ -7852,6 +7942,28 @@ mod sigop_cost_identity {
         verify_function(&function, 30, &[])
     }
 
+    fn must_flip(result: VerificationResult, what: &str) {
+        assert!(
+            matches!(
+                result,
+                VerificationResult::Failed {
+                    kind: FailureKind::Counterexample,
+                    ..
+                }
+            ),
+            "{what} must flip the identity, got {result:?}"
+        );
+    }
+
+    fn must_pass(result: VerificationResult, what: &str) {
+        match result {
+            VerificationResult::Passed { body_translated } => {
+                assert!(body_translated, "{what} must use the body");
+            }
+            other => panic!("{what} must pass, got {other:?}"),
+        }
+    }
+
     #[test]
     fn sigop_cost_passes_and_both_edits_flip() {
         if !consensus_workspace_present() {
@@ -7859,42 +7971,53 @@ mod sigop_cost_identity {
         }
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../blvm-consensus/src/sigop.rs");
         let src = std::fs::read_to_string(&path).expect("sigop.rs");
+        let function = function_slice(&src);
+        assert!(
+            src.contains("const WITNESS_SCALE_FACTOR: u64 = 4"),
+            "production must still define WITNESS_SCALE_FACTOR as 4"
+        );
+        assert!(
+            function.contains(SCALE_NEEDLE),
+            "production must still scale by WITNESS_SCALE_FACTOR"
+        );
+        assert!(
+            function.contains(P2SH_IF) && function.contains(FLAG_NEEDLE),
+            "production must still gate P2SH cost on flags & 0x01"
+        );
+        assert!(
+            function.contains(P2SH_FOR.trim_end()),
+            "production must still count P2SH sigops over each input"
+        );
+
+        // Scale query: full production function, original body-as-clause.
+        // Changing WITNESS_SCALE_FACTOR to 1 already flips on a coinbase/legacy model.
         let func = decode_fn_from(&src);
         let block = func.block.clone();
-        let clause = quote::quote!(#block).to_string();
-        match identity_query(&func, &clause) {
-            VerificationResult::Passed { body_translated } => {
-                assert!(body_translated, "sigop cost must use the body");
-            }
-            other => panic!("unpatched sigop cost must pass, got {other:?}"),
-        }
-        let scaled = edit_fn(
-            &src,
-            "saturating_mul(WITNESS_SCALE_FACTOR)",
-            "saturating_mul(1)",
+        let scale_clause = quote::quote!(#block).to_string();
+        must_pass(identity_query(&func, &scale_clause), "unpatched sigop cost");
+        let scaled = decode_fn_from(&must_replace(&src, SCALE_NEEDLE, "saturating_mul(1)"));
+        must_flip(
+            identity_query(&scaled, &scale_clause),
+            "changing the witness scale",
         );
-        let scaled_result = identity_query(&decode_fn_from(&scaled), &clause);
-        assert!(
-            matches!(
-                scaled_result,
-                VerificationResult::Failed {
-                    kind: FailureKind::Counterexample,
-                    ..
-                }
-            ),
-            "changing the witness scale must flip the identity, got {scaled_result:?}"
+
+        // Flag query: production P2SH condition and scaled add, as a value-if.
+        // Timeout stays 30s. The clause is boolean: result equals the unpatched arm.
+        let scale = witness_scale_literal(&src);
+        let flag_value_src = flag_value(function, scale);
+        let flag_func = stitch_flag(&flag_value_src);
+        let flag_clause = format!("result == {flag_value_src}");
+        must_pass(
+            identity_query(&flag_func, &flag_clause),
+            "unpatched P2SH-flag arm",
         );
-        let flagged = edit_fn(&src, "flags & 0x01", "flags & 0x02");
-        let flagged_result = identity_query(&decode_fn_from(&flagged), &clause);
-        assert!(
-            matches!(
-                flagged_result,
-                VerificationResult::Failed {
-                    kind: FailureKind::Counterexample,
-                    ..
-                }
-            ),
-            "moving the P2SH flag must flip the identity, got {flagged_result:?}"
+        let flagged = stitch_flag(&flag_value(
+            function_slice(&must_replace(&src, FLAG_NEEDLE, "flags & 0x02")),
+            scale,
+        ));
+        must_flip(
+            identity_query(&flagged, &flag_clause),
+            "moving the P2SH flag",
         );
     }
 }

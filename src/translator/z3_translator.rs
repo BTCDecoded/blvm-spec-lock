@@ -4447,7 +4447,12 @@ impl Z3Translator {
     /// in `i64` is an error; a time lock reads the prior median and shifts the
     /// 16-bit value; a height lock does not. Either sum overflowing `i64` is an
     /// error. The results are the maxima of the initializer and every
-    /// contribution.
+    /// contribution. The height and time addends are read from the
+    /// `required_height` / `required_time` snippets (coefficient 1 when the
+    /// matching `checked_add` is present, 0 when the receiver is only a
+    /// `checked_sub`). If either addend cannot be classified, this
+    /// specializer does not match; it never falls back to a hardcoded
+    /// `height + value` or `mtp + seconds`.
     fn try_sequence_locks<'a>(
         &'a self,
         block: &Block,
@@ -4495,10 +4500,12 @@ impl Z3Translator {
         let seconds = value.clone() * factor;
         let height_ok = height.ge(&zero) & height.le(&i64_max);
         let mtp_ok = mtps_some & idx.lt(&mtps_len) & mtp.ge(&zero) & mtp.le(&i64_max);
-        let overflow_t = (mtp.clone() + seconds.clone()).gt(&i64_max);
-        let overflow_h = (height.clone() + value.clone()).gt(&i64_max);
-        let req_t = mtp + seconds - Int::from_i64(&self.ctx, parsed.time_sub);
-        let req_h = height + value - Int::from_i64(&self.ctx, parsed.height_sub);
+        let height_term = value.clone() * Int::from_i64(&self.ctx, parsed.height_addend);
+        let time_term = seconds.clone() * Int::from_i64(&self.ctx, parsed.time_addend);
+        let overflow_t = (mtp.clone() + time_term.clone()).gt(&i64_max);
+        let overflow_h = (height.clone() + height_term.clone()).gt(&i64_max);
+        let req_t = mtp + time_term - Int::from_i64(&self.ctx, parsed.time_sub);
+        let req_h = height + height_term - Int::from_i64(&self.ctx, parsed.height_sub);
         let opened = in_range.clone() & disabled.not();
         let bad = opened.clone()
             & (height_ok.not()
@@ -29830,6 +29837,10 @@ struct SequenceLocks {
     shift: u32,
     height_sub: i64,
     time_sub: i64,
+    /// 1 if `required_height` adds `locktime_value`, 0 if that add is absent.
+    height_addend: i64,
+    /// 1 if `required_time` adds `locktime_seconds`, 0 if that add is absent.
+    time_addend: i64,
     enforce_as_u32: bool,
 }
 
@@ -29916,7 +29927,8 @@ struct SeqSeen {
     type_flag: bool,
     mtp: bool,
     value_extract: bool,
-    checked_add: bool,
+    height_addend: Option<i64>,
+    time_addend: Option<i64>,
     checked_sub: bool,
     max_time: bool,
     max_height: bool,
@@ -29942,7 +29954,8 @@ fn parse_sequence_locks(block: &Block) -> Option<SequenceLocks> {
         type_flag: false,
         mtp: false,
         value_extract: false,
-        checked_add: false,
+        height_addend: None,
+        time_addend: None,
         checked_sub: false,
         max_time: false,
         max_height: false,
@@ -29965,7 +29978,8 @@ fn parse_sequence_locks(block: &Block) -> Option<SequenceLocks> {
         && seen.type_flag
         && seen.mtp
         && seen.value_extract
-        && seen.checked_add
+        && seen.height_addend.is_some()
+        && seen.time_addend.is_some()
         && seen.checked_sub
         && seen.max_time
         && seen.max_height
@@ -29984,6 +29998,8 @@ fn parse_sequence_locks(block: &Block) -> Option<SequenceLocks> {
         shift,
         height_sub: seen.height_sub?,
         time_sub: seen.time_sub?,
+        height_addend: seen.height_addend?,
+        time_addend: seen.time_addend?,
         enforce_as_u32: seen.enforce_as_u32,
     })
 }
@@ -30016,9 +30032,21 @@ fn walk_seq_block(block: &Block, seen: &mut SeqSeen) {
                         }
                         "required_height" => {
                             seen.height_sub = trailing_checked_sub(&init.expr);
+                            // Fail closed: only the height snippet, never a
+                            // checked_add found elsewhere in the body.
+                            seen.height_addend = checked_add_coefficient(
+                                &init.expr,
+                                "coin_height",
+                                "locktime_value",
+                            );
                         }
                         "required_time" => {
                             seen.time_sub = trailing_checked_sub(&init.expr);
+                            seen.time_addend = checked_add_coefficient(
+                                &init.expr,
+                                "coin_time",
+                                "locktime_seconds",
+                            );
                         }
                         "enforce_bip68" => {
                             seen.enforce = seq_mentions(&init.expr, "LOCKTIME_VERIFY_SEQUENCE")
@@ -30089,9 +30117,6 @@ fn walk_seq_expr(expr: &Expr, seen: &mut SeqSeen) {
             }
         }
         Expr::MethodCall(call) => {
-            if call.method == "checked_add" {
-                seen.checked_add = true;
-            }
             if call.method == "checked_sub" {
                 seen.checked_sub = true;
             }
@@ -30238,6 +30263,74 @@ fn trailing_checked_sub(expr: &Expr) -> Option<i64> {
             Stmt::Expr(expr, _) => trailing_checked_sub(expr),
             _ => None,
         }),
+        _ => None,
+    }
+}
+
+/// Coefficient of `recv.checked_add(arg)` on a `required_height` /
+/// `required_time` initializer. `1` when that add is present, `0` when the
+/// receiver is only `recv.checked_sub(_)`. Returns `None` when the
+/// expression cannot be classified; callers must fail closed and must not
+/// default to adding `arg`.
+fn checked_add_coefficient(expr: &Expr, recv: &str, arg: &str) -> Option<i64> {
+    let expr = peel_ok_or_try(expr);
+    match peel_paren(expr) {
+        Expr::MethodCall(call) if call.method == "and_then" && call.args.len() == 1 => {
+            let Expr::Closure(closure) = peel_paren(&call.args[0]) else {
+                return None;
+            };
+            // The continuation must itself be a trailing checked_sub; any
+            // other body is unreadable.
+            trailing_checked_sub(&closure.body)?;
+            classify_add_or_plain_sub(&call.receiver, recv, arg)
+        }
+        other => classify_add_or_plain_sub(other, recv, arg),
+    }
+}
+
+fn peel_ok_or_try(expr: &Expr) -> &Expr {
+    let expr = peel_paren(expr);
+    match expr {
+        Expr::Try(try_expr) => peel_ok_or_try(&try_expr.expr),
+        Expr::MethodCall(call)
+            if call.args.len() == 1 && (call.method == "ok_or_else" || call.method == "ok_or") =>
+        {
+            peel_ok_or_try(&call.receiver)
+        }
+        Expr::Paren(paren) => peel_ok_or_try(&paren.expr),
+        Expr::Group(group) => peel_ok_or_try(&group.expr),
+        Expr::Block(block) => block
+            .block
+            .stmts
+            .last()
+            .and_then(|stmt| match stmt {
+                Stmt::Expr(inner, _) => Some(peel_ok_or_try(inner)),
+                _ => None,
+            })
+            .unwrap_or(expr),
+        _ => expr,
+    }
+}
+
+fn classify_add_or_plain_sub(expr: &Expr, recv: &str, arg: &str) -> Option<i64> {
+    match peel_paren(expr) {
+        Expr::MethodCall(call) if call.method == "checked_add" && call.args.len() == 1 => {
+            if path_ends(&call.receiver, recv) && path_ends(&call.args[0], arg) {
+                Some(1)
+            } else {
+                None
+            }
+        }
+        Expr::MethodCall(call) if call.method == "checked_sub" && call.args.len() == 1 => {
+            lit_i64(&call.args[0])?;
+            if path_ends(&call.receiver, recv) {
+                Some(0)
+            } else {
+                None
+            }
+        }
+        // Do not walk unknown methods; that would hide an unreadable addend
+        // behind a trailing sub and silently default the coefficient.
         _ => None,
     }
 }
@@ -34130,6 +34223,138 @@ mod tests {
             "u64",
             "result == if s < 64 && c { x >> s } else { 0 }",
         );
+    }
+
+    const HEIGHT_ADD_NEEDLE: &str = "                .checked_add(locktime_value)\n                .and_then(|sum| sum.checked_sub(1))";
+
+    fn production_sequence_locks_src() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../blvm-consensus/src/sequence_locks.rs");
+        std::fs::read_to_string(&path).expect("sequence_locks.rs")
+    }
+
+    fn calculate_sequence_locks_fn(src: &str) -> syn::ItemFn {
+        let file = syn::parse_file(src).expect("parse sequence_locks.rs");
+        file.items
+            .into_iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(func) if func.sig.ident == "calculate_sequence_locks" => Some(func),
+                _ => None,
+            })
+            .expect("calculate_sequence_locks")
+    }
+
+    fn must_replace(src: &str, from: &str, to: &str) -> String {
+        assert_ne!(from, to);
+        assert_eq!(src.matches(from).count(), 1, "needle must be unique: {from}");
+        let out = src.replace(from, to);
+        assert_ne!(out, src);
+        out
+    }
+
+    /// Production height snippet adds `locktime_value`; dropping that add
+    /// parses as coefficient 0. An unreadable height addend fails closed.
+    #[test]
+    fn sequence_locks_height_addend_is_parsed_both_ways() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let src = production_sequence_locks_src();
+        let parsed = parse_sequence_locks(&calculate_sequence_locks_fn(&src).block)
+            .expect("production body must parse");
+        assert_eq!(parsed.height_addend, 1, "production adds locktime_value");
+        assert_eq!(parsed.time_addend, 1, "production adds locktime_seconds");
+        assert_eq!(parsed.height_sub, 1);
+        assert_eq!(parsed.time_sub, 1);
+
+        let dropped = must_replace(
+            &src,
+            HEIGHT_ADD_NEEDLE,
+            "                .checked_sub(1)",
+        );
+        let dropped_parsed = parse_sequence_locks(&calculate_sequence_locks_fn(&dropped).block)
+            .expect("dropping the height addend must still parse");
+        assert_eq!(
+            dropped_parsed.height_addend, 0,
+            "absent checked_add(locktime_value) is coefficient 0"
+        );
+        assert_eq!(dropped_parsed.time_addend, 1);
+        assert_eq!(dropped_parsed.height_sub, 1);
+
+        let unreadable = must_replace(
+            &src,
+            HEIGHT_ADD_NEEDLE,
+            "                .checked_add(locktime_seconds)\n                .and_then(|sum| sum.checked_sub(1))",
+        );
+        assert!(
+            parse_sequence_locks(&calculate_sequence_locks_fn(&unreadable).block).is_none(),
+            "an unreadable height addend must fail closed, not default to height + value"
+        );
+    }
+
+    /// A body that drops `+ locktime_value` must not still prove
+    /// `min_h == ph + lock - 1`. The point (height 0, lock 1) is not
+    /// hidden by the `min_height.max` clamp: production yields 0, the
+    /// mutant yields -1. This must be a Counterexample (or fail closed),
+    /// never a vacuous Pass.
+    #[test]
+    fn sequence_locks_dropped_height_addend_does_not_prove_height_plus_lock() {
+        if !crate::parser::spec_expr::consensus_workspace_present() {
+            return;
+        }
+        let src = production_sequence_locks_src();
+        let clause = "result_is_err != 0 || input_len != 1 || heights_len != 1 || version != 2 || (flags & 1) == 0 || (seq_words[0] & 0x80000000) != 0 || (seq_words[0] & 0x00400000) != 0 || seq_heights[0] != 0 || (seq_words[0] & 0x0000ffff) != 1 || (result_0 == 0 && result_1 == -1)";
+
+        let production = check_sequence_locks_ensures(&src, clause);
+        assert_eq!(
+            production,
+            Some(SatResult::Unsat),
+            "unpatched production must prove height + lock - 1 at (0, 1), got {production:?}"
+        );
+
+        let dropped = must_replace(
+            &src,
+            HEIGHT_ADD_NEEDLE,
+            "                .checked_sub(1)",
+        );
+        let mutant = check_sequence_locks_ensures(&dropped, clause);
+        assert_ne!(
+            mutant,
+            Some(SatResult::Unsat),
+            "dropping +locktime_value must not still prove height + lock - 1 (got Passed)"
+        );
+        assert_eq!(
+            mutant,
+            Some(SatResult::Sat),
+            "dropping +locktime_value must yield a Counterexample (or fail closed as None); got {mutant:?}"
+        );
+    }
+
+    fn check_sequence_locks_ensures(src: &str, ensures: &str) -> Option<SatResult> {
+        let func = calculate_sequence_locks_fn(src);
+        let tr = Z3Translator::new(30000);
+        // The specializer introduces result_0 / seq_* itself. The
+        // production signature uses consensus types the translator does
+        // not need to name once parse_sequence_locks matches.
+        let (mut shared_vars, type_constraints) =
+            tr.build_shared_vars(&std::collections::HashMap::new(), None);
+        let ensures_expr: syn::Expr = syn::parse_str(ensures).expect("ensures parses");
+        let contract = Contract {
+            contract_type: crate::parser::contracts::ContractType::Ensures,
+            condition: ensures_expr,
+            comment: None,
+        };
+        let ensures_z3 = tr
+            .translate_contract_with_shared_vars(&contract, &mut shared_vars)
+            .ok()?;
+        let body_formula = tr.translate_function_body(&func, &mut shared_vars).ok()??;
+        let solver = Solver::new(tr.context());
+        for c in &type_constraints {
+            solver.assert(c);
+        }
+        solver.assert(&body_formula);
+        solver.assert(&ensures_z3.as_bool()?.not());
+        Some(solver.check())
     }
 }
 

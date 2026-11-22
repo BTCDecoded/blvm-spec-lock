@@ -24538,6 +24538,15 @@ fn contains_mul(expr: &Expr) -> bool {
     }
 }
 
+/// `NAME`, `path::NAME`, or an `as` cast of one. `NAME + 1` is not exact.
+fn exact_named_constant(expr: &Expr, name: &str) -> bool {
+    match peel_paren(expr) {
+        peeled @ Expr::Path(_) => path_ends(peeled, name),
+        Expr::Cast(cast) => exact_named_constant(&cast.expr, name),
+        _ => false,
+    }
+}
+
 impl<'ast> syn::visit::Visit<'ast> for WeightFind {
     fn visit_expr(&mut self, expr: &'ast Expr) {
         match expr {
@@ -24637,13 +24646,18 @@ impl<'ast> syn::visit::Visit<'ast> for WeightFind {
                     } else if matches!(bin.op, syn::BinOp::Gt(_)) && lit_i64(right) == Some(1) {
                         note_weight_rel(self, 2);
                     } else if matches!(bin.op, syn::BinOp::Gt(_))
-                        && contains_path_end(right, "MAX_BLOCK_WEIGHT")
+                        && exact_named_constant(right, "MAX_BLOCK_WEIGHT")
                     {
                         note_weight_rel(self, 0);
                     } else if matches!(bin.op, syn::BinOp::Ge(_))
-                        && contains_path_end(right, "MAX_BLOCK_WEIGHT")
+                        && exact_named_constant(right, "MAX_BLOCK_WEIGHT")
                     {
                         note_weight_rel(self, 1);
+                    } else if matches!(bin.op, syn::BinOp::Gt(_) | syn::BinOp::Ge(_))
+                        && contains_path_end(right, "MAX_BLOCK_WEIGHT")
+                    {
+                        // Refuse `> MAX_BLOCK_WEIGHT + 1` rather than treating it as `> MAX`.
+                        self.rel_conflict = true;
                     }
                 }
                 if matches!(bin.op, syn::BinOp::Lt(_))
@@ -24662,13 +24676,17 @@ impl<'ast> syn::visit::Visit<'ast> for WeightFind {
                     if matches!(bin.op, syn::BinOp::Gt(_)) && lit_i64(right) == Some(1) {
                         note_sig_rel(self, 2);
                     } else if matches!(bin.op, syn::BinOp::Gt(_))
-                        && contains_path_end(right, "MAX_BLOCK_SIGOPS_COST")
+                        && exact_named_constant(right, "MAX_BLOCK_SIGOPS_COST")
                     {
                         note_sig_rel(self, 0);
                     } else if matches!(bin.op, syn::BinOp::Ge(_))
-                        && contains_path_end(right, "MAX_BLOCK_SIGOPS_COST")
+                        && exact_named_constant(right, "MAX_BLOCK_SIGOPS_COST")
                     {
                         note_sig_rel(self, 1);
+                    } else if matches!(bin.op, syn::BinOp::Gt(_) | syn::BinOp::Ge(_))
+                        && contains_path_end(right, "MAX_BLOCK_SIGOPS_COST")
+                    {
+                        self.sig_conflict = true;
                     }
                 }
                 if matches!(bin.op, syn::BinOp::Gt(_))

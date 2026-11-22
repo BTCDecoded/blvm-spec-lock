@@ -18200,11 +18200,12 @@ mod weight_limit_identity {
         let func = stitch(&body);
         // Weight cap (connect.rs:3411-3421): a block is invalid when
         // block_weight > MAX_BLOCK_WEIGHT (4_000_000, constants.rs:16).
-        // At exactly the cap the `>` check does not reject. Zero (3401-3403)
-        // and the *2 DoS bound (3404-3410) do not fire at that weight.
-        // Other connect rejects are listed so the cap is the remaining cause.
+        // At exactly the cap the `>` check does not reject; at cap+1 it
+        // returns result == 0. Zero (3401-3403) and the *2 DoS bound
+        // (3404-3410) do not fire at either weight. Other connect rejects
+        // are listed so the cap is the remaining cause.
         let clause = format!(
-            "result < 0 || {} || script_sig_len < 2 || script_sig_len > 100 || total_sigop_cost > 80000 || block_weight != 4_000_000 || result > 0",
+            "result < 0 || {} || script_sig_len < 2 || script_sig_len > 100 || total_sigop_cost > 80000 || (block_weight != 4_000_000 && block_weight != 4_000_001) || (block_weight == 4_000_000 && result > 0) || (block_weight == 4_000_001 && result == 0)",
             other_bads()
         );
         match identity_query(&func, &clause) {
@@ -18231,7 +18232,9 @@ mod weight_limit_identity {
             ),
             "accepting the weight limit must flip the identity, got {boundary_result:?}"
         );
-        let predicate = stitch(&body.replace(needle, "block_weight > 1 {"));
+        let predicate_src = body.replace(needle, "block_weight > 1 {");
+        assert_ne!(predicate_src, body, "the weight predicate must change");
+        let predicate = stitch(&predicate_src);
         let predicate_result = identity_query(&predicate, &clause);
         assert!(
             matches!(
@@ -18242,6 +18245,22 @@ mod weight_limit_identity {
                 }
             ),
             "rejecting every weight above 1 must flip the identity, got {predicate_result:?}"
+        );
+        // `> MAX_BLOCK_WEIGHT + 1` must not be parsed as the cap (`> MAX`).
+        let plus_one_src = body.replace(
+            needle,
+            "block_weight > crate::constants::MAX_BLOCK_WEIGHT as u64 + 1 {",
+        );
+        assert_ne!(plus_one_src, body, "the shifted weight cap must change");
+        let plus_one_result = identity_query(&stitch(&plus_one_src), &clause);
+        assert!(
+            !matches!(
+                plus_one_result,
+                VerificationResult::Passed {
+                    body_translated: true
+                }
+            ),
+            "> MAX_BLOCK_WEIGHT + 1 must not parse as the weight cap, got {plus_one_result:?}"
         );
     }
 
@@ -18257,11 +18276,12 @@ mod weight_limit_identity {
         let func = stitch(&body);
         // Sigop cap (connect.rs:4080-4086): a block is invalid when
         // total_sigop_cost > MAX_BLOCK_SIGOPS_COST (80_000, constants.rs:115).
-        // At exactly the cap the `>` check does not reject. The same
-        // predicate appears on the non-production profile path at 3755-3764;
-        // both must stay the same relation or the body specializer drops.
+        // At exactly the cap the `>` check does not reject; at cap+1, with
+        // an in-range weight, it returns result == 0. The same predicate
+        // appears on the non-production profile path at 3755-3764; both
+        // must stay the same relation or the body specializer drops.
         let clause = format!(
-            "result < 0 || {} || script_sig_len < 2 || script_sig_len > 100 || block_weight < 1 || block_weight > 4_000_000 || total_sigop_cost != 80_000 || result > 0",
+            "result < 0 || {} || script_sig_len < 2 || script_sig_len > 100 || block_weight < 1 || block_weight > 4_000_000 || (total_sigop_cost != 80_000 && total_sigop_cost != 80_001) || (total_sigop_cost == 80_000 && result > 0) || (total_sigop_cost == 80_001 && result == 0)",
             other_bads()
         );
         match identity_query(&func, &clause) {

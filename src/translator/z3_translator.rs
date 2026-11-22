@@ -558,7 +558,11 @@ impl Z3Translator {
                         .is_none()
                 {
                     if let Some(amount) = right.as_int() {
-                        self.record_shift_bound(vars, &amount);
+                        self.record_shift_bound(
+                            vars,
+                            &amount,
+                            simple_path_name(&bin.right).as_deref(),
+                        );
                     }
                 }
                 // BitAnd (&): model with div/rem for constant masks (Z3 Int has no native bitwise)
@@ -1491,25 +1495,42 @@ impl Z3Translator {
         shifted.to_int(false)
     }
 
-    /// The continuation after `if guard { return ... }` is `¬guard`. A later
-    /// variable shift has to prove its amount is below 64 from that path.
-    fn note_shift_continuation<'a>(&'a self, vars: &mut Z3VarMap<'a>, guard: &Bool<'a>) {
-        let cont = guard.not();
-        let next = match vars.get("__shift_path").and_then(|v| v.as_bool()) {
-            Some(prev) => Bool::and(&self.ctx, &[&prev, &cont]),
-            None => cont,
+    /// Carry `if var >= K { return ... }` (or `>`, or the swapped
+    /// `K <= var` / `K < var` form) into later shifts of the same
+    /// variable, when `K` is a constant in 1..=64. Any other guard
+    /// shape is refused. The consensus form is
+    /// `if halving_period >= 64 { return 0; }` (economic.rs:26-28).
+    fn note_shift_guard<'a>(&'a self, vars: &mut Z3VarMap<'a>, cond: &Expr) {
+        let Some((name, upper)) = exact_shift_guard(cond) else {
+            return;
         };
-        vars.insert("__shift_path".to_string(), next.into());
+        let Some(term) = vars.get(&name).and_then(|v| v.as_int()) else {
+            return;
+        };
+        let path = term.lt(&Int::from_i64(&self.ctx, upper));
+        let key = format!("__shift_path_{name}");
+        let next = match vars.get(&key).and_then(|v| v.as_bool()) {
+            Some(prev) => Bool::and(&self.ctx, &[&prev, &path]),
+            None => path,
+        };
+        vars.insert(key, next.into());
     }
 
-    /// Record `path ⇒ 0 ≤ amount < 64` for a variable shift. `bvlshr` is unchanged.
-    fn record_shift_bound<'a>(&'a self, vars: &mut Z3VarMap<'a>, amount: &Int<'a>) {
+    /// Record `path ⇒ amount < 64` for a variable shift of `amount_name`
+    /// when that name has an exact early-return guard. `bvlshr` is unchanged.
+    fn record_shift_bound<'a>(
+        &'a self,
+        vars: &mut Z3VarMap<'a>,
+        amount: &Int<'a>,
+        amount_name: Option<&str>,
+    ) {
         let width = Int::from_i64(&self.ctx, 64);
         let in_range = amount.lt(&width);
-        let obligation = match vars.get("__shift_path").and_then(|v| v.as_bool()) {
-            Some(path) => path.implies(&in_range),
-            None => in_range,
-        };
+        let obligation = amount_name
+            .and_then(|name| vars.get(&format!("__shift_path_{name}")))
+            .and_then(|v| v.as_bool())
+            .map(|path| path.implies(&in_range))
+            .unwrap_or(in_range);
         let n = vars
             .keys()
             .filter(|name| name.starts_with("__shift_bound_"))
@@ -3783,6 +3804,11 @@ impl Z3Translator {
         // a second consensus.
         let kept = crate::translator::production_lock::retain_production(func.clone());
         let body = &kept.block;
+
+        // The ensures clause is translated first and may record a variable
+        // shift with no path. Only the body's early-return guard may prove
+        // a later shift is below 64, so drop any stale contract bounds.
+        vars.retain(|name, _| !name.starts_with("__shift_"));
 
         // For simple functions, translate the body to a formula
         // result == <body_expression>
@@ -10001,13 +10027,13 @@ impl Z3Translator {
                         } else if let Some((cond, result_formula)) =
                             self.translate_if_with_early_return(if_expr, vars)?
                         {
-                            self.note_shift_continuation(vars, &cond);
+                            self.note_shift_guard(vars, &if_expr.cond);
                             early_return_conditions.push((cond, result_formula));
                         } else if let Some(err_cond) =
                             self.translate_if_with_err_return(if_expr, vars)
                         {
                             // `if bad { return Err(...) }` — on the Ok path, bad is false.
-                            self.note_shift_continuation(vars, &err_cond);
+                            self.note_shift_guard(vars, &if_expr.cond);
                             err_guard_conditions.push(err_cond);
                         }
                     } else if let Expr::Return(ret) = expr {
@@ -10095,12 +10121,12 @@ impl Z3Translator {
                             } else if let Some((cond, result_formula)) =
                                 self.translate_if_with_early_return(if_expr, vars)?
                             {
-                                self.note_shift_continuation(vars, &cond);
+                                self.note_shift_guard(vars, &if_expr.cond);
                                 early_return_conditions.push((cond, result_formula));
                             } else if let Some(err_cond) =
                                 self.translate_if_with_err_return(if_expr, vars)
                             {
-                                self.note_shift_continuation(vars, &err_cond);
+                                self.note_shift_guard(vars, &if_expr.cond);
                                 err_guard_conditions.push(err_cond);
                             }
                         }
@@ -12919,6 +12945,51 @@ fn lit_i64(expr: &Expr) -> Option<i64> {
         return None;
     };
     int.base10_parse::<i64>().ok()
+}
+
+/// A single-segment path, the local variable in a shift guard.
+fn simple_path_name(expr: &Expr) -> Option<String> {
+    let Expr::Path(path) = peel_paren(expr) else {
+        return None;
+    };
+    if path.path.segments.len() != 1 {
+        return None;
+    }
+    Some(path.path.segments[0].ident.to_string())
+}
+
+/// Exclusive upper bound `U` of the continuation after an early-return
+/// comparison, when `U` is in 1..=64. `ident >= K` gives `U = K`;
+/// `ident > K` gives `U = K + 1`. Swapped `K <= ident` / `K < ident`
+/// are accepted. Any other shape, or `U > 64` (e.g. `>= 65`), is refused.
+fn exact_shift_guard(expr: &Expr) -> Option<(String, i64)> {
+    let Expr::Binary(bin) = peel_paren(expr) else {
+        return None;
+    };
+    let (name, k, ge) = if let Some(name) = simple_path_name(&bin.left) {
+        let k = lit_i64(peel_paren(&bin.right))?;
+        let ge = match bin.op {
+            syn::BinOp::Ge(_) => true,
+            syn::BinOp::Gt(_) => false,
+            _ => return None,
+        };
+        (name, k, ge)
+    } else if let Some(name) = simple_path_name(&bin.right) {
+        let k = lit_i64(peel_paren(&bin.left))?;
+        let ge = match bin.op {
+            syn::BinOp::Le(_) => true,
+            syn::BinOp::Lt(_) => false,
+            _ => return None,
+        };
+        (name, k, ge)
+    } else {
+        return None;
+    };
+    let upper = if ge { k } else { k.checked_add(1)? };
+    if !(1..=64).contains(&upper) {
+        return None;
+    }
+    Some((name.to_string(), upper))
 }
 
 struct BlockProof {

@@ -3421,6 +3421,9 @@ mod get_block_subsidy_identity {
         let interval = protocol_u64("H");
         let initial = initial_subsidy();
         let guard = subsidy_shift_guard();
+        // GetBlockSubsidy (economic.rs:22-46): after
+        // `if halving_period >= 64 { return 0; }` (26-28),
+        // `subsidy = INITIAL_SUBSIDY >> halving_period` (36-37).
         let identity = format!(
             "result == if (height / {interval}) >= {guard} {{ 0 }} else {{ {initial} >> (height / {interval}) }}"
         );
@@ -3476,7 +3479,7 @@ mod get_block_subsidy_identity {
             "guard edit must flip the identity, got {halved_result:?}"
         );
 
-        let mut shifted = func;
+        let mut shifted = func.clone();
         assert!(
             crate::translator::body_edit::increment_returned_shift(&mut shifted),
             "the returned value is a shift"
@@ -3496,6 +3499,24 @@ mod get_block_subsidy_identity {
                 }
             ),
             "shift edit must flip the identity, got {shifted_result:?}"
+        );
+
+        // `>= 65` is not an exact shift guard (U = 65 is above 64), so
+        // the later `>> halving_period` must not still pass as a
+        // body-translated proof (economic.rs:26-28, 37).
+        let orig_src = quote::quote!(#func).to_string();
+        let weakened_src = orig_src.replace("halving_period >= 64", "halving_period >= 65");
+        assert_ne!(weakened_src, orig_src, "the shift guard must change");
+        let weakened: syn::ItemFn = syn::parse_str(&weakened_src).expect("weakened guard");
+        let weakened_result = identity_query(&weakened);
+        assert!(
+            !matches!(
+                weakened_result,
+                VerificationResult::Passed {
+                    body_translated: true
+                }
+            ),
+            ">= 65 must not prove the later shift is below 64, got {weakened_result:?}"
         );
     }
 }

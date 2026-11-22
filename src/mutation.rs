@@ -193,6 +193,18 @@ const DER_HIGH: &str = r#"    if (signature[4] & 0x80) != 0 {
         return Ok(false);
     }"#;
 
+fn must_replace(src: String, needle: &str, replacement: &str, label: &str) -> String {
+    let patched = src.replace(needle, replacement);
+    assert_ne!(patched, src, "{label}: needle missed the production source");
+    patched
+}
+
+fn must_replace_once(src: String, needle: &str, replacement: &str, label: &str) -> String {
+    let patched = src.replacen(needle, replacement, 1);
+    assert_ne!(patched, src, "{label}: needle missed the production source");
+    patched
+}
+
 fn patch(
     mutant: Mutant,
     fast: &str,
@@ -206,58 +218,101 @@ fn patch(
     let mut merkle = merkle.to_string();
     match mutant {
         Mutant::M1 => {
-            check = check.replace(DUP_IF, "");
+            check = must_replace(check, DUP_IF, "", mutant.id());
         }
         Mutant::M2 | Mutant::M13 => {
-            check = check.replace(
+            check = must_replace(
+                check,
                 "seen_prevouts.insert(&input.prevout)",
                 "seen_prevouts.insert(&input.prevout.txid)",
+                mutant.id(),
             );
         }
         Mutant::M3 => {
-            check = check.replace(".checked_add(output.value)", ".wrapping_add(output.value)");
+            check = must_replace(
+                check,
+                ".checked_add(output.value)",
+                ".wrapping_add(output.value)",
+                mutant.id(),
+            );
         }
         Mutant::M4 => {
-            fast = fast.replace("value_u64 > MAX_MONEY_U64", "value_u64 >= MAX_MONEY_U64");
-            check = check.replace("value_u64 > MAX_MONEY_U64", "value_u64 >= MAX_MONEY_U64");
-            check = check.replace("total_u64 > MAX_MONEY_U64", "total_u64 >= MAX_MONEY_U64");
+            fast = must_replace(
+                fast,
+                "value_u64 > MAX_MONEY_U64",
+                "value_u64 >= MAX_MONEY_U64",
+                mutant.id(),
+            );
+            check = must_replace(
+                check,
+                "value_u64 > MAX_MONEY_U64",
+                "value_u64 >= MAX_MONEY_U64",
+                mutant.id(),
+            );
+            check = must_replace(
+                check,
+                "total_u64 > MAX_MONEY_U64",
+                "total_u64 >= MAX_MONEY_U64",
+                mutant.id(),
+            );
         }
         Mutant::M5 => {
             for src in [&mut fast, &mut check] {
-                *src = src.replace(
+                *src = must_replace(
+                    std::mem::take(src),
                     "output.value < 0 || value_u64 > MAX_MONEY_U64",
                     "output.value > MAX_MONEY",
+                    mutant.id(),
                 );
             }
-            check = check.replace(
+            check = must_replace(
+                check,
                 "total_output_value < 0 || total_u64 > MAX_MONEY_U64",
                 "total_output_value > MAX_MONEY",
+                mutant.id(),
             );
         }
         Mutant::M6 | Mutant::M14 => {
-            der = der.replace("signature.len() > 73", "signature.len() > 74");
+            der = must_replace(
+                der,
+                "signature.len() > 73",
+                "signature.len() > 74",
+                mutant.id(),
+            );
         }
         Mutant::M7 => {
-            der = der.replace(DER_LEADING, "");
+            der = must_replace(der, DER_LEADING, "", mutant.id());
         }
         Mutant::M8 => {
-            der = der.replace(DER_HIGH, "");
+            der = must_replace(der, DER_HIGH, "", mutant.id());
         }
         Mutant::M9 => {
-            der = der.replace(
+            der = must_replace(
+                der,
                 "signature[0] != 0x30",
                 "signature[0] != 0x30 && signature[0] != 0x31",
+                mutant.id(),
             );
         }
         Mutant::M10 => {
-            merkle = merkle.replace(MERKLE_CMP, "");
+            merkle = must_replace(merkle, MERKLE_CMP, "", mutant.id());
         }
         Mutant::M11 | Mutant::M15 => {
-            merkle = merkle.replace(MERKLE_CMP, "");
-            merkle = merkle.replace(MERKLE_PAD, &format!("{MERKLE_PAD}\n{MERKLE_CMP}"));
+            merkle = must_replace(merkle, MERKLE_CMP, "", mutant.id());
+            merkle = must_replace(
+                merkle,
+                MERKLE_PAD,
+                &format!("{MERKLE_PAD}\n{MERKLE_CMP}"),
+                mutant.id(),
+            );
         }
         Mutant::M12 => {
-            check = check.replacen("value_u64 > MAX_MONEY_U64", "value_u64 >= MAX_MONEY_U64", 1);
+            check = must_replace_once(
+                check,
+                "value_u64 > MAX_MONEY_U64",
+                "value_u64 >= MAX_MONEY_U64",
+                mutant.id(),
+            );
         }
     }
     (fast, check, der, merkle)
@@ -388,7 +443,7 @@ fn render_table() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translator::production_lock::mir_matches;
+    use crate::translator::production_lock::{dup_same_outpoint_query, mir_matches};
 
     #[test]
     fn unpatched_production_is_unsat() {
@@ -417,6 +472,25 @@ mod tests {
                 judge(mutant),
                 SatResult::Sat,
                 "{} stayed UNSAT; the patch did not touch what Z3 sees",
+                mutant.id()
+            );
+        }
+        // Optional sanity: M2 and M13 disagree with production only on
+        // same txid + different vout. A same-outpoint pair is rejected by
+        // both keys, so it is not a distinguishing witness.
+        for mutant in [Mutant::M2, Mutant::M13] {
+            let tx = consensus_src("transaction.rs");
+            let (fast, check, _, _) = patch(
+                mutant,
+                &extract_fn(&tx, "check_transaction_fast_path"),
+                &extract_fn(&tx, "check_transaction"),
+                "",
+                "",
+            );
+            assert_eq!(
+                dup_same_outpoint_query(&tx_facts(&fast, &check)),
+                SatResult::Unsat,
+                "{} must still agree with production on a same-outpoint pair",
                 mutant.id()
             );
         }

@@ -19685,46 +19685,217 @@ mod p2sh_fast_identity {
     use crate::parser::spec_expr::consensus_workspace_present;
     use std::path::PathBuf;
 
-    fn fn_interior(src: &str, name: &str) -> String {
-        let marker = format!("fn {name}");
-        let at = src
-            .find(&marker)
-            .unwrap_or_else(|| panic!("missing {name}"));
-        let rest = &src[at..];
-        let brace = rest.find('{').expect("fn brace");
-        let bytes = rest.as_bytes();
-        let mut i = brace;
+    /// Structural gates of `try_verify_p2sh_fast_path` (script/mod.rs:2119-2129):
+    /// the `SCRIPT_VERIFY_P2SH` flag and the 23-byte `OP_HASH160 PUSH_20 OP_EQUAL`
+    /// template. A miss is `None`, encoded as `2` (the same i64 encoding the
+    /// previous stitch used). HASH160(redeem), push parsing, the interpreter,
+    /// STRICTENC/BIP66, and ECDSA are not modeled: after the gates, the query
+    /// returns the production `signature::verify_signature(...)` call from
+    /// `verify_p2sh_p2pkh_redeem` (2027-2036) as an uninterpreted Int.
+    /// Presence of that call is asserted as text, not by a rename mutation.
+    /// The two mutations lock the length gate (`len() != 23` vs `!= 24`) and
+    /// that `OP_EQUAL` is checked at template index 22, not 21 (mod.rs:2126).
+    /// Named consts are replaced by literals parsed from flags.rs / opcodes.rs
+    /// because those paths are not in the translator's const files.
+    const P2SH_LEN: &str = "script_pubkey.len() != 23";
+    const P2SH_FLAG: &str = "flags & flags::SCRIPT_VERIFY_P2SH";
+    const P2SH_HASH160: &str = "script_pubkey[0] != OP_HASH160";
+    const P2SH_PUSH20: &str = "script_pubkey[1] != PUSH_20_BYTES";
+    const P2SH_EQUAL: &str = "script_pubkey[22] != OP_EQUAL";
+    const VERIFY_CALL: &str = "verify_signature(";
+
+    fn slice_fn(src: &str, marker: &str) -> String {
+        let start = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing {marker}"));
+        let rest = &src[start..];
         let mut depth = 0i32;
-        while i < bytes.len() {
-            if bytes[i] == b'"' {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == b'"' {
-                        break;
-                    }
-                    i += 1;
-                }
-            } else if bytes[i] == b'{' {
+        let mut started = false;
+        for (i, byte) in rest.bytes().enumerate() {
+            if byte == b'{' {
                 depth += 1;
-            } else if bytes[i] == b'}' {
+                started = true;
+            } else if byte == b'}' {
                 depth -= 1;
-                if depth == 0 {
-                    return rest[brace + 1..i].to_string();
+                if started && depth == 0 {
+                    return rest[..=i].to_string();
                 }
             }
-            i += 1;
         }
-        panic!("unclosed {name}");
+        panic!("unbalanced {marker}");
     }
 
-    fn stitch(body: &str) -> syn::ItemFn {
-        let src =
-            format!("fn try_verify_p2sh_fast_path(script_pubkey: &[u8]) -> i64 {{\n{body}\n}}\n");
-        let file = syn::parse_file(&src).unwrap_or_else(|err| panic!("parse p2sh: {err}"));
+    fn inner(item: &str) -> String {
+        let brace = item.find('{').expect("brace");
+        let mut depth = 0i32;
+        for (i, byte) in item[brace..].bytes().enumerate() {
+            if byte == b'{' {
+                depth += 1;
+            } else if byte == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    return item[brace + 1..brace + i].to_string();
+                }
+            }
+        }
+        panic!("unbalanced inner");
+    }
+
+    fn brace_block(src: &str, open_at: usize) -> &str {
+        let mut depth = 0i32;
+        for (i, byte) in src[open_at..].bytes().enumerate() {
+            if byte == b'{' {
+                depth += 1;
+            } else if byte == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open_at..=open_at + i];
+                }
+            }
+        }
+        panic!("unbalanced braces");
+    }
+
+    fn const_rhs<'a>(src: &'a str, name: &str) -> &'a str {
+        let needle = format!("const {name}:");
+        let rest = src
+            .split_once(&needle)
+            .unwrap_or_else(|| panic!("missing const {name}"))
+            .1;
+        rest.split_once('=')
+            .expect("const =")
+            .1
+            .split_once(';')
+            .expect("const ;")
+            .0
+            .trim()
+    }
+
+    fn flag_mask(flags: &str, name: &str) -> String {
+        let rhs = const_rhs(flags, name);
+        if let Some((left, right)) = rhs.split_once("<<") {
+            let base: u32 = left.trim().parse().expect("flag base");
+            let shift: u32 = right.trim().parse().expect("flag shift");
+            return (base << shift).to_string();
+        }
+        rhs.replace('_', "").to_string()
+    }
+
+    fn leading_miss_ifs(body: &str) -> (String, Vec<String>) {
+        let mut i = 0usize;
+        let mut blocks = String::new();
+        let mut conds = Vec::new();
+        loop {
+            while i < body.len() && body.as_bytes()[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if body[i..].starts_with("//") {
+                i += body[i..]
+                    .find('\n')
+                    .map(|n| n + 1)
+                    .unwrap_or(body[i..].len());
+                continue;
+            }
+            if !body[i..].starts_with("if ") && !body[i..].starts_with("if(") {
+                break;
+            }
+            let if_at = i;
+            let keyword = if body[i..].starts_with("if ") { 3 } else { 2 };
+            let brace = body[i..].find('{').map(|n| i + n).expect("if brace");
+            let cond = body[if_at + keyword..brace].trim().to_string();
+            let block = brace_block(body, brace);
+            if !block.contains("return None") {
+                break;
+            }
+            if !blocks.is_empty() {
+                blocks.push('\n');
+            }
+            blocks.push_str(&body[if_at..brace + block.len()]);
+            conds.push(cond);
+            i = brace + block.len();
+        }
+        assert!(
+            !conds.is_empty(),
+            "production must start with return-None gates"
+        );
+        (blocks, conds)
+    }
+
+    fn verify_signature_call(fn_src: &str) -> String {
+        let at = fn_src
+            .find(VERIFY_CALL)
+            .expect("production redeem must call verify_signature");
+        let start = fn_src[..at].rfind("signature::").unwrap_or(at);
+        let paren = fn_src[at..].find('(').expect("call paren") + at;
+        let mut depth = 0i32;
+        for (i, byte) in fn_src[paren..].bytes().enumerate() {
+            if byte == b'(' {
+                depth += 1;
+            } else if byte == b')' {
+                depth -= 1;
+                if depth == 0 {
+                    return fn_src[start..=paren + i].trim().to_string();
+                }
+            }
+        }
+        panic!("unbalanced verify_signature call");
+    }
+
+    fn subst_paths(text: &str, flags: &str, opcodes: &str) -> String {
+        let p2sh = flag_mask(flags, "SCRIPT_VERIFY_P2SH");
+        let hash160 = const_rhs(opcodes, "OP_HASH160");
+        let push20 = const_rhs(opcodes, "PUSH_20_BYTES");
+        let equal = const_rhs(opcodes, "OP_EQUAL");
+        text.replace("flags::SCRIPT_VERIFY_P2SH", &p2sh)
+            .replace("OP_HASH160", hash160)
+            .replace("PUSH_20_BYTES", push20)
+            .replace("OP_EQUAL", equal)
+    }
+
+    fn must_replace_in(src: &str, fn_name: &str, from: &str, to: &str) -> String {
+        let marker = format!("fn {fn_name}(");
+        let slice = slice_fn(src, &marker);
+        let start = src.find(&marker).expect(&marker);
+        let end = start + slice.len();
+        let edited = slice.replace(from, to);
+        assert_ne!(
+            edited, slice,
+            "{from} must change inside production {fn_name}"
+        );
+        let mut out = src.to_string();
+        out.replace_range(start..end, &edited);
+        out
+    }
+
+    fn query_src(script: &str, flags: &str, opcodes: &str) -> (String, String) {
+        let fast = slice_fn(script, "fn try_verify_p2sh_fast_path(");
+        let (mut gates, conds) = leading_miss_ifs(&inner(&fast));
+        assert_eq!(
+            conds.len(),
+            2,
+            "P2SH fast path should have the flag if and the 23-byte template if"
+        );
+        gates = subst_paths(&gates, flags, opcodes).replace("return None", "return 2");
+        let redeem = slice_fn(script, "fn verify_p2sh_p2pkh_redeem(");
+        let call = verify_signature_call(&redeem);
+        assert!(
+            call.contains("SigVersion::Base"),
+            "P2SH redeem must verify as Base"
+        );
+        let miss = conds
+            .iter()
+            .map(|c| format!("({})", subst_paths(c, flags, opcodes)))
+            .collect::<Vec<_>>()
+            .join(" || ");
+        let clause = format!("result == if {miss} {{ 2 }} else {{ {call} }}");
+        let src = format!(
+            "fn try_verify_p2sh_fast_path(script_pubkey: &[u8], flags: u32, pubkey_bytes: &[u8], signature_bytes: &[u8], sighash: &[u8], height: u64, network: u32, secp: u32) -> i64 {{\n{gates}\n    {call}\n}}\n"
+        );
+        (src, clause)
+    }
+
+    fn extract(src: &str) -> syn::ItemFn {
+        let file = syn::parse_file(src).unwrap_or_else(|err| panic!("parse p2sh: {err}"));
         match &file.items[0] {
             syn::Item::Fn(func) => func.clone(),
             _ => panic!("p2sh fn"),
@@ -19741,10 +19912,36 @@ mod p2sh_fast_identity {
         function.contracts = vec![super::Contract {
             contract_type: super::ContractType::Ensures,
             condition: clause.to_string(),
-            expr: syn::parse_str(clause).ok(),
+            expr: Some(
+                syn::parse_str::<syn::Expr>(clause)
+                    .unwrap_or_else(|err| panic!("p2sh clause must parse: {err}: {clause}")),
+            ),
             is_spec_derived: true,
         }];
+        // expr is Option in the struct
         verify_function(&function, 30, &[])
+    }
+
+    fn must_flip(result: VerificationResult, what: &str) {
+        assert!(
+            matches!(
+                result,
+                VerificationResult::Failed {
+                    kind: FailureKind::Counterexample,
+                    ..
+                }
+            ),
+            "{what} must flip the identity, got {result:?}"
+        );
+    }
+
+    fn must_pass(result: VerificationResult, what: &str) {
+        match result {
+            VerificationResult::Passed { body_translated } => {
+                assert!(body_translated, "{what} must use the body");
+            }
+            other => panic!("{what} must pass, got {other:?}"),
+        }
     }
 
     #[test]
@@ -19752,57 +19949,48 @@ mod p2sh_fast_identity {
         if !consensus_workspace_present() {
             return;
         }
-        let path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../blvm-consensus/src/script/mod.rs");
-        let src = std::fs::read_to_string(&path).expect("script/mod.rs");
-        let body = [
-            "try_verify_p2sh_fast_path",
-            "verify_p2sh_p2pkh_redeem",
-            "verify_p2sh_p2pk_redeem",
-        ]
-        .into_iter()
-        .map(|name| fn_interior(&src, name))
-        .collect::<Vec<_>>()
-        .join(";\n");
-        let func = stitch(&body);
-        let block = func.block.clone();
-        let clause = quote::quote!(#block).to_string();
-        match identity_query(&func, &clause) {
-            VerificationResult::Passed { body_translated } => {
-                assert!(
-                    body_translated,
-                    "try_verify_p2sh_fast_path must use the body"
-                );
-            }
-            other => panic!("unpatched try_verify_p2sh_fast_path must pass, got {other:?}"),
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../blvm-consensus/src");
+        let script = std::fs::read_to_string(root.join("script/mod.rs")).expect("script/mod.rs");
+        let flags = std::fs::read_to_string(root.join("script/flags.rs")).expect("flags.rs");
+        let opcodes = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../blvm-primitives/src/opcodes.rs"),
+        )
+        .expect("opcodes.rs");
+        let fast = slice_fn(&script, "fn try_verify_p2sh_fast_path(");
+        for gate in [P2SH_FLAG, P2SH_LEN, P2SH_HASH160, P2SH_PUSH20, P2SH_EQUAL] {
+            assert!(fast.contains(gate), "production must contain {gate}");
         }
-        let boundary_src = body.replace("script_pubkey.len() != 23", "script_pubkey.len() != 24");
-        assert_ne!(boundary_src, body);
-        let boundary = stitch(&boundary_src);
-        let boundary_result = identity_query(&boundary, &clause);
+        let redeem = slice_fn(&script, "fn verify_p2sh_p2pkh_redeem(");
         assert!(
-            matches!(
-                boundary_result,
-                VerificationResult::Failed {
-                    kind: FailureKind::Counterexample,
-                    ..
-                }
-            ),
-            "moving the P2SH length gate must flip the identity, got {boundary_result:?}"
+            redeem.contains(VERIFY_CALL),
+            "production redeem must call verify_signature"
         );
-        let predicate_src = body.replace("verify_signature(", "verify_signature_skipped(");
-        assert_ne!(predicate_src, body);
-        let predicate = stitch(&predicate_src);
-        let predicate_result = identity_query(&predicate, &clause);
-        assert!(
-            matches!(
-                predicate_result,
-                VerificationResult::Failed {
-                    kind: FailureKind::Counterexample,
-                    ..
-                }
-            ),
-            "renaming verify_signature must flip the identity, got {predicate_result:?}"
+        let (src, clause) = query_src(&script, &flags, &opcodes);
+        must_pass(
+            identity_query(&extract(&src), &clause),
+            "unpatched P2SH fast path",
+        );
+        let boundary = must_replace_in(
+            &script,
+            "try_verify_p2sh_fast_path",
+            P2SH_LEN,
+            "script_pubkey.len() != 24",
+        );
+        let (boundary_src, _) = query_src(&boundary, &flags, &opcodes);
+        must_flip(
+            identity_query(&extract(&boundary_src), &clause),
+            "moving the P2SH length gate",
+        );
+        let equal = must_replace_in(
+            &script,
+            "try_verify_p2sh_fast_path",
+            P2SH_EQUAL,
+            "script_pubkey[21] != OP_EQUAL",
+        );
+        let (equal_src, _) = query_src(&equal, &flags, &opcodes);
+        must_flip(
+            identity_query(&extract(&equal_src), &clause),
+            "moving the P2SH OP_EQUAL index",
         );
     }
 }
@@ -19812,46 +20000,220 @@ mod p2wpkh_fast_identity {
     use crate::parser::spec_expr::consensus_workspace_present;
     use std::path::PathBuf;
 
-    fn fn_interior(src: &str, name: &str) -> String {
-        let marker = format!("fn {name}");
-        let at = src
-            .find(&marker)
-            .unwrap_or_else(|| panic!("missing {name}"));
-        let rest = &src[at..];
-        let brace = rest.find('{').expect("fn brace");
-        let bytes = rest.as_bytes();
-        let mut i = brace;
+    /// Structural gates of `try_verify_p2wpkh_fast_path` (script/mod.rs:2577-2590):
+    /// `SCRIPT_VERIFY_WITNESS`, the 22-byte `OP_0 PUSH_20` template, an empty
+    /// scriptSig, and `witness.len() != 2`. A miss is `None`, encoded as `2`.
+    /// Pubkey-hash, BIP143, STRICTENC/BIP66, and ECDSA are not modeled: after
+    /// the gates, the query returns the production `signature::verify_signature(...)`
+    /// call from `finish_p2wpkh_ecdsa` (2384-2393) as an uninterpreted Int.
+    /// Presence of that call is asserted as text, not by a rename mutation.
+    /// The two mutations lock the length gate (`len() != 22` vs `!= 23`) and
+    /// the witness-count gate (`witness.len() != 2` vs `!= 3`, mod.rs:2588).
+    /// Named consts are replaced by literals parsed from flags.rs / opcodes.rs.
+    const P2WPKH_LEN: &str = "script_pubkey.len() != 22";
+    const P2WPKH_FLAG: &str = "flags & crate::script::flags::SCRIPT_VERIFY_WITNESS";
+    const P2WPKH_OP0: &str = "script_pubkey[0] != OP_0";
+    const P2WPKH_PUSH20: &str = "script_pubkey[1] != PUSH_20_BYTES";
+    const P2WPKH_EMPTY_SIG: &str = "if !script_sig.is_empty()";
+    const P2WPKH_WITNESS: &str = "if witness.len() != 2";
+    const VERIFY_CALL: &str = "verify_signature(";
+
+    fn slice_fn(src: &str, marker: &str) -> String {
+        let start = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing {marker}"));
+        let rest = &src[start..];
         let mut depth = 0i32;
-        while i < bytes.len() {
-            if bytes[i] == b'"' {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == b'"' {
-                        break;
-                    }
-                    i += 1;
-                }
-            } else if bytes[i] == b'{' {
+        let mut started = false;
+        for (i, byte) in rest.bytes().enumerate() {
+            if byte == b'{' {
                 depth += 1;
-            } else if bytes[i] == b'}' {
+                started = true;
+            } else if byte == b'}' {
                 depth -= 1;
-                if depth == 0 {
-                    return rest[brace + 1..i].to_string();
+                if started && depth == 0 {
+                    return rest[..=i].to_string();
                 }
             }
-            i += 1;
         }
-        panic!("unclosed {name}");
+        panic!("unbalanced {marker}");
     }
 
-    fn stitch(body: &str) -> syn::ItemFn {
-        let src =
-            format!("fn try_verify_p2wpkh_fast_path(script_pubkey: &[u8]) -> i64 {{\n{body}\n}}\n");
-        let file = syn::parse_file(&src).unwrap_or_else(|err| panic!("parse p2wpkh: {err}"));
+    fn inner(item: &str) -> String {
+        let brace = item.find('{').expect("brace");
+        let mut depth = 0i32;
+        for (i, byte) in item[brace..].bytes().enumerate() {
+            if byte == b'{' {
+                depth += 1;
+            } else if byte == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    return item[brace + 1..brace + i].to_string();
+                }
+            }
+        }
+        panic!("unbalanced inner");
+    }
+
+    fn brace_block(src: &str, open_at: usize) -> &str {
+        let mut depth = 0i32;
+        for (i, byte) in src[open_at..].bytes().enumerate() {
+            if byte == b'{' {
+                depth += 1;
+            } else if byte == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open_at..=open_at + i];
+                }
+            }
+        }
+        panic!("unbalanced braces");
+    }
+
+    fn const_rhs<'a>(src: &'a str, name: &str) -> &'a str {
+        let needle = format!("const {name}:");
+        let rest = src
+            .split_once(&needle)
+            .unwrap_or_else(|| panic!("missing const {name}"))
+            .1;
+        rest.split_once('=')
+            .expect("const =")
+            .1
+            .split_once(';')
+            .expect("const ;")
+            .0
+            .trim()
+    }
+
+    fn flag_mask(flags: &str, name: &str) -> String {
+        let rhs = const_rhs(flags, name);
+        if let Some((left, right)) = rhs.split_once("<<") {
+            let base: u32 = left.trim().parse().expect("flag base");
+            let shift: u32 = right.trim().parse().expect("flag shift");
+            return (base << shift).to_string();
+        }
+        rhs.replace('_', "").to_string()
+    }
+
+    fn leading_miss_ifs(body: &str) -> (String, Vec<String>) {
+        let mut i = 0usize;
+        let mut blocks = String::new();
+        let mut conds = Vec::new();
+        loop {
+            while i < body.len() && body.as_bytes()[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if body[i..].starts_with("let _") {
+                if let Some(semi) = body[i..].find(';') {
+                    i += semi + 1;
+                    continue;
+                }
+            }
+            if body[i..].starts_with("//") {
+                i += body[i..]
+                    .find('\n')
+                    .map(|n| n + 1)
+                    .unwrap_or(body[i..].len());
+                continue;
+            }
+            if !body[i..].starts_with("if ") && !body[i..].starts_with("if(") {
+                break;
+            }
+            let if_at = i;
+            let keyword = if body[i..].starts_with("if ") { 3 } else { 2 };
+            let brace = body[i..].find('{').map(|n| i + n).expect("if brace");
+            let cond = body[if_at + keyword..brace].trim().to_string();
+            let block = brace_block(body, brace);
+            if !block.contains("return None") {
+                break;
+            }
+            if !blocks.is_empty() {
+                blocks.push('\n');
+            }
+            blocks.push_str(&body[if_at..brace + block.len()]);
+            conds.push(cond);
+            i = brace + block.len();
+        }
+        assert!(
+            !conds.is_empty(),
+            "production must start with return-None gates"
+        );
+        (blocks, conds)
+    }
+
+    fn verify_signature_call(fn_src: &str) -> String {
+        let at = fn_src
+            .find(VERIFY_CALL)
+            .expect("production finish_p2wpkh_ecdsa must call verify_signature");
+        let start = fn_src[..at].rfind("signature::").unwrap_or(at);
+        let paren = fn_src[at..].find('(').expect("call paren") + at;
+        let mut depth = 0i32;
+        for (i, byte) in fn_src[paren..].bytes().enumerate() {
+            if byte == b'(' {
+                depth += 1;
+            } else if byte == b')' {
+                depth -= 1;
+                if depth == 0 {
+                    return fn_src[start..=paren + i].trim().to_string();
+                }
+            }
+        }
+        panic!("unbalanced verify_signature call");
+    }
+
+    fn subst_paths(text: &str, flags: &str, opcodes: &str) -> String {
+        let witness = flag_mask(flags, "SCRIPT_VERIFY_WITNESS");
+        let op0 = const_rhs(opcodes, "OP_0");
+        let push20 = const_rhs(opcodes, "PUSH_20_BYTES");
+        text.replace("crate::script::flags::SCRIPT_VERIFY_WITNESS", &witness)
+            .replace("PUSH_20_BYTES", push20)
+            .replace("OP_0", op0)
+    }
+
+    fn must_replace_in(src: &str, fn_name: &str, from: &str, to: &str) -> String {
+        let marker = format!("fn {fn_name}(");
+        let slice = slice_fn(src, &marker);
+        let start = src.find(&marker).expect(&marker);
+        let end = start + slice.len();
+        let edited = slice.replace(from, to);
+        assert_ne!(
+            edited, slice,
+            "{from} must change inside production {fn_name}"
+        );
+        let mut out = src.to_string();
+        out.replace_range(start..end, &edited);
+        out
+    }
+
+    fn query_src(script: &str, flags: &str, opcodes: &str) -> (String, String) {
+        let fast = slice_fn(script, "fn try_verify_p2wpkh_fast_path(");
+        let (mut gates, conds) = leading_miss_ifs(&inner(&fast));
+        assert_eq!(
+            conds.len(),
+            4,
+            "P2WPKH fast path should have flag, template, empty scriptSig, and witness-len ifs"
+        );
+        gates = subst_paths(&gates, flags, opcodes).replace("return None", "return 2");
+        let finish = slice_fn(script, "fn finish_p2wpkh_ecdsa(");
+        let call = verify_signature_call(&finish);
+        assert!(
+            call.contains("SigVersion::WitnessV0"),
+            "P2WPKH must verify as WitnessV0"
+        );
+        let miss = conds
+            .iter()
+            .map(|c| format!("({})", subst_paths(c, flags, opcodes)))
+            .collect::<Vec<_>>()
+            .join(" || ");
+        let clause = format!("result == if {miss} {{ 2 }} else {{ {call} }}");
+        let src = format!(
+            "fn try_verify_p2wpkh_fast_path(script_pubkey: &[u8], script_sig: &[u8], witness: &[u8], flags: u32, pubkey_bytes: &[u8], signature_bytes: &[u8], sighash: &[u8], height: u64, network: u32, secp: u32) -> i64 {{\n{gates}\n    {call}\n}}\n"
+        );
+        (src, clause)
+    }
+
+    fn extract(src: &str) -> syn::ItemFn {
+        let file = syn::parse_file(src).unwrap_or_else(|err| panic!("parse p2wpkh: {err}"));
         match &file.items[0] {
             syn::Item::Fn(func) => func.clone(),
             _ => panic!("p2wpkh fn"),
@@ -19868,10 +20230,35 @@ mod p2wpkh_fast_identity {
         function.contracts = vec![super::Contract {
             contract_type: super::ContractType::Ensures,
             condition: clause.to_string(),
-            expr: syn::parse_str(clause).ok(),
+            expr: Some(
+                syn::parse_str::<syn::Expr>(clause)
+                    .unwrap_or_else(|err| panic!("p2wpkh clause must parse: {err}: {clause}")),
+            ),
             is_spec_derived: true,
         }];
         verify_function(&function, 30, &[])
+    }
+
+    fn must_flip(result: VerificationResult, what: &str) {
+        assert!(
+            matches!(
+                result,
+                VerificationResult::Failed {
+                    kind: FailureKind::Counterexample,
+                    ..
+                }
+            ),
+            "{what} must flip the identity, got {result:?}"
+        );
+    }
+
+    fn must_pass(result: VerificationResult, what: &str) {
+        match result {
+            VerificationResult::Passed { body_translated } => {
+                assert!(body_translated, "{what} must use the body");
+            }
+            other => panic!("{what} must pass, got {other:?}"),
+        }
     }
 
     #[test]
@@ -19879,57 +20266,55 @@ mod p2wpkh_fast_identity {
         if !consensus_workspace_present() {
             return;
         }
-        let path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../blvm-consensus/src/script/mod.rs");
-        let src = std::fs::read_to_string(&path).expect("script/mod.rs");
-        let body = [
-            "try_verify_p2wpkh_fast_path",
-            "verify_p2wpkh_inline",
-            "finish_p2wpkh_ecdsa",
-        ]
-        .into_iter()
-        .map(|name| fn_interior(&src, name))
-        .collect::<Vec<_>>()
-        .join(";\n");
-        let func = stitch(&body);
-        let block = func.block.clone();
-        let clause = quote::quote!(#block).to_string();
-        match identity_query(&func, &clause) {
-            VerificationResult::Passed { body_translated } => {
-                assert!(
-                    body_translated,
-                    "try_verify_p2wpkh_fast_path must use the body"
-                );
-            }
-            other => panic!("unpatched try_verify_p2wpkh_fast_path must pass, got {other:?}"),
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../blvm-consensus/src");
+        let script = std::fs::read_to_string(root.join("script/mod.rs")).expect("script/mod.rs");
+        let flags = std::fs::read_to_string(root.join("script/flags.rs")).expect("flags.rs");
+        let opcodes = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../blvm-primitives/src/opcodes.rs"),
+        )
+        .expect("opcodes.rs");
+        let fast = slice_fn(&script, "fn try_verify_p2wpkh_fast_path(");
+        for gate in [
+            P2WPKH_FLAG,
+            P2WPKH_LEN,
+            P2WPKH_OP0,
+            P2WPKH_PUSH20,
+            P2WPKH_EMPTY_SIG,
+            P2WPKH_WITNESS,
+        ] {
+            assert!(fast.contains(gate), "production must contain {gate}");
         }
-        let boundary_src = body.replace("script_pubkey.len() != 22", "script_pubkey.len() != 23");
-        assert_ne!(boundary_src, body);
-        let boundary = stitch(&boundary_src);
-        let boundary_result = identity_query(&boundary, &clause);
+        let finish = slice_fn(&script, "fn finish_p2wpkh_ecdsa(");
         assert!(
-            matches!(
-                boundary_result,
-                VerificationResult::Failed {
-                    kind: FailureKind::Counterexample,
-                    ..
-                }
-            ),
-            "moving the P2WPKH length gate must flip the identity, got {boundary_result:?}"
+            finish.contains(VERIFY_CALL),
+            "production finish_p2wpkh_ecdsa must call verify_signature"
         );
-        let predicate_src = body.replace("verify_signature(", "verify_signature_skipped(");
-        assert_ne!(predicate_src, body);
-        let predicate = stitch(&predicate_src);
-        let predicate_result = identity_query(&predicate, &clause);
-        assert!(
-            matches!(
-                predicate_result,
-                VerificationResult::Failed {
-                    kind: FailureKind::Counterexample,
-                    ..
-                }
-            ),
-            "renaming verify_signature must flip the identity, got {predicate_result:?}"
+        let (src, clause) = query_src(&script, &flags, &opcodes);
+        must_pass(
+            identity_query(&extract(&src), &clause),
+            "unpatched P2WPKH fast path",
+        );
+        let boundary = must_replace_in(
+            &script,
+            "try_verify_p2wpkh_fast_path",
+            P2WPKH_LEN,
+            "script_pubkey.len() != 23",
+        );
+        let (boundary_src, _) = query_src(&boundary, &flags, &opcodes);
+        must_flip(
+            identity_query(&extract(&boundary_src), &clause),
+            "moving the P2WPKH length gate",
+        );
+        let witness = must_replace_in(
+            &script,
+            "try_verify_p2wpkh_fast_path",
+            "witness.len() != 2",
+            "witness.len() != 3",
+        );
+        let (witness_src, _) = query_src(&witness, &flags, &opcodes);
+        must_flip(
+            identity_query(&extract(&witness_src), &clause),
+            "moving the P2WPKH witness-count gate",
         );
     }
 }

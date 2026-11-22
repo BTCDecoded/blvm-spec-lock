@@ -10431,7 +10431,7 @@ impl Z3Translator {
         let snapshot = vars.clone();
         let found = self.translate_if_early_return_lets(if_expr, vars, cond_bool)?;
         *vars = snapshot;
-        return Ok(found);
+        Ok(found)
     }
 
     /// Translate then-branch lets and a possible early return, writing

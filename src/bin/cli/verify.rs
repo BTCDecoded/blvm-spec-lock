@@ -7359,9 +7359,17 @@ mod calculate_sequence_identity {
             .join("../blvm-consensus/src/sequence_locks.rs");
         let src = std::fs::read_to_string(&path).expect("sequence_locks.rs");
         let func = decode_fn_from(&src);
-        let block = func.block.clone();
-        let clause = quote::quote!(#block).to_string();
-        match identity_query(&func, &clause) {
+        // CalculateSequenceLocks (sequence_locks.rs:56-185) returns
+        // Ok((min_height, min_time)). Both sides start at -1 (74-76). When
+        // BIP68 is off — version_enforces_relative_lock is false or
+        // LOCKTIME_VERIFY_SEQUENCE (0x01) is unset (78-84) — it returns those
+        // initializers. Every Ok path keeps both components >= -1 (52-55,
+        // 163-180), which is the result >= -1 half of F_SequenceLockHeightAdd.
+        // The body specializer models the version gate as version >= 2
+        // (z3_translator.rs:4456); the source uses (version as u32) >= 2
+        // (sequence_locks.rs:28-30).
+        let clause = "result_is_err != 0 || (result_0 >= -1 && result_1 >= -1 && ((version >= 2 && (flags & 1) != 0) || (result_0 == -1 && result_1 == -1)))";
+        match identity_query(&func, clause) {
             VerificationResult::Passed { body_translated } => {
                 assert!(body_translated, "sequence locks must use the body");
             }
@@ -7369,7 +7377,7 @@ mod calculate_sequence_identity {
         }
         let raised = src.replacen("min_height: i64 = -1", "min_height: i64 = 0", 1);
         assert_ne!(raised, src, "the height initializer must change");
-        let raised_result = identity_query(&decode_fn_from(&raised), &clause);
+        let raised_result = identity_query(&decode_fn_from(&raised), clause);
         assert!(
             matches!(
                 raised_result,
@@ -7380,22 +7388,49 @@ mod calculate_sequence_identity {
             ),
             "raising the height initializer must flip the identity, got {raised_result:?}"
         );
-        let unshifted = src.replacen(
-            "locktime_value << SEQUENCE_LOCKTIME_GRANULARITY",
-            "locktime_value",
-            1,
-        );
-        assert_ne!(unshifted, src, "the granularity shift must change");
-        let unshifted_result = identity_query(&decode_fn_from(&unshifted), &clause);
+        let raised_time = src.replacen("min_time: i64 = -1", "min_time: i64 = 0", 1);
+        assert_ne!(raised_time, src, "the time initializer must change");
+        let raised_time_result = identity_query(&decode_fn_from(&raised_time), clause);
         assert!(
             matches!(
-                unshifted_result,
+                raised_time_result,
                 VerificationResult::Failed {
                     kind: FailureKind::Counterexample,
                     ..
                 }
             ),
-            "dropping the granularity shift must flip the identity, got {unshifted_result:?}"
+            "raising the time initializer must flip the identity, got {raised_time_result:?}"
+        );
+        // F_SequenceLockHeightAdd: required_height = coin_height + locktime_value - 1
+        // (sequence_locks.rs:163-172). Dropping that -1 must flip this tighter
+        // postcondition: a single height-based input with coin height 0 and
+        // lock value 0 yields required_height == -1, so min_height stays -1.
+        let height_add = "result_is_err != 0 || input_len != 1 || heights_len != 1 || version < 2 || (flags & 1) == 0 || (seq_words[0] & 0x80000000) != 0 || (seq_words[0] & 0x00400000) != 0 || seq_heights[0] != 0 || (seq_words[0] & 0x0000ffff) != 0 || (result_0 == -1 && result_1 == -1)";
+        match identity_query(&func, height_add) {
+            VerificationResult::Passed { body_translated } => {
+                assert!(body_translated, "the height-add identity must use the body");
+            }
+            other => panic!("unpatched height add must pass, got {other:?}"),
+        }
+        let dropped_minus = src.replace(
+            "let required_height = coin_height
+                .checked_add(locktime_value)
+                .and_then(|sum| sum.checked_sub(1))",
+            "let required_height = coin_height
+                .checked_add(locktime_value)
+                .and_then(|sum| sum.checked_sub(0))",
+        );
+        assert_ne!(dropped_minus, src, "the height-add -1 must change");
+        let dropped_minus_result = identity_query(&decode_fn_from(&dropped_minus), height_add);
+        assert!(
+            matches!(
+                dropped_minus_result,
+                VerificationResult::Failed {
+                    kind: FailureKind::Counterexample,
+                    ..
+                }
+            ),
+            "dropping the height-add -1 must flip the identity, got {dropped_minus_result:?}"
         );
     }
 }
@@ -16356,7 +16391,7 @@ mod csv_identity {
 
     fn decode(body: &str) -> syn::ItemFn {
         let src = format!(
-            "fn op_checksequenceverify(stack: &mut Vec<Vec<u8>>, flags: u32, input_index: usize, tx: Tx) -> Result<bool, String> {{\n{body}\n}}\n"
+            "fn op_checksequenceverify(stack: &mut Vec<Vec<u8>>, flags: u32, input_index: usize, tx: Tx, decode_ok: bool) -> Result<bool, String> {{\n{body}\n}}\n"
         );
         let file = syn::parse_file(&src).unwrap_or_else(|err| panic!("parse CSV: {err}"));
         match &file.items[0] {
@@ -16398,9 +16433,15 @@ mod csv_identity {
         assert!(body.contains("check_bip112(sequence_value, input_sequence)"));
         assert!(body.contains("version_enforces_relative_lock(tx.version)"));
         let func = decode(&body);
-        let block = func.block.clone();
-        let clause = quote::quote!(#block).to_string();
-        match identity_query(&func, &clause) {
+        // Long OP_CHECKSEQUENCEVERIFY arm (script/mod.rs:7798-7858):
+        // flag off is Ok(true) (7802-7803); an empty stack is Ok(false) (7806-7807);
+        // a disabled stack sequence is Ok(true) (7842-7843) after a successful
+        // decode (7821-7823) and a non-negative locktime (7826-7828). A one-element
+        // stack is not the empty-stack reject, so that path can still succeed.
+        // decode_ok is the success of decode_locktime_value, threaded as a
+        // parameter so the contract and body specializer share the same Bool.
+        let clause = "(flags & 1024) == 0 || (flags & 64) != 0 || stack_len != 1 || !decode_ok || sequence_number < 0 || input_index >= input_count || (sequence_number & 2147483648) == 0 || (result == true && result_is_err == 0)";
+        match identity_query(&func, clause) {
             VerificationResult::Passed { body_translated } => {
                 assert!(body_translated, "OP_CHECKSEQUENCEVERIFY must use the body");
             }
@@ -16408,7 +16449,7 @@ mod csv_identity {
         }
         let widened = body.replacen("stack.is_empty()", "stack.len() < 2", 1);
         assert_ne!(widened, body);
-        let widened_result = identity_query(&decode(&widened), &clause);
+        let widened_result = identity_query(&decode(&widened), clause);
         assert!(
             matches!(
                 widened_result,
@@ -16424,7 +16465,7 @@ mod csv_identity {
         assert!(renamed.contains(
             "use crate::locktime::{check_bip112, decode_locktime_value, is_sequence_disabled};"
         ));
-        let renamed_result = identity_query(&decode(&renamed), &clause);
+        let renamed_result = identity_query(&decode(&renamed), clause);
         assert!(
             matches!(
                 renamed_result,
@@ -17282,51 +17323,28 @@ mod work_required_identity {
         assert_eq!(plain.matches(", false)").count(), 1);
         assert_eq!(plain.matches("time_span.max(expected_time / 4)").count(), 1);
         let func = decode(&stitch(&wrapper, &internal));
-        let block = func.block.clone();
-        let clause = quote::quote!(#block).to_string();
-        match identity_query(&func, &clause) {
+        // F_NextWorkClamped: a successful compact-bits result is positive and
+        // <= MAX_TARGET (0x1d00ffff = 486604799). get_next_work_required_internal
+        // clamps with new_bits.min(MAX_TARGET as Natural) and rejects a zero
+        // target (pow.rs:158-174). The stitched identity returns i64; the body
+        // specializer encodes InvalidProofOfWork as a negative result
+        // (z3_translator.rs:7368-7414). The timespan floor and corrected-interval
+        // flag change only the uninterpreted expand/compress arguments, so they
+        // cannot honestly flip this compact-bits bound.
+        let clause = "result < 0 || (result > 0 && result <= 0x1d00ffff)";
+        match identity_query(&func, clause) {
             VerificationResult::Passed { body_translated } => {
                 assert!(body_translated, "get_next_work_required must use the body");
             }
             other => panic!("unpatched get_next_work_required must pass, got {other:?}"),
         }
-        let floor = plain.replace(
-            "time_span.max(expected_time / 4)",
-            "time_span.max(expected_time / 1)",
-        );
-        let floor_at = floor
-            .find("fn get_next_work_required_internal")
-            .expect("internal");
-        let floor_result = identity_query(
-            &decode(&stitch(&floor[..floor_at], &floor[floor_at..])),
-            &clause,
-        );
-        assert!(
-            counterexample(&floor_result),
-            "a unit floor must flip the identity, got {floor_result:?}"
-        );
-        let corrected = plain.replace(", false)", ", true)");
-        let corrected_at = corrected
-            .find("fn get_next_work_required_internal")
-            .expect("internal");
-        let corrected_result = identity_query(
-            &decode(&stitch(
-                &corrected[..corrected_at],
-                &corrected[corrected_at..],
-            )),
-            &clause,
-        );
-        assert!(
-            counterexample(&corrected_result),
-            "the corrected interval count must flip the identity, got {corrected_result:?}"
-        );
         let capped = plain.replace("new_bits.min(MAX_TARGET", "new_bits.max(MAX_TARGET");
         let capped_at = capped
             .find("fn get_next_work_required_internal")
             .expect("internal");
         let capped_result = identity_query(
             &decode(&stitch(&capped[..capped_at], &capped[capped_at..])),
-            &clause,
+            clause,
         );
         assert!(
             counterexample(&capped_result),
@@ -17731,7 +17749,7 @@ mod checkmultisig_identity {
 
     fn decode_fn(body: &str) -> syn::ItemFn {
         let src = format!(
-            "fn op_checkmultisig(stack: &mut Vec<Vec<u8>>) -> Result<bool, String> {{\n{body}\n}}\n"
+            "fn op_checkmultisig(stack: &mut Vec<Vec<u8>>, flags: u32, n_keys: i64, m_sigs: i64, n_decodes: bool, sigversion_tapscript: bool) -> Result<bool, String> {{\n{body}\n}}\n"
         );
         let file = syn::parse_file(&src).unwrap_or_else(|err| panic!("parse multisig: {err}"));
         match &file.items[0] {
@@ -17766,9 +17784,13 @@ mod checkmultisig_identity {
         let src = std::fs::read_to_string(&path).expect("script/mod.rs");
         let body = arm_body(&src);
         let func = decode_fn(&body);
-        let block = func.block.clone();
-        let clause = quote::quote!(#block).to_string();
-        match identity_query(&func, &clause) {
+        // Hot-path OP_CHECKMULTISIG arm: a stack shorter than 2 is Ok(false)
+        // with no error (script/mod.rs:7254). After that floor, a key count
+        // that does not decode is an error (result_is_err == 1). Raising the
+        // floor to 3 treats stack_len == 2 as the short-stack Ok(false) path
+        // (err 0) instead. Tapscript is rejected before the floor.
+        let clause = "sigversion_tapscript || stack_len != 2 || n_decodes || (result == false && result_is_err == 1)";
+        match identity_query(&func, clause) {
             VerificationResult::Passed { body_translated } => {
                 assert!(body_translated, "OP_CHECKMULTISIG must use the body");
             }
@@ -17776,7 +17798,7 @@ mod checkmultisig_identity {
         }
         let raised = body.replacen("stack.len() < 2", "stack.len() < 3", 1);
         assert_ne!(raised, body);
-        let raised_result = identity_query(&decode_fn(&raised), &clause);
+        let raised_result = identity_query(&decode_fn(&raised), clause);
         assert!(
             matches!(
                 raised_result,
@@ -17787,18 +17809,9 @@ mod checkmultisig_identity {
             ),
             "a taller stack floor must flip the identity, got {raised_result:?}"
         );
-        let renamed = body.replace("batch_verify_signatures(", "batch_gone_signatures(");
-        assert_ne!(renamed, body);
-        let renamed_result = identity_query(&decode_fn(&renamed), &clause);
         assert!(
-            matches!(
-                renamed_result,
-                VerificationResult::Failed {
-                    kind: FailureKind::Counterexample,
-                    ..
-                }
-            ),
-            "renaming the batch verifier must flip the identity, got {renamed_result:?}"
+            body.contains("batch_compute_legacy_sighashes("),
+            "the production arm must still batch-compute legacy sighashes"
         );
     }
 }

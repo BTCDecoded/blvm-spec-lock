@@ -14866,6 +14866,15 @@ mod retarget_identity {
     use crate::parser::spec_expr::consensus_workspace_present;
     use std::path::PathBuf;
 
+    const CARRY_NEEDLE: &str = "product >> 64";
+    const LIMB_NEEDLE: &str = "(remainder << 64) | (self.0[3] as u128)";
+    /// Bounds for the limb-order query only. Middle limbs are zero, the
+    /// product is `* 1`, and the divisor is 2, so the first dividend word
+    /// (`this.0[3]` vs `this.0[0]`) is decided without a full symbolic
+    /// 256-bit mul/div search. `w0` and `w3` stay symbolic. The carry
+    /// query does not use these bounds.
+    const LIMB_BOUNDS: &str = "w1 == 0 && w2 == 0 && mul_rhs == 1 && div_rhs == 2";
+
     fn item_src(name: &str) -> String {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../blvm-consensus/src/pow.rs");
         let src = std::fs::read_to_string(path).expect("pow.rs");
@@ -14917,20 +14926,61 @@ mod retarget_identity {
             .expect("retarget_mul_div")
     }
 
-    fn identity_query(func: &syn::ItemFn, clause: &str) -> VerificationResult {
+    fn must_replace(src: &str, from: &str, to: &str) -> String {
+        let edited = src.replace(from, to);
+        assert_ne!(
+            edited, src,
+            "{from} must change inside the production function"
+        );
+        edited
+    }
+
+    fn identity_query(func: &syn::ItemFn, clause: &str, requires: &[&str]) -> VerificationResult {
         let mut function = make_function_to_verify(
             std::path::Path::new("src/pow.rs"),
             "retarget_mul_div",
             &func.attrs,
             func,
         );
-        function.contracts = vec![super::Contract {
+        let mut contracts: Vec<super::Contract> = requires
+            .iter()
+            .map(|req| super::Contract {
+                contract_type: super::ContractType::Requires,
+                condition: (*req).to_string(),
+                expr: syn::parse_str(req).ok(),
+                is_spec_derived: true,
+            })
+            .collect();
+        contracts.push(super::Contract {
             contract_type: super::ContractType::Ensures,
             condition: clause.to_string(),
             expr: syn::parse_str(clause).ok(),
             is_spec_derived: true,
-        }];
+        });
+        function.contracts = contracts;
         verify_function(&function, 60, &[])
+    }
+
+    fn must_flip(result: VerificationResult, what: &str) {
+        assert!(
+            matches!(
+                result,
+                VerificationResult::Failed {
+                    kind: FailureKind::Counterexample,
+                    ..
+                }
+            ),
+            "{what} must flip the identity, got {result:?}"
+        );
+    }
+
+    fn must_pass(result: VerificationResult, what: &str) {
+        match result {
+            VerificationResult::Passed { body_translated } => {
+                assert!(body_translated, "{what} must use the body");
+            }
+            other => panic!("{what} must pass, got {other:?}"),
+        }
     }
 
     #[test]
@@ -14940,47 +14990,46 @@ mod retarget_identity {
         }
         let mul = item_src("checked_mul_u64");
         let div = item_src("div_u64");
+        assert!(
+            mul.contains(CARRY_NEEDLE),
+            "production checked_mul_u64 must still shift the carry by 64"
+        );
+        assert!(
+            div.contains(LIMB_NEEDLE),
+            "production div_u64 must still start the dividend at self.0[3]"
+        );
         let src = stitch(&mul, &div);
         let func = extract(&src);
         let block = func.block.clone();
         let clause = quote::quote!(#block).to_string();
-        match identity_query(&func, &clause) {
-            VerificationResult::Passed { body_translated } => {
-                assert!(body_translated, "retarget_mul_div must use the body");
-            }
-            other => panic!("unpatched retarget_mul_div must pass, got {other:?}"),
-        }
-        let widened = stitch(&mul.replace("product >> 64", "product >> 32"), &div);
-        assert_ne!(widened, src, "the carry shift must change");
-        let widened_result = identity_query(&extract(&widened), &clause);
-        assert!(
-            matches!(
-                widened_result,
-                VerificationResult::Failed {
-                    kind: FailureKind::Counterexample,
-                    ..
-                }
-            ),
-            "shifting the carry by 32 must flip the identity, got {widened_result:?}"
+
+        // Carry query: full production mul+div stitch, no limb bounds.
+        // Timeout stays 60s. Changing the carry shift already flips here.
+        must_pass(
+            identity_query(&func, &clause, &[]),
+            "unpatched retarget_mul_div",
+        );
+        let widened = stitch(&must_replace(&mul, CARRY_NEEDLE, "product >> 32"), &div);
+        must_flip(
+            identity_query(&extract(&widened), &clause, &[]),
+            "shifting the carry by 32",
+        );
+
+        // Limb query: same production stitch, but middle limbs and the
+        // multipliers are fixed so the first-word order is in budget.
+        // Timeout stays 60s.
+        let bounds = [LIMB_BOUNDS];
+        must_pass(
+            identity_query(&func, &clause, &bounds),
+            "unpatched retarget_mul_div under limb bounds",
         );
         let flipped = stitch(
             &mul,
-            &div.replace(
-                "(remainder << 64) | (self.0[3] as u128)",
-                "(remainder << 64) | (self.0[0] as u128)",
-            ),
+            &must_replace(&div, LIMB_NEEDLE, "(remainder << 64) | (self.0[0] as u128)"),
         );
-        assert_ne!(flipped, src, "the first dividend limb must change");
-        let flipped_result = identity_query(&extract(&flipped), &clause);
-        assert!(
-            matches!(
-                flipped_result,
-                VerificationResult::Failed {
-                    kind: FailureKind::Counterexample,
-                    ..
-                }
-            ),
-            "reading the low limb first must flip the identity, got {flipped_result:?}"
+        must_flip(
+            identity_query(&extract(&flipped), &clause, &bounds),
+            "reading the low limb first",
         );
     }
 }

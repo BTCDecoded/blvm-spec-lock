@@ -7365,10 +7365,9 @@ mod calculate_sequence_identity {
         // LOCKTIME_VERIFY_SEQUENCE (0x01) is unset (78-84) — it returns those
         // initializers. Every Ok path keeps both components >= -1 (52-55,
         // 163-180), which is the result >= -1 half of F_SequenceLockHeightAdd.
-        // The body specializer models the version gate as version >= 2
-        // (z3_translator.rs:4456); the source uses (version as u32) >= 2
-        // (sequence_locks.rs:28-30).
-        let clause = "result_is_err != 0 || (result_0 >= -1 && result_1 >= -1 && ((version >= 2 && (flags & 1) != 0) || (result_0 == -1 && result_1 == -1)))";
+        // The helper is (version as u32) >= 2 (sequence_locks.rs:28-30), so
+        // the body specializer truncates with as_u32 when that form is parsed.
+        let clause = "result_is_err != 0 || (result_0 >= -1 && result_1 >= -1 && (((version as u32) >= 2 && (flags & 1) != 0) || (result_0 == -1 && result_1 == -1)))";
         match identity_query(&func, clause) {
             VerificationResult::Passed { body_translated } => {
                 assert!(body_translated, "sequence locks must use the body");
@@ -7405,7 +7404,7 @@ mod calculate_sequence_identity {
         // (sequence_locks.rs:163-172). Dropping that -1 must flip this tighter
         // postcondition: a single height-based input with coin height 0 and
         // lock value 0 yields required_height == -1, so min_height stays -1.
-        let height_add = "result_is_err != 0 || input_len != 1 || heights_len != 1 || version < 2 || (flags & 1) == 0 || (seq_words[0] & 0x80000000) != 0 || (seq_words[0] & 0x00400000) != 0 || seq_heights[0] != 0 || (seq_words[0] & 0x0000ffff) != 0 || (result_0 == -1 && result_1 == -1)";
+        let height_add = "result_is_err != 0 || input_len != 1 || heights_len != 1 || (version as u32) < 2 || (flags & 1) == 0 || (seq_words[0] & 0x80000000) != 0 || (seq_words[0] & 0x00400000) != 0 || seq_heights[0] != 0 || (seq_words[0] & 0x0000ffff) != 0 || (result_0 == -1 && result_1 == -1)";
         match identity_query(&func, height_add) {
             VerificationResult::Passed { body_translated } => {
                 assert!(body_translated, "the height-add identity must use the body");
@@ -7431,6 +7430,36 @@ mod calculate_sequence_identity {
                 }
             ),
             "dropping the height-add -1 must flip the identity, got {dropped_minus_result:?}"
+        );
+        // version 2^32+1 is 1 as u32, so version_enforces_relative_lock is
+        // false (sequence_locks.rs:28-30). A single height-based lock of 1
+        // at height 0 would raise min_height to 0 if BIP68 were enforced on
+        // the unbounded Int; it must stay at the -1 initializers.
+        let truncate = "result_is_err != 0 || version != 4294967297 || (flags & 1) == 0 || input_len != 1 || heights_len != 1 || (seq_words[0] & 0x80000000) != 0 || (seq_words[0] & 0x00400000) != 0 || seq_heights[0] != 0 || (seq_words[0] & 0x0000ffff) != 1 || (result_0 == -1 && result_1 == -1)";
+        match identity_query(&func, truncate) {
+            VerificationResult::Passed { body_translated } => {
+                assert!(
+                    body_translated,
+                    "the u32 version truncation identity must use the body"
+                );
+            }
+            other => panic!("unpatched u32 version truncation must pass, got {other:?}"),
+        }
+        let unbounded = src.replace(
+            "version_enforces_relative_lock(tx.version)",
+            "(tx.version >= 2)",
+        );
+        assert_ne!(unbounded, src, "the version helper must change");
+        let unbounded_result = identity_query(&decode_fn_from(&unbounded), truncate);
+        assert!(
+            matches!(
+                unbounded_result,
+                VerificationResult::Failed {
+                    kind: FailureKind::Counterexample,
+                    ..
+                }
+            ),
+            "replacing the helper with an unbounded version >= 2 must flip truncation, got {unbounded_result:?}"
         );
     }
 }
@@ -16475,6 +16504,38 @@ mod csv_identity {
                 }
             ),
             "renaming both disable calls must flip the identity, got {renamed_result:?}"
+        );
+        // version 2^32+1 is 1 as u32, so version_enforces_relative_lock is
+        // false (sequence_locks.rs:28-30) and the arm returns Ok(false)
+        // (script/mod.rs:7845-7846). Conditions reach that gate: CSV on,
+        // MINIMALDATA off, a one-element stack, a successful non-negative
+        // decode, and neither sequence disabled. An unbounded `tx.version < 2`
+        // would continue and can return Ok(true).
+        let truncate = "(flags & 1024) == 0 || (flags & 64) != 0 || stack_len != 1 || !decode_ok || sequence_number != 0 || input_index >= input_count || input_sequence != 0 || tx_version != 4294967297 || (result == false && result_is_err == 0)";
+        match identity_query(&func, truncate) {
+            VerificationResult::Passed { body_translated } => {
+                assert!(
+                    body_translated,
+                    "the CSV u32 version truncation identity must use the body"
+                );
+            }
+            other => panic!("unpatched CSV u32 version truncation must pass, got {other:?}"),
+        }
+        let unbounded = body.replace(
+            "!crate::sequence_locks::version_enforces_relative_lock(tx.version)",
+            "tx.version < 2",
+        );
+        assert_ne!(unbounded, body, "the CSV version helper must change");
+        let unbounded_result = identity_query(&decode(&unbounded), truncate);
+        assert!(
+            matches!(
+                unbounded_result,
+                VerificationResult::Failed {
+                    kind: FailureKind::Counterexample,
+                    ..
+                }
+            ),
+            "replacing the helper with unbounded tx.version < 2 must flip truncation, got {unbounded_result:?}"
         );
     }
 }

@@ -465,9 +465,17 @@ impl Z3Translator {
                 if let Some(constant_value) = resolve_constant(&name) {
                     return Ok(Int::from_i64(&self.ctx, constant_value).into());
                 }
-                if let Some(value) =
-                    future_block_time_u64(name.rsplit("::").next().unwrap_or(&name))
-                {
+                // `u64::MAX` does not fit in i64; a contract literal cannot
+                // name it. The path is the never-activation sentinel
+                // (bip_validation.rs:302, constants.rs:339-348).
+                if name == "u64::MAX" {
+                    return Ok(Int::from_u64(&self.ctx, u64::MAX).into());
+                }
+                let last = name.rsplit("::").next().unwrap_or(&name);
+                if let Some(value) = bip54_activation_u64(last) {
+                    return Ok(Int::from_u64(&self.ctx, value).into());
+                }
+                if let Some(value) = future_block_time_u64(last) {
                     return Ok(Int::from_u64(&self.ctx, value).into());
                 }
 

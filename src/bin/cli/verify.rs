@@ -5436,16 +5436,23 @@ mod bip54_active_identity {
     }
 
     fn identity_query(func: &syn::ItemFn) -> VerificationResult {
-        let identity = "result == (height >= match activation_override { \
-            Some(h) => h, \
-            None => match network { \
-                crate::types::Network::Mainnet => crate::constants::BIP54_ACTIVATION_MAINNET, \
-                crate::types::Network::Testnet => crate::constants::BIP54_ACTIVATION_TESTNET, \
-                crate::types::Network::Regtest \
-                | crate::types::Network::Signet \
-                | crate::types::Network::Testnet4 => crate::constants::BIP54_ACTIVATION_REGTEST, \
-            }, \
-        })";
+        // is_bip54_active_at (bip_validation.rs:287-302):
+        //   Some(h) => h, else the Network match at 294-299
+        //   (Mainnet, Testnet, or Regtest|Signet|Testnet4), then
+        //   `activation != u64::MAX && height >= activation` (302).
+        // Per-network heights are BIP54_ACTIVATION_* in
+        // blvm-primitives constants.rs:339-348; all are currently
+        // the never sentinel u64::MAX. Network variants are in
+        // types.rs:246-257.
+        //
+        // Encoding: `u64::MAX` in the clause is the sentinel
+        // 2^64-1 (a contract integer literal cannot name it).
+        // `network` is an invented Int discriminant: 0 = Mainnet,
+        // 1 = Testnet, any other value is the third arm (the
+        // same ITE the translator builds, and the same as the
+        // Rust enum layout). `activation_override_is_some` and
+        // `h` are the Option<u64> presence bit and Some payload.
+        let identity = "result == (            (activation_override_is_some && h != u64::MAX && height >= h) ||             (!activation_override_is_some && network == 0 && BIP54_ACTIVATION_MAINNET != u64::MAX && height >= BIP54_ACTIVATION_MAINNET) ||             (!activation_override_is_some && network == 1 && BIP54_ACTIVATION_TESTNET != u64::MAX && height >= BIP54_ACTIVATION_TESTNET) ||             (!activation_override_is_some && network != 0 && network != 1 && BIP54_ACTIVATION_REGTEST != u64::MAX && height >= BIP54_ACTIVATION_REGTEST)        )";
         let mut function = make_function_to_verify(
             std::path::Path::new("src/bip_validation.rs"),
             "is_bip54_active_at",
@@ -5508,6 +5515,25 @@ mod bip54_active_identity {
                 }
             ),
             "changing the activation bound to equality must flip the identity, got {predicate_result:?}"
+        );
+
+        // Dropping `activation != u64::MAX` (bip_validation.rs:302)
+        // must not still pass as a body-translated proof.
+        let orig_src = quote::quote!(#func).to_string();
+        let dropped_src = orig_src
+            .replace("activation != u64 :: MAX && ", "")
+            .replace("activation != u64::MAX && ", "");
+        assert_ne!(dropped_src, orig_src, "the sentinel check must be dropped");
+        let dropped: syn::ItemFn = syn::parse_str(&dropped_src).expect("dropped sentinel");
+        let dropped_result = identity_query(&dropped);
+        assert!(
+            !matches!(
+                dropped_result,
+                VerificationResult::Passed {
+                    body_translated: true
+                }
+            ),
+            "dropping the u64::MAX sentinel must not prove the identity, got {dropped_result:?}"
         );
     }
 }

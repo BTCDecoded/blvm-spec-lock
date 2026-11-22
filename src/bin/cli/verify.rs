@@ -14082,6 +14082,7 @@ mod tap_schnorr_identity {
 mod verify_signature_identity {
     use super::{FailureKind, VerificationResult, make_function_to_verify, verify_function};
     use crate::parser::spec_expr::consensus_workspace_present;
+    use std::path::PathBuf;
 
     /// Encoding gates of `verify_signature` (signature.rs:116-220).
     /// Empty signature is `Ok(false)` (128-130) unless
@@ -14089,40 +14090,190 @@ mod verify_signature_identity {
     /// Under STRICTENC, a non-empty signature whose hashtype is outside
     /// `0x01..=0x03` is rejected (`reject_strictenc_signature` at 100-106
     /// and `reject_strictenc` at 61-66). This query does not model ECDSA:
-    /// a signature that passes the gates is `Ok(true)`. STRICTENC pubkey
-    /// and hashtype failures are `Ok(false)` here; the clause allows either
-    /// `result == false` or `result_is_err == 1`, which is also true of the
-    /// production `Err` on those paths. Locals are avoided so a SAT model
-    /// only names parameters and `result`.
-    fn function_src() -> String {
-        r#"fn verify_signature(
-    _secp: i64,
-    pubkey_bytes: &[u8],
-    signature_bytes: &[u8],
-    sighash: i64,
-    flags: u32,
-    height: u64,
-    network: i64,
-    sigversion: i64,
-) -> Result<bool> {
-    if (flags & 0x02) != 0
-        && !(pubkey_bytes.len() == 33 && (pubkey_bytes[0] == 0x02 || pubkey_bytes[0] == 0x03))
-        && !(pubkey_bytes.len() == 65 && pubkey_bytes[0] == 0x04)
-    {
-        return Ok(false);
+    /// a signature that passes the gates is `Ok(true)`. The helpers' STRICTENC
+    /// pubkey and hashtype failures are production `Err` paths; the clause
+    /// allows either `result == false` or `result_is_err == 1`. Locals are
+    /// avoided so a SAT model only names parameters and `result`.
+    fn slice_fn(src: &str, marker: &str) -> String {
+        let start = src.find(marker).expect(marker);
+        let rest = &src[start..];
+        let mut depth = 0i32;
+        let mut started = false;
+        for (i, byte) in rest.bytes().enumerate() {
+            if byte == b'{' {
+                depth += 1;
+                started = true;
+            } else if byte == b'}' {
+                depth -= 1;
+                if started && depth == 0 {
+                    return rest[..=i].to_string();
+                }
+            }
+        }
+        panic!("unbalanced {marker}");
     }
-    if signature_bytes.is_empty() {
-        return Ok(false);
+
+    fn inner(src: &str) -> String {
+        let brace = src.find('{').expect("brace");
+        let mut depth = 0i32;
+        for (i, byte) in src[brace..].bytes().enumerate() {
+            if byte == b'{' {
+                depth += 1;
+            } else if byte == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    return src[brace + 1..brace + i].to_string();
+                }
+            }
+        }
+        panic!("unbalanced inner");
     }
-    if (flags & 0x02) != 0
-        && !(0x01..=0x03).contains(&(signature_bytes[signature_bytes.len() - 1] & 127))
-    {
-        return Ok(false);
+
+    fn load_signature_src() -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../blvm-consensus/src/script/signature.rs");
+        std::fs::read_to_string(path).expect("signature.rs")
     }
-    Ok(true)
-}
-"#
-        .to_string()
+
+    /// `return Ok(())` in a `Result<()>` helper would return the wrong type
+    /// from `verify_signature`. The generic translator only reads a mid-function
+    /// `if` when the then-branch is a single `return Ok` / `return Err`, so a
+    /// wrapped `if !skip { lets; if bad { return Err } }` would be dropped.
+    /// Invert the leading `if skip { return Ok(()); }` into each Err guard
+    /// (`if !skip && bad { return Err }`) and keep the lets at the top level.
+    /// `!0x80` on a `u8` is `127`; the translator's `!` is logical-not only.
+    fn split_leading_ok_return(body: &str) -> Option<(String, String)> {
+        let trimmed = body.trim_start();
+        if !trimmed.starts_with("if ") {
+            return None;
+        }
+        let after_if = &trimmed[3..];
+        let brace = after_if.find('{')?;
+        let cond = after_if[..brace].trim();
+        let bytes = after_if.as_bytes();
+        let mut depth = 1i32;
+        let mut i = brace + 1;
+        while i < bytes.len() {
+            if bytes[i] == b'{' {
+                depth += 1;
+            } else if bytes[i] == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    let then_body = after_if[brace + 1..i].trim();
+                    if then_body == "return Ok(());" || then_body == "return Ok(())" {
+                        return Some((cond.to_string(), after_if[i + 1..].to_string()));
+                    }
+                    return None;
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn prefix_err_ifs(body: &str, prefix: &str) -> String {
+        let mut out = String::new();
+        let bytes = body.as_bytes();
+        let mut i = 0usize;
+        let mut depth = 0i32;
+        while i < bytes.len() {
+            let at_if = depth == 0 && body[i..].starts_with("if ");
+            if at_if {
+                let after_if = &body[i + 3..];
+                if let Some(brace) = after_if.find('{') {
+                    let cond = after_if[..brace].trim();
+                    let rest = after_if.as_bytes();
+                    let mut d = 1i32;
+                    let mut j = brace + 1;
+                    while j < rest.len() {
+                        if rest[j] == b'{' {
+                            d += 1;
+                        } else if rest[j] == b'}' {
+                            d -= 1;
+                            if d == 0 {
+                                let then_body = after_if[brace + 1..j].trim();
+                                if then_body.starts_with("return Err(") {
+                                    out.push_str("if ");
+                                    out.push_str(prefix);
+                                    out.push_str(" && (");
+                                    out.push_str(cond);
+                                    out.push_str(") {\n                    ");
+                                    out.push_str(then_body);
+                                    out.push_str("\n                }");
+                                    i = i + 3 + j + 1;
+                                    break;
+                                }
+                                d = -1;
+                                break;
+                            }
+                        }
+                        j += 1;
+                    }
+                    if d == 0 {
+                        continue;
+                    }
+                }
+            }
+            let b = bytes[i];
+            if b == b'{' {
+                depth += 1;
+            } else if b == b'}' {
+                depth -= 1;
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+        out
+    }
+
+    fn inline_unit_result(body: &str) -> String {
+        let mut body = body.trim().to_string();
+        if let Some(stripped) = body
+            .strip_suffix("Ok(());")
+            .or_else(|| body.strip_suffix("Ok(())"))
+        {
+            body = stripped.trim_end().to_string();
+        }
+        // `!0x80` on a u8 clears the ANYONECANPAY bit. The translator's `!`
+        // is logical-not, so the query uses the equivalent `127`.
+        body = body.replace("!0x80", "127");
+        // `is_strict_der` is an uninterpreted Int; `!call` needs a Bool.
+        body = body.replace(
+            "if !crate::bip_validation::is_strict_der(signature_bytes)?",
+            "if crate::bip_validation::is_strict_der(signature_bytes)? == 0",
+        );
+        if let Some((cond, rest)) = split_leading_ok_return(&body) {
+            prefix_err_ifs(&rest, &format!("!({cond})"))
+        } else {
+            body
+        }
+    }
+
+    /// Slice `verify_signature` through the `reject_strictenc_signature` call
+    /// and inline `reject_strictenc_pubkey` / `reject_strictenc_signature`
+    /// from the same file. Mutations must be applied to that file first.
+    fn function_src(src: &str) -> String {
+        let verify = slice_fn(src, "fn verify_signature(");
+        let pubkey_call = "reject_strictenc_pubkey(flags, pubkey_bytes)?;";
+        let signature_call = "reject_strictenc_signature(flags, signature_bytes)?;";
+        assert!(
+            verify.contains(pubkey_call),
+            "verify_signature must call reject_strictenc_pubkey"
+        );
+        assert!(
+            verify.contains(signature_call),
+            "verify_signature must call reject_strictenc_signature"
+        );
+        let call_at = verify
+            .find(signature_call)
+            .expect("reject_strictenc_signature call");
+        let prefix = &verify[..call_at + signature_call.len()];
+        let mut query = format!("{prefix}\n    Ok(true)\n}}");
+        let pubkey_body = inner(&slice_fn(src, "fn reject_strictenc_pubkey("));
+        let signature_body = inner(&slice_fn(src, "fn reject_strictenc_signature("));
+        query = query.replace(pubkey_call, &inline_unit_result(&pubkey_body));
+        query = query.replace(signature_call, &inline_unit_result(&signature_body));
+        query
     }
 
     fn extract(src: &str) -> syn::ItemFn {
@@ -14140,6 +14291,32 @@ mod verify_signature_identity {
     /// `base_sighash` is the last signature byte with the ANYONECANPAY
     /// bit cleared (`& 127`, i.e. `& !0x80` on a `u8`).
     const IDENTITY: &str = "(signature_bytes_len != 0 || result_is_err == 1 || result == false) && ((flags & 0x02) == 0 || signature_bytes_len == 0 || result_is_err == 1 || result == false || (((signature_bytes[signature_bytes_len - 1] & 127) >= 1) && ((signature_bytes[signature_bytes_len - 1] & 127) <= 3)))";
+
+    const PRODUCTION_GATES: &[&str] = &[
+        "if signature_bytes.is_empty()",
+        "0x01..=0x03",
+        "pubkey_bytes.len() == 33",
+        "pubkey_bytes.len() == 65",
+        "pubkey_bytes[0] == 0x02 || pubkey_bytes[0] == 0x03",
+        "pubkey_bytes[0] == 0x04",
+        "signature_bytes[signature_bytes.len() - 1]",
+        "flags & 0x02",
+        "!0x80",
+        "is_strict_der(signature_bytes)",
+        "reject_strictenc_pubkey(flags, pubkey_bytes)",
+        "reject_strictenc_signature(flags, signature_bytes)",
+    ];
+
+    const QUERY_GATES: &[&str] = &[
+        "if signature_bytes.is_empty()",
+        "0x01..=0x03",
+        "pubkey_bytes.len() == 33",
+        "pubkey_bytes.len() == 65",
+        "pubkey_bytes[0] == 0x02 || pubkey_bytes[0] == 0x03",
+        "pubkey_bytes[0] == 0x04",
+        "signature_bytes[signature_bytes.len() - 1]",
+        "flags & 0x02",
+    ];
 
     fn identity_query(func: &syn::ItemFn) -> VerificationResult {
         let mut function = make_function_to_verify(
@@ -14162,12 +14339,15 @@ mod verify_signature_identity {
         if !consensus_workspace_present() {
             return;
         }
-        let src = function_src();
-        assert!(
-            src.contains("0x01..=0x03"),
-            "verify_signature must contain the STRICTENC sighash window"
-        );
-        let func = extract(&src);
+        let src = load_signature_src();
+        for gate in PRODUCTION_GATES {
+            assert!(src.contains(gate), "production must contain {gate}");
+        }
+        let query = function_src(&src);
+        for gate in QUERY_GATES {
+            assert!(query.contains(gate), "query must contain {gate}");
+        }
+        let func = extract(&query);
         match identity_query(&func) {
             VerificationResult::Passed { body_translated } => {
                 assert!(body_translated, "verify_signature must use the body");
@@ -14177,7 +14357,7 @@ mod verify_signature_identity {
         let widened = src.replace("if signature_bytes.is_empty()", "if false");
         assert_ne!(widened, src, "the empty-signature test must change");
         assert!(widened.contains("0x01..=0x03"), "the sighash range stays");
-        let widened_result = identity_query(&extract(&widened));
+        let widened_result = identity_query(&extract(&function_src(&widened)));
         assert!(
             matches!(
                 widened_result,
@@ -14194,7 +14374,7 @@ mod verify_signature_identity {
             flipped.contains("if signature_bytes.is_empty()"),
             "the empty-signature test stays"
         );
-        let flipped_result = identity_query(&extract(&flipped));
+        let flipped_result = identity_query(&extract(&function_src(&flipped)));
         assert!(
             matches!(
                 flipped_result,
